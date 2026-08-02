@@ -17,9 +17,6 @@ struct Args {
 
     #[arg(short, long)]
     debug: bool,
-
-    #[arg(long)]
-    version: bool,
 }
 
 fn main() -> Result<()> {
@@ -35,11 +32,6 @@ fn main() -> Result<()> {
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::EnvFilter::new("maggie=info"))
             .init();
-    }
-
-    if args.version {
-        println!("maggie {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
     }
 
     tracing::info!("Starting maggie");

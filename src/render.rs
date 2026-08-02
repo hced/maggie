@@ -52,32 +52,6 @@ impl RgbaBuffer {
 
         result
     }
-
-    pub fn sample_bilinear(&self, x: f64, y: f64) -> [u8; 4] {
-        let max_x = (self.width - 1).max(0) as f64;
-        let max_y = (self.height - 1).max(0) as f64;
-        let x = x.clamp(0.0, max_x);
-        let y = y.clamp(0.0, max_y);
-        let x0 = x.floor() as i32;
-        let y0 = y.floor() as i32;
-        let x1 = (x0 + 1).min(self.width - 1);
-        let y1 = (y0 + 1).min(self.height - 1);
-        let fx = (x - x0 as f64) as f32;
-        let fy = (y - y0 as f64) as f32;
-
-        let p00 = self.pixel(x0, y0).unwrap_or([0; 4]);
-        let p01 = self.pixel(x1, y0).unwrap_or([0; 4]);
-        let p10 = self.pixel(x0, y1).unwrap_or([0; 4]);
-        let p11 = self.pixel(x1, y1).unwrap_or([0; 4]);
-
-        let mut out = [0u8; 4];
-        for c in 0..4 {
-            let top = p00[c] as f32 + (p01[c] as f32 - p00[c] as f32) * fx;
-            let bottom = p10[c] as f32 + (p11[c] as f32 - p10[c] as f32) * fx;
-            out[c] = (top + (bottom - top) * fy).round() as u8;
-        }
-        out
-    }
 }
 
 pub struct Renderer {
@@ -101,16 +75,49 @@ impl Renderer {
         dest_h: i32,
     ) -> RgbaBuffer {
         let zoom = self.scale_factor;
-        let mut result = RgbaBuffer::new(dest_w, dest_h);
+        let inv_zoom = 1.0 / zoom;
+        let src_w = source.width;
+        let src_h = source.height;
+        let max_x = (src_w - 1).max(0) as f64;
+        let max_y = (src_h - 1).max(0) as f64;
+        let data = &source.data;
+        let mut result = vec![0u8; (dest_w * dest_h * 4) as usize];
+
         for y in 0..dest_h {
-            let sy = origin.1 + (y as f64 + 0.5) / zoom;
+            let sy = (origin.1 + (y as f64 + 0.5) * inv_zoom).clamp(0.0, max_y);
+            let y0 = sy.floor() as i32;
+            let y1 = (y0 + 1).min(src_h - 1);
+            let fy = (sy - y0 as f64) as f32;
+            let row0 = y0 as usize * src_w as usize;
+            let row1 = y1 as usize * src_w as usize;
+            let out_row = y as usize * dest_w as usize;
             for x in 0..dest_w {
-                let sx = origin.0 + (x as f64 + 0.5) / zoom;
-                let pixel = source.sample_bilinear(sx, sy);
-                result.set_pixel(x, y, pixel);
+                let sx = (origin.0 + (x as f64 + 0.5) * inv_zoom).clamp(0.0, max_x);
+                let x0 = sx.floor() as i32;
+                let x1 = (x0 + 1).min(src_w - 1);
+                let fx = (sx - x0 as f64) as f32;
+                let i00 = (row0 + x0 as usize) * 4;
+                let i01 = (row0 + x1 as usize) * 4;
+                let i10 = (row1 + x0 as usize) * 4;
+                let i11 = (row1 + x1 as usize) * 4;
+                let p00 = &data[i00..i00 + 4];
+                let p01 = &data[i01..i01 + 4];
+                let p10 = &data[i10..i10 + 4];
+                let p11 = &data[i11..i11 + 4];
+                let o = (out_row + x as usize) * 4;
+                for c in 0..4 {
+                    let top = p00[c] as f32 + (p01[c] as f32 - p00[c] as f32) * fx;
+                    let bottom = p10[c] as f32 + (p11[c] as f32 - p10[c] as f32) * fx;
+                    result[o + c] = (top + (bottom - top) * fy).round() as u8;
+                }
             }
         }
-        result
+
+        RgbaBuffer {
+            width: dest_w,
+            height: dest_h,
+            data: result,
+        }
     }
 
     pub fn update_scale_factor(&mut self, new_scale: f64) {

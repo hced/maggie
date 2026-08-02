@@ -874,7 +874,7 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
 
     let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("maggie"), None);
     layer.set_anchor(Anchor::all());
-    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
     layer.set_size(0, 0);
     layer.commit();
 
