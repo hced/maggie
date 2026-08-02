@@ -12,7 +12,17 @@
 
 ---
 
-## 3. Configuration System
+## 3. Screen Capture & Modes — *Implemented*
+* **Frozen-frame model:** The screen is captured exactly **once** at startup via `zwlr_screencopy` (`capture_output` on the current output). The SHM buffer (XRGB8888/ARGB8888) is converted to RGBA with a stride-aware row copy, honoring the `y_invert` flag.
+* **Capture-before-content:** The fullscreen layer-shell overlay (`Layer::Overlay`) is committed at startup but presents **no image data until the first captured frame is ready**; the initial screencopy therefore never contains the overlay, avoiding the Droste-effect self-feedback that plagues live-capture magnifiers.
+* **Static view:** After the first frame, the overlay displays a static, nearest-neighbor zoomed view of the frozen frame. Zoom keys `1`–`9` re-scale the same frozen frame; the screen is never re-captured at runtime.
+* **Failure handling:** A failed capture is retried up to **3 times**; if all retries fail, the overlay renders black.
+* **Zoom centering:** The zoomed view is centered on the pointer position **at capture time**; if the pointer was never seen, the screen center is used.
+* **No live mode:** Continuous live capture is explicitly **out of scope**; the interactive live-magnifier idea (including an earlier planned `--live` flag) was dropped. Behavior modes that assumed a live view (see §6) are obsolete until redefined.
+
+---
+
+## 4. Configuration System — *Partial*
 * **Location:** XDG standard configuration directory (`~/.config/maggie/`).
 * **Format:** `.ron` (Rusty Object Notation) configuration file.
 * **Storage Requirements:**
@@ -20,51 +30,52 @@
   * **Keybindings** for all in-app functions.
   * **Screenshot Path** (default: `~/Pictures`).
   * **Screenshot Filename Pattern:** Utilizes standard `strftime` formatting tokens (supporting dynamic variables such as `%Y` for year, `%m` for month, `%d` for day, `%H` for hour, `%M` for minute, etc., defaulting to `maggie_%Y%m%d_%H%M%S.png`).
+* **Status:** Loading from disk is implemented; the listed `strftime` tokens are evaluated on save. **Write-on-change persistence is not wired up** — `save_config` exists but is unused, so runtime adjustments never reach disk.
 
 ---
 
-## 4. Visuals & Rendering
-* **Zoom & Scaling:** Controlled via numeric keyboard keys `1` through `9` to switch zoom levels.
-* **Rendering Preference:** No anti-aliasing; **nearest-neighbor rendering** (pixellated visuals) is preferred by default to keep magnification blocks crisp. 
-* **Anti-Aliasing Toggle:** An optional toggle bound to the `A` key, implemented only if it does not introduce development complexity.
+## 5. Visuals & Rendering — *Implemented* (AA toggle: *Stub*)
+* **Zoom & Scaling:** Controlled via numeric keyboard keys `1` through `9` to switch zoom levels; keys re-scale the frozen frame.
+* **Rendering Preference:** No anti-aliasing; **nearest-neighbor rendering** (pixellated visuals) is preferred by default to keep magnification blocks crisp.
+* **Anti-Aliasing Toggle:** An optional toggle bound to the `A` key, implemented only if it does not introduce development complexity. — *Stub: key is bound but not yet functional.*
 
 ---
 
-## 5. Behavior Modes
-The application supports three distinct behavior modes configurable via the settings:
-1. **Center Cursor (Default):** Keeps the mouse cursor locked at the screen center while moving around.
-2. **Edge Pan:** The screen stays still until the mouse reaches a set distance threshold from any screen edge.
-3. **Miniature Window:** Displays a miniature window with rounded corners representing the zoomed portion of the screen.
+## 6. Behavior Modes — *Revised*
+* The former **Center Cursor** / **Edge Pan** / **Miniature Window** modes assumed a live, moving view and are now **obsolete** in the frozen-frame model; they are pending redefinition or removal. Mode-switch bindings (`Ctrl+C`/`Ctrl+E`/`Ctrl+M`) still exist in code but have no rendering effect.
+* **Actual behavior:** The zoomed view is centered on the pointer position at capture time (or screen center if the pointer was never seen) and does not follow the cursor afterward. See §3.
 
 ---
 
-## 6. OSD (On-Screen Display) Key Legend
-* Toggable via the `K` key.
-* Off by default, unless configured to always show via the configuration file.
-* Dynamically stays or moves out of the way of the cursor position.
+## 7. OSD (On-Screen Display) Key Legend — *Implemented*
+* Toggable via the `K` key (configurable via `keybindings.toggle_osd`).
+* Off by default, unless configured to always show via the configuration file (`show_osd`).
+* Dynamically stays or moves out of the way of the cursor position: the legend box is drawn in the quadrant opposite the cursor.
+* Rendered with a built-in 5×7 bitmap font (`src/osd.rs`); lists zoom level, `1`–`9` zoom, `K` OSD toggle, `F` fullscreen screenshot, `S`/`W`/`C` (pending), and `Q`/`Esc` quit.
 
 ---
 
-## 7. Screenshot Subsystem
+## 8. Screenshot Subsystem — *Partial*
 Triggered using dedicated keybindings (`S`, `W`, `F`):
-* **Manual Selection (`S`):** Allows dragging a rectangular selection region. Once drawn, the side closest to the mouse cursor can be nudged using the **Arrow keys** (1 px per keypress).
-* **Window Selection (`W`):** Displays a dynamically sized grid representing all available windows for capture. Clicking an item captures and saves that specific window.
-* **Fullscreen Capture (`F`):** Captures the entire active workspace or output.
-* **Cancellation:** Pressing **Escape** during Manual or Window selection mode cancels the operation.
-* **Output Path Generation:** Combines the configured `screenshot_path` with the evaluated `strftime` filename pattern.
+* **Manual Selection (`S`):** Allows dragging a rectangular selection region. Once drawn, the side closest to the mouse cursor can be nudged using the **Arrow keys** (1 px per keypress). — *Stub: not yet implemented.*
+* **Window Selection (`W`):** Displays a dynamically sized grid representing all available windows for capture. Clicking an item captures and saves that specific window. — *Stub: not yet implemented.*
+* **Fullscreen Capture (`F`):** Saves the currently frozen frame as a PNG. — *Implemented.*
+* **Cancellation:** Pressing **Escape** during Manual or Window selection mode cancels the operation. — *Pending together with `S`/`W`; Escape currently quits the app.*
+* **Output Path Generation:** Combines the configured `screenshot_path` with the evaluated `strftime` filename pattern (`~` expansion and directory creation included). — *Implemented.*
 
 ---
 
-## 8. Configuration Window
+## 9. Configuration Window — *Stub*
 * Activated via the `C` key.
 * Displays all current and future configuration options.
 * **Instant Application:** Value modifications take effect immediately without requiring explicit "Apply" or "Cancel" buttons.
 * **Factory Reset:** Each setting includes an adjacent reset button to revert individual values back to factory defaults.
 * **Persistence:** All runtime adjustments immediately update the underlying configuration file on disk.
+* **Status:** Not yet implemented; the `C` key is bound but inert.
 
 ---
 
-## 9. CLI Arguments
+## 10. CLI Arguments — *Implemented*
 The application supports the following command-line interface arguments:
 * `-z` or `--zoom <LEVEL>`: Specifies a preferred initial zoom level (e.g., `3`).
 * `-d` or `--debug`: Enables debug mode to output verbose troubleshooting logs to `stdout`.
