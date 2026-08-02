@@ -7,6 +7,7 @@ mod input;
 mod render;
 mod capture;
 mod engine;
+mod osd;
 
 #[derive(Parser, Debug)]
 #[command(name = "maggie", version, about = "Native Wayland screen magnifier")]

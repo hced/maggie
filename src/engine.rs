@@ -38,10 +38,11 @@ use wayland_client::{Connection, QueueHandle};
 use wayland_client::Proxy;
 
 use wayland_protocols_wlr::screencopy::v1::client::{
-    zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
+    zwlr_screencopy_frame_v1::Flags, zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 
+use crate::capture::CaptureManager;
 use crate::config::MagnifierConfig;
 use crate::render::Renderer;
 use crate::render::RgbaBuffer;
@@ -112,15 +113,24 @@ pub struct MagnifierWindow {
     layer: LayerSurface,
     compositor_state: CompositorState,
     screencast_manager: Option<ZwlrScreencopyManagerV1>,
-    screencast_frame: Option<ZwlrScreencopyFrameV1>,
     screencast_pool: Option<SlotPool>,
     screencast_buffer: Option<smithay_client_toolkit::shm::slot::Buffer>,
+    screencast_width: Option<u32>,
+    screencast_height: Option<u32>,
+    screencast_stride: Option<u32>,
+    y_invert: bool,
+    capture_retries: u8,
+    capture_manager: CaptureManager,
     captured: Option<CapturedFrame>,
     state: MagnifierState,
     exit: bool,
     first_configure: bool,
+    redraw_pending: bool,
     width: u32,
     height: u32,
+    current_output: Option<wl_output::WlOutput>,
+    frozen_center_logical: (i32, i32),
+    pointer_seen: bool,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
 }
@@ -164,6 +174,7 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
                     stride,
                     u32::from(format)
                 );
+                state.capture_retries = 0;
                 let format = match format {
                     wayland_client::WEnum::Value(f) => f,
                     _ => return,
@@ -172,6 +183,9 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
                     tracing::warn!("Unsupported screencopy format: {:?}", format);
                     return;
                 }
+                state.screencast_width = Some(width);
+                state.screencast_height = Some(height);
+                state.screencast_stride = Some(stride);
                 let pool_size = height as usize * stride as usize;
                 let mut pool = match SlotPool::new(pool_size, &state.shm) {
                     Ok(p) => p,
@@ -193,47 +207,78 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
                 }
             }
             Event::Flags { flags } => {
-                tracing::debug!("Screencopy flags: {:?}", flags);
+                if let wayland_client::WEnum::Value(flags) = flags {
+                    state.y_invert = flags.contains(Flags::YInvert);
+                    tracing::debug!("Screencopy flags: {:?}", flags);
+                }
             }
             Event::Ready { .. } => {
                 tracing::debug!("Screencopy frame ready");
+                state.capture_retries = 0;
                 if let (Some(mut pool), Some(buffer)) = (
                     state.screencast_pool.take(),
                     state.screencast_buffer.take(),
                 ) && let Some(canvas) = buffer.canvas(&mut pool)
                 {
-                    let stride = buffer.stride() as u32;
-                    let width = stride / 4;
-                    let height = buffer.height() as u32;
-                    let mut data = Vec::with_capacity((width * height * 4) as usize);
-                    for row in canvas.chunks_exact(stride as usize) {
-                        for px in row.chunks_exact(4) {
-                            data.push(px[2]);
-                            data.push(px[1]);
-                            data.push(px[0]);
-                            data.push(255);
+                    let stride = state.screencast_stride.unwrap_or(buffer.stride() as u32) as usize;
+                    let width = state
+                        .screencast_width
+                        .unwrap_or(buffer.stride() as u32 / 4) as usize;
+                    let height = state.screencast_height.unwrap_or(buffer.height() as u32) as usize;
+                    let mut data = Vec::with_capacity(width * height * 4);
+                    if state.y_invert {
+                        for row in canvas.chunks_exact(stride).rev().take(height) {
+                            convert_row(row, width, &mut data);
+                        }
+                    } else {
+                        for row in canvas.chunks_exact(stride).take(height) {
+                            convert_row(row, width, &mut data);
                         }
                     }
                     state.captured = Some(CapturedFrame {
-                        width,
-                        height,
+                        width: width as u32,
+                        height: height as u32,
                         data,
                     });
                     tracing::info!("Captured {}x{} frame", width, height);
                 }
-                state.screencast_frame = None;
-                state.request_screencopy(qh);
+                state.redraw_pending = true;
+                state.draw_frame(qh);
             }
             Event::Failed => {
-                tracing::error!("Screencopy capture failed");
-                state.screencast_pool = None;
-                state.screencast_buffer = None;
-                state.screencast_frame = None;
+                if state.capture_retries < 3 {
+                    state.capture_retries += 1;
+                    tracing::warn!(
+                        "Screencopy capture failed, retrying ({}/{})",
+                        state.capture_retries,
+                        3
+                    );
+                    state.screencast_pool = None;
+                    state.screencast_buffer = None;
+                    state.request_screencopy(qh);
+                } else {
+                    tracing::error!(
+                        "Screencopy capture failed after {} retries, showing black overlay",
+                        state.capture_retries
+                    );
+                    state.screencast_pool = None;
+                    state.screencast_buffer = None;
+                    state.draw_black_overlay(qh);
+                }
             }
             _ => {
                 tracing::debug!("Screencopy frame event: {:?}", event);
             }
         }
+    }
+}
+
+fn convert_row(row: &[u8], width: usize, out: &mut Vec<u8>) {
+    for px in row.chunks_exact(4).take(width) {
+        out.push(px[2]);
+        out.push(px[1]);
+        out.push(px[0]);
+        out.push(255);
     }
 }
 
@@ -289,7 +334,10 @@ impl CompositorHandler for MagnifierWindow {
         _: &wl_surface::WlSurface,
         _: u32,
     ) {
-        self.draw_frame(qh);
+        if self.redraw_pending {
+            self.redraw_pending = false;
+            self.draw_frame(qh);
+        }
     }
 
     fn surface_enter(
@@ -297,8 +345,9 @@ impl CompositorHandler for MagnifierWindow {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        self.current_output = Some(output.clone());
     }
 
     fn surface_leave(
@@ -308,6 +357,7 @@ impl CompositorHandler for MagnifierWindow {
         _: &wl_surface::WlSurface,
         _: &wl_output::WlOutput,
     ) {
+        self.current_output = None;
     }
 }
 
@@ -330,7 +380,6 @@ impl LayerShellHandler for MagnifierWindow {
         if self.first_configure {
             self.first_configure = false;
             self.request_screencopy(qh);
-            self.draw_frame(qh);
         }
 
         self.layer.commit();
@@ -349,6 +398,7 @@ impl PointerHandler for MagnifierWindow {
             if &event.surface != self.layer.wl_surface() {
                 continue;
             }
+            self.pointer_seen = true;
             self.state.pointer_position = (event.position.0 as i32, event.position.1 as i32);
         }
     }
@@ -402,19 +452,23 @@ impl KeyboardHandler for MagnifierWindow {
             _ => None,
         } {
             self.state.handle_zoom_key(zoom_level);
+            self.redraw_pending = true;
         }
 
         let config_key = &self.state.config.keybindings;
 
         if keysym_str == config_key.toggle_osd {
             self.state.toggle_osd();
+            self.redraw_pending = true;
             tracing::info!("OSD toggled: {}", self.state.osd_visible);
         } else if keysym_str == config_key.screenshot_manual {
             tracing::info!("Manual screenshot mode - not yet implemented");
         } else if keysym_str == config_key.screenshot_window {
             tracing::info!("Window screenshot mode - not yet implemented");
         } else if keysym_str == config_key.screenshot_fullscreen {
-            tracing::info!("Fullscreen screenshot - not yet implemented");
+            if let Err(e) = self.save_screenshot() {
+                tracing::error!("Failed to save screenshot: {:#}", e);
+            }
         } else if keysym_str == config_key.config_window {
             tracing::info!("Configuration window - not yet implemented");
         } else if keysym_str == config_key.anti_aliasing {
@@ -546,28 +600,61 @@ smithay_client_toolkit::delegate_dispatch2!(MagnifierWindow);
 
 impl MagnifierWindow {
     fn request_screencopy(&mut self, qh: &QueueHandle<Self>) {
-        if let (Some(manager), Some(output)) = (
-            &self.screencast_manager,
-            self.output_state.outputs().next(),
-        ) {
-            let frame = manager.capture_output(true as i32, &output, qh, ScreencastFrameData);
-            self.screencast_frame = Some(frame);
+        let Some(manager) = &self.screencast_manager else {
+            return;
+        };
+        let output = self
+            .current_output
+            .clone()
+            .or_else(|| self.output_state.outputs().next());
+        let Some(output) = output else {
+            tracing::error!("No output available for screencopy");
+            return;
+        };
+
+        self.frozen_center_logical = self.state.pointer_position;
+        let _frame = manager.capture_output(true as i32, &output, qh, ScreencastFrameData);
+    }
+
+    fn capture_scale(&self) -> i32 {
+        match self
+            .current_output
+            .as_ref()
+            .and_then(|o| self.output_state.info(o))
+        {
+            Some(info) => info.scale_factor.max(1),
+            None => 1,
         }
     }
 
-    fn draw_frame(&mut self, qh: &QueueHandle<Self>) {
+    fn osd_lines(&self) -> Vec<String> {
+        let config_key = &self.state.config.keybindings;
+        vec![
+            format!("maggie  zoom {}x", self.state.zoom),
+            "1-9  zoom level".to_string(),
+            format!("{}  toggle OSD", config_key.toggle_osd),
+            format!("{}  screenshot fullscreen", config_key.screenshot_fullscreen),
+            format!("{}  manual selection", config_key.screenshot_manual),
+            format!("{}  window selection", config_key.screenshot_window),
+            format!("{}  config window", config_key.config_window),
+            "Q / Esc  quit".to_string(),
+        ]
+    }
+
+    fn render_frame<F>(&mut self, qh: &QueueHandle<Self>, fill: F)
+    where
+        F: FnOnce(&mut [u8], i32, i32, i32),
+    {
         let width = self.width;
         let height = self.height;
         let stride = width as i32 * 4;
 
-        let result = self.pool.create_buffer(
+        let (buffer, canvas) = match self.pool.create_buffer(
             width as i32,
             height as i32,
             stride,
             wl_shm::Format::Argb8888,
-        );
-
-        let (buffer, canvas) = match result {
+        ) {
             Ok(result) => result,
             Err(e) => {
                 tracing::error!("Failed to create buffer: {:?}", e);
@@ -575,42 +662,59 @@ impl MagnifierWindow {
             }
         };
 
+        fill(canvas, width as i32, height as i32, stride);
+
+        let surface = self.layer.wl_surface();
+        buffer.attach_to(surface).expect("buffer attach");
+        surface.damage(0, 0, width as i32, height as i32);
+        surface.frame(qh, FrameCallbackData(surface.clone()));
+        self.layer.commit();
+    }
+
+    fn draw_frame(&mut self, qh: &QueueHandle<Self>) {
+        let Some(source) = self.captured.as_ref() else {
+            return;
+        };
+
         let zoom = self.state.zoom;
-        let source = self.captured.as_ref().map(|frame| {
-            let view_w = (width as f64 / zoom).ceil() as i32;
-            let view_h = (height as f64 / zoom).ceil() as i32;
-            let (px, py) = self.state.pointer_position;
-            let scale = self
-                .output_state
-                .outputs()
-                .next()
-                .and_then(|o| self.output_state.info(&o))
-                .map(|i| i.scale_factor.max(1))
-                .unwrap_or(1);
-            let px = px * scale;
-            let py = py * scale;
+        let view_w = (self.width as f64 / zoom).ceil() as i32;
+        let view_h = (self.height as f64 / zoom).ceil() as i32;
+        let scale = self.capture_scale();
+        let (center_x, center_y) = if self.pointer_seen {
+            (
+                self.frozen_center_logical.0 * scale,
+                self.frozen_center_logical.1 * scale,
+            )
+        } else {
+            (source.width as i32 / 2, source.height as i32 / 2)
+        };
 
-            let src_x = (px - view_w / 2).clamp(0, frame.width as i32 - 1);
-            let src_y = (py - view_h / 2).clamp(0, frame.height as i32 - 1);
-            let src_w = view_w.min(frame.width as i32 - src_x);
-            let src_h = view_h.min(frame.height as i32 - src_y);
+        let src_x = (center_x - view_w / 2).clamp(0, source.width as i32 - 1);
+        let src_y = (center_y - view_h / 2).clamp(0, source.height as i32 - 1);
+        let src_w = view_w.min(source.width as i32 - src_x);
+        let src_h = view_h.min(source.height as i32 - src_y);
 
-            let region = RgbaBuffer {
-                width: src_w,
-                height: src_h,
-                data: extract_region(&frame.data, frame.width as i32, src_x, src_y, src_w, src_h),
-            };
-            self.state.renderer.render_nearest_neighbor(&region)
-        });
+        let region = RgbaBuffer {
+            width: src_w,
+            height: src_h,
+            data: extract_region(&source.data, source.width as i32, src_x, src_y, src_w, src_h),
+        };
+        let scaled = self.state.renderer.render_nearest_neighbor(&region);
 
-        if let Some(scaled) = source {
-            let dest_w = scaled.width.min(width as i32);
-            let dest_h = scaled.height.min(height as i32);
-            let off_x = ((width as i32 - dest_w) / 2).max(0);
-            let off_y = ((height as i32 - dest_h) / 2).max(0);
-            canvas.chunks_exact_mut(stride as usize).take(dest_h as usize).for_each(|row| {
-                row.fill(0);
-            });
+        let dest_w = scaled.width.min(self.width as i32);
+        let dest_h = scaled.height.min(self.height as i32);
+        let off_x = ((self.width as i32 - dest_w) / 2).max(0);
+        let off_y = ((self.height as i32 - dest_h) / 2).max(0);
+
+        let show_osd = self.state.osd_visible;
+        let osd_lines = self.osd_lines();
+        let osd_cursor = self.state.pointer_position;
+
+        self.render_frame(qh, |canvas, width, height, stride| {
+            canvas
+                .chunks_exact_mut(stride as usize)
+                .take(dest_h as usize)
+                .for_each(|row| row.fill(0));
             for y in 0..dest_h {
                 let src_row = &scaled.data[(y as usize) * (scaled.width as usize) * 4..];
                 let dest_row = &mut canvas
@@ -618,20 +722,41 @@ impl MagnifierWindow {
                 dest_row[..(dest_w as usize) * 4]
                     .copy_from_slice(&src_row[..(dest_w as usize) * 4]);
             }
-        } else {
+            if show_osd {
+                crate::osd::draw_osd(canvas, width, height, &osd_lines, osd_cursor);
+            }
+        });
+    }
+
+    fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
+        self.render_frame(qh, |canvas, _width, _height, _stride| {
             canvas.chunks_exact_mut(4).for_each(|chunk| {
                 chunk[0] = 0;
                 chunk[1] = 0;
                 chunk[2] = 0;
                 chunk[3] = 255;
             });
-        }
+        });
+    }
 
-        let surface = self.layer.wl_surface();
-        buffer.attach_to(surface).expect("buffer attach");
-        surface.damage(0, 0, width as i32, height as i32);
-        surface.frame(qh, FrameCallbackData(surface.clone()));
-        self.layer.commit();
+    fn save_screenshot(&mut self) -> anyhow::Result<()> {
+        let Some(captured) = &self.captured else {
+            tracing::warn!("No captured frame yet");
+            return Ok(());
+        };
+        let path = self.capture_manager.generate_screenshot_path()?;
+        let file = std::fs::File::create(&path)?;
+        let mut encoder = png::Encoder::new(
+            std::io::BufWriter::new(file),
+            captured.width,
+            captured.height,
+        );
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&captured.data)?;
+        tracing::info!("Screenshot saved to {}", path.display());
+        Ok(())
     }
 }
 
@@ -686,6 +811,10 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
     layer.commit();
 
     let pool = SlotPool::new(1920 * 1080 * 4, &shm)?;
+    let capture_manager = CaptureManager::new(
+        config.screenshot_path.clone(),
+        config.screenshot_filename_pattern.clone(),
+    );
     let state = MagnifierState::new(config, initial_zoom);
 
     let mut window = MagnifierWindow {
@@ -697,15 +826,24 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         layer,
         compositor_state: compositor,
         screencast_manager,
-        screencast_frame: None,
         screencast_pool: None,
         screencast_buffer: None,
+        screencast_width: None,
+        screencast_height: None,
+        screencast_stride: None,
+        y_invert: false,
+        capture_retries: 0,
+        capture_manager,
         captured: None,
         state,
         exit: false,
         first_configure: true,
+        redraw_pending: false,
         width: 1920,
         height: 1080,
+        current_output: None,
+        frozen_center_logical: (0, 0),
+        pointer_seen: false,
         keyboard: None,
         pointer: None,
     };
