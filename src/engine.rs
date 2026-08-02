@@ -35,9 +35,16 @@ use wayland_client::protocol::{
     wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
 };
 use wayland_client::{Connection, QueueHandle};
+use wayland_client::Proxy;
+
+use wayland_protocols_wlr::screencopy::v1::client::{
+    zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
+    zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+};
 
 use crate::config::MagnifierConfig;
 use crate::render::Renderer;
+use crate::render::RgbaBuffer;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum MagnifierMode {
@@ -90,6 +97,12 @@ impl MagnifierState {
     }
 }
 
+pub struct CapturedFrame {
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
+}
+
 pub struct MagnifierWindow {
     registry_state: RegistryState,
     output_state: OutputState,
@@ -98,6 +111,11 @@ pub struct MagnifierWindow {
     pool: SlotPool,
     layer: LayerSurface,
     compositor_state: CompositorState,
+    screencast_manager: Option<ZwlrScreencopyManagerV1>,
+    screencast_frame: Option<ZwlrScreencopyFrameV1>,
+    screencast_pool: Option<SlotPool>,
+    screencast_buffer: Option<smithay_client_toolkit::shm::slot::Buffer>,
+    captured: Option<CapturedFrame>,
     state: MagnifierState,
     exit: bool,
     first_configure: bool,
@@ -105,6 +123,118 @@ pub struct MagnifierWindow {
     height: u32,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
+}
+
+
+struct ScreencastManagerData;
+
+impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyManagerV1, MagnifierWindow>
+    for ScreencastManagerData
+{
+    fn event(
+        &self,
+        _: &mut MagnifierWindow,
+        _: &ZwlrScreencopyManagerV1,
+        _: <ZwlrScreencopyManagerV1 as Proxy>::Event,
+        _: &Connection,
+        _: &QueueHandle<MagnifierWindow>,
+    ) {}
+}
+
+struct ScreencastFrameData;
+
+impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, MagnifierWindow>
+    for ScreencastFrameData
+{
+    fn event(
+        &self,
+        state: &mut MagnifierWindow,
+        frame: &ZwlrScreencopyFrameV1,
+        event: <ZwlrScreencopyFrameV1 as Proxy>::Event,
+        _: &Connection,
+        qh: &QueueHandle<MagnifierWindow>,
+    ) {
+        use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::Event;
+        match event {
+            Event::Buffer { format, width, height, stride } => {
+                tracing::debug!(
+                    "Screencopy buffer: {}x{} stride={} format={}",
+                    width,
+                    height,
+                    stride,
+                    u32::from(format)
+                );
+                let format = match format {
+                    wayland_client::WEnum::Value(f) => f,
+                    _ => return,
+                };
+                if format != wl_shm::Format::Argb8888 && format != wl_shm::Format::Xrgb8888 {
+                    tracing::warn!("Unsupported screencopy format: {:?}", format);
+                    return;
+                }
+                let pool_size = height as usize * stride as usize;
+                let mut pool = match SlotPool::new(pool_size, &state.shm) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!("Failed to create screencopy pool: {:?}", e);
+                        return;
+                    }
+                };
+                if let Ok((buffer, _canvas)) = pool.create_buffer(
+                    width as i32,
+                    height as i32,
+                    stride as i32,
+                    format,
+                ) {
+                    frame.copy(buffer.wl_buffer());
+                    state.screencast_pool = Some(pool);
+                    state.screencast_buffer = Some(buffer);
+                    tracing::debug!("Screencopy buffer created and copy requested");
+                }
+            }
+            Event::Flags { flags } => {
+                tracing::debug!("Screencopy flags: {:?}", flags);
+            }
+            Event::Ready { .. } => {
+                tracing::debug!("Screencopy frame ready");
+                if let (Some(mut pool), Some(buffer)) = (
+                    state.screencast_pool.take(),
+                    state.screencast_buffer.take(),
+                ) && let Some(canvas) = buffer.canvas(&mut pool)
+                {
+                    let stride = buffer.stride() as u32;
+                    let width = stride / 4;
+                    let height = buffer.height() as u32;
+                    let mut data = Vec::with_capacity((width * height * 4) as usize);
+                    for row in canvas.chunks_exact(stride as usize) {
+                        for px in row.chunks_exact(4) {
+                            data.push(px[2]);
+                            data.push(px[1]);
+                            data.push(px[0]);
+                            data.push(255);
+                        }
+                    }
+                    state.captured = Some(CapturedFrame {
+                        width,
+                        height,
+                        data,
+                    });
+                    tracing::info!("Captured {}x{} frame", width, height);
+                }
+                state.screencast_frame = None;
+                state.request_screencopy(qh);
+            }
+            Event::Failed => {
+                tracing::error!("Screencopy capture failed");
+                state.screencast_pool = None;
+                state.screencast_buffer = None;
+                state.screencast_frame = None;
+            }
+            _ => {
+                tracing::debug!("Screencopy frame event: {:?}", event);
+            }
+        }
+    }
 }
 
 delegate_registry!(MagnifierWindow);
@@ -199,6 +329,7 @@ impl LayerShellHandler for MagnifierWindow {
 
         if self.first_configure {
             self.first_configure = false;
+            self.request_screencopy(qh);
             self.draw_frame(qh);
         }
 
@@ -294,7 +425,9 @@ impl KeyboardHandler for MagnifierWindow {
             self.state.switch_mode(MagnifierMode::EdgePan);
         } else if keysym_str == config_key.mode_miniature {
             self.state.switch_mode(MagnifierMode::MiniatureWindow);
-        } else if event.keysym == Keysym::Escape {
+        }
+
+        if event.keysym == Keysym::Escape || event.keysym == Keysym::q {
             self.exit = true;
         }
     }
@@ -403,6 +536,8 @@ fn keysym_to_string(keysym: Keysym) -> String {
         Keysym::_7 => "7".to_string(),
         Keysym::_8 => "8".to_string(),
         Keysym::_9 => "9".to_string(),
+        Keysym::q => "q".to_string(),
+        Keysym::Escape => "Escape".to_string(),
         _ => format!("{}", u32::from(keysym)),
     }
 }
@@ -410,6 +545,16 @@ fn keysym_to_string(keysym: Keysym) -> String {
 smithay_client_toolkit::delegate_dispatch2!(MagnifierWindow);
 
 impl MagnifierWindow {
+    fn request_screencopy(&mut self, qh: &QueueHandle<Self>) {
+        if let (Some(manager), Some(output)) = (
+            &self.screencast_manager,
+            self.output_state.outputs().next(),
+        ) {
+            let frame = manager.capture_output(true as i32, &output, qh, ScreencastFrameData);
+            self.screencast_frame = Some(frame);
+        }
+    }
+
     fn draw_frame(&mut self, qh: &QueueHandle<Self>) {
         let width = self.width;
         let height = self.height;
@@ -430,12 +575,57 @@ impl MagnifierWindow {
             }
         };
 
-        canvas.chunks_exact_mut(4).for_each(|chunk| {
-            chunk[0] = 0;
-            chunk[1] = 0;
-            chunk[2] = 0;
-            chunk[3] = 255;
+        let zoom = self.state.zoom;
+        let source = self.captured.as_ref().map(|frame| {
+            let view_w = (width as f64 / zoom).ceil() as i32;
+            let view_h = (height as f64 / zoom).ceil() as i32;
+            let (px, py) = self.state.pointer_position;
+            let scale = self
+                .output_state
+                .outputs()
+                .next()
+                .and_then(|o| self.output_state.info(&o))
+                .map(|i| i.scale_factor.max(1))
+                .unwrap_or(1);
+            let px = px * scale;
+            let py = py * scale;
+
+            let src_x = (px - view_w / 2).clamp(0, frame.width as i32 - 1);
+            let src_y = (py - view_h / 2).clamp(0, frame.height as i32 - 1);
+            let src_w = view_w.min(frame.width as i32 - src_x);
+            let src_h = view_h.min(frame.height as i32 - src_y);
+
+            let region = RgbaBuffer {
+                width: src_w,
+                height: src_h,
+                data: extract_region(&frame.data, frame.width as i32, src_x, src_y, src_w, src_h),
+            };
+            self.state.renderer.render_nearest_neighbor(&region)
         });
+
+        if let Some(scaled) = source {
+            let dest_w = scaled.width.min(width as i32);
+            let dest_h = scaled.height.min(height as i32);
+            let off_x = ((width as i32 - dest_w) / 2).max(0);
+            let off_y = ((height as i32 - dest_h) / 2).max(0);
+            canvas.chunks_exact_mut(stride as usize).take(dest_h as usize).for_each(|row| {
+                row.fill(0);
+            });
+            for y in 0..dest_h {
+                let src_row = &scaled.data[(y as usize) * (scaled.width as usize) * 4..];
+                let dest_row = &mut canvas
+                    [((y + off_y) as usize) * (stride as usize) + (off_x as usize) * 4..];
+                dest_row[..(dest_w as usize) * 4]
+                    .copy_from_slice(&src_row[..(dest_w as usize) * 4]);
+            }
+        } else {
+            canvas.chunks_exact_mut(4).for_each(|chunk| {
+                chunk[0] = 0;
+                chunk[1] = 0;
+                chunk[2] = 0;
+                chunk[3] = 255;
+            });
+        }
 
         let surface = self.layer.wl_surface();
         buffer.attach_to(surface).expect("buffer attach");
@@ -443,6 +633,23 @@ impl MagnifierWindow {
         surface.frame(qh, FrameCallbackData(surface.clone()));
         self.layer.commit();
     }
+}
+
+fn extract_region(
+    data: &[u8],
+    width: i32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for row in 0..h {
+        let src = ((y + row) as usize * width as usize + x as usize) * 4;
+        let dest = &data[src..src + (w as usize) * 4];
+        out.extend_from_slice(dest);
+    }
+    out
 }
 
 pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
@@ -463,6 +670,10 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
     let shm = Shm::bind(&globals, &qh)
         .map_err(|e| anyhow::anyhow!("SHM not available: {:?}", e))?;
     let output_state = OutputState::new(&globals, &qh);
+
+    let screencast_manager = globals
+        .bind::<ZwlrScreencopyManagerV1, _, _>(&qh, 1..=3, ScreencastManagerData)
+        .ok();
 
     let mut event_queue = event_queue;
 
@@ -485,6 +696,11 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         pool,
         layer,
         compositor_state: compositor,
+        screencast_manager,
+        screencast_frame: None,
+        screencast_pool: None,
+        screencast_buffer: None,
+        captured: None,
         state,
         exit: false,
         first_configure: true,
@@ -498,6 +714,10 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         "Maggie magnifier started with zoom {} on layer surface",
         window.state.zoom
     );
+
+    if window.screencast_manager.is_some() {
+        tracing::info!("Screencopy manager available");
+    }
 
     loop {
         event_queue.blocking_dispatch(&mut window)?;
