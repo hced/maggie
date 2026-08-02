@@ -18,6 +18,7 @@
 * **Frozen view:** After the first frame, the overlay displays a nearest-neighbor zoomed view of the frozen frame. Zoom keys `1`–`9` re-scale the same frozen frame; the screen is never re-captured at runtime.
 * **Failure handling:** A failed capture is retried up to **3 times**; if all retries fail, the overlay renders black.
 * **Zoom centering:** The viewport follows the **live cursor** over the frozen frame — the view is centered on the content under the cursor and clamped at the capture edges; if the cursor was never seen, it centers on the capture. Zoom keys `1`–`9` re-scale.
+* **Viewport clamping:** The viewport is clamped to the capture bounds so it always fills the screen and sticks at the edges; consequently, the pointer drifts off-center as it approaches the screen edges.
 * **No live mode:** Continuous live capture is explicitly **out of scope**; the interactive live-magnifier idea (including an earlier planned `--live` flag) was dropped. Behavior modes that assumed a live view (see §6) are obsolete until redefined.
 
 ---
@@ -51,7 +52,7 @@
 * Toggable via the `K` key (configurable via `keybindings.toggle_osd`).
 * Off by default, unless configured to always show via the configuration file (`show_osd`).
 * Dynamically stays or moves out of the way of the cursor position: the legend box is drawn in the quadrant opposite the cursor.
-* Rendered with a built-in 5×7 bitmap font (`src/osd.rs`); lists zoom level, `1`–`9` zoom, `K` OSD toggle, `F` fullscreen screenshot, `S`/`W`/`C` (pending), and `Q`/`Esc` quit.
+* Rendered with a built-in 5×7 bitmap font (`src/osd.rs`) drawn at **2× scale** (5×7 glyphs scaled 2×, i.e. rendered at 10×14); lists zoom level, `1`–`9` zoom, `K` OSD toggle, `F` fullscreen screenshot, `S`/`W`/`C` (pending), and `Q`/`Esc` quit.
 
 ---
 
