@@ -695,10 +695,12 @@ impl MagnifierWindow {
             (source.width as i32 / 2, source.height as i32 / 2)
         };
 
-        let src_x = (center_x - view_w / 2).clamp(0, source.width as i32 - 1);
-        let src_y = (center_y - view_h / 2).clamp(0, source.height as i32 - 1);
-        let src_w = view_w.min(source.width as i32 - src_x);
-        let src_h = view_h.min(source.height as i32 - src_y);
+        let max_x = (source.width as i32 - view_w).max(0);
+        let max_y = (source.height as i32 - view_h).max(0);
+        let src_x = (center_x - view_w / 2).clamp(0, max_x);
+        let src_y = (center_y - view_h / 2).clamp(0, max_y);
+        let src_w = view_w.min(source.width as i32);
+        let src_h = view_h.min(source.height as i32);
 
         let region = RgbaBuffer {
             width: src_w,
@@ -717,10 +719,7 @@ impl MagnifierWindow {
         let osd_cursor = self.state.pointer_position;
 
         self.render_frame(qh, |canvas, width, height, stride| {
-            canvas
-                .chunks_exact_mut(stride as usize)
-                .take(dest_h as usize)
-                .for_each(|row| row.fill(0));
+            canvas.fill(0);
             for y in 0..dest_h {
                 let src_row = &scaled.data[(y as usize) * (scaled.width as usize) * 4..];
                 let dest_row = &mut canvas

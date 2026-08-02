@@ -2,10 +2,11 @@
 
 const GLYPH_WIDTH: i32 = 5;
 const GLYPH_HEIGHT: usize = 7;
-const GLYPH_ADVANCE: i32 = 6;
-const LINE_HEIGHT: i32 = GLYPH_HEIGHT as i32 + 2;
-const BOX_PADDING: i32 = 8;
-const BOX_MARGIN: i32 = 10;
+const GLYPH_SCALE: i32 = 2;
+const GLYPH_ADVANCE: i32 = 6 * GLYPH_SCALE;
+const LINE_HEIGHT: i32 = (GLYPH_HEIGHT as i32 + 2) * GLYPH_SCALE;
+const BOX_PADDING: i32 = 16;
+const BOX_MARGIN: i32 = 14;
 const BOX_ALPHA: u8 = 190;
 const TEXT_COLOR: [u8; 3] = [0xE6, 0xE6, 0xE6];
 
@@ -74,16 +75,23 @@ pub fn draw_text(
                     if row & (1 << (GLYPH_WIDTH - 1 - col)) == 0 {
                         continue;
                     }
-                    let px = pen_x + col;
-                    let py = y + row_index as i32;
-                    if px < 0 || py < 0 || px >= canvas_w || py >= canvas_h {
-                        continue;
+                    for dy in 0..GLYPH_SCALE {
+                        let py = y + row_index as i32 * GLYPH_SCALE + dy;
+                        if py < 0 || py >= canvas_h {
+                            continue;
+                        }
+                        for dx in 0..GLYPH_SCALE {
+                            let px = pen_x + col * GLYPH_SCALE + dx;
+                            if px < 0 || px >= canvas_w {
+                                continue;
+                            }
+                            let index = ((py * canvas_w + px) * 4) as usize;
+                            canvas[index] = color[2];
+                            canvas[index + 1] = color[1];
+                            canvas[index + 2] = color[0];
+                            canvas[index + 3] = 255;
+                        }
                     }
-                    let index = ((py * canvas_w + px) * 4) as usize;
-                    canvas[index] = color[2];
-                    canvas[index + 1] = color[1];
-                    canvas[index + 2] = color[0];
-                    canvas[index + 3] = 255;
                 }
             }
         }
