@@ -2,9 +2,8 @@
 
 use std::num::NonZeroU32;
 
-use smithay_client_toolkit::compositor::FrameCallbackData;
-use smithay_client_toolkit::compositor::CompositorHandler;
 use smithay_client_toolkit::compositor::CompositorState;
+use smithay_client_toolkit::compositor::CompositorHandler;
 use smithay_client_toolkit::delegate_registry;
 use smithay_client_toolkit::output::OutputHandler;
 use smithay_client_toolkit::output::OutputState;
@@ -125,11 +124,10 @@ pub struct MagnifierWindow {
     state: MagnifierState,
     exit: bool,
     first_configure: bool,
-    redraw_pending: bool,
+    last_redraw: Option<std::time::Instant>,
     width: u32,
     height: u32,
     current_output: Option<wl_output::WlOutput>,
-    frozen_center_logical: (i32, i32),
     pointer_seen: bool,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
@@ -242,7 +240,6 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
                     });
                     tracing::info!("Captured {}x{} frame", width, height);
                 }
-                state.redraw_pending = true;
                 state.draw_frame(qh);
             }
             Event::Failed => {
@@ -330,14 +327,10 @@ impl CompositorHandler for MagnifierWindow {
     fn frame(
         &mut self,
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &QueueHandle<Self>,
         _: &wl_surface::WlSurface,
         _: u32,
     ) {
-        if self.redraw_pending {
-            self.redraw_pending = false;
-            self.draw_frame(qh);
-        }
     }
 
     fn surface_enter(
@@ -390,16 +383,24 @@ impl PointerHandler for MagnifierWindow {
     fn pointer_frame(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
+        let mut moved = false;
         for event in events {
             if &event.surface != self.layer.wl_surface() {
                 continue;
             }
             self.pointer_seen = true;
-            self.state.pointer_position = (event.position.0 as i32, event.position.1 as i32);
+            let position = (event.position.0 as i32, event.position.1 as i32);
+            if position != self.state.pointer_position {
+                self.state.pointer_position = position;
+                moved = true;
+            }
+        }
+        if moved {
+            self.draw_frame(qh);
         }
     }
 }
@@ -430,7 +431,7 @@ impl KeyboardHandler for MagnifierWindow {
     fn press_key(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
         event: KeyEvent,
@@ -452,14 +453,14 @@ impl KeyboardHandler for MagnifierWindow {
             _ => None,
         } {
             self.state.handle_zoom_key(zoom_level);
-            self.redraw_pending = true;
+            self.draw_frame(qh);
         }
 
         let config_key = &self.state.config.keybindings;
 
         if keysym_str == config_key.toggle_osd {
             self.state.toggle_osd();
-            self.redraw_pending = true;
+            self.draw_frame(qh);
             tracing::info!("OSD toggled: {}", self.state.osd_visible);
         } else if keysym_str == config_key.screenshot_manual {
             tracing::info!("Manual screenshot mode - not yet implemented");
@@ -612,7 +613,6 @@ impl MagnifierWindow {
             return;
         };
 
-        self.frozen_center_logical = self.state.pointer_position;
         let _frame = manager.capture_output(true as i32, &output, qh, ScreencastFrameData);
     }
 
@@ -641,7 +641,7 @@ impl MagnifierWindow {
         ]
     }
 
-    fn render_frame<F>(&mut self, qh: &QueueHandle<Self>, fill: F)
+    fn render_frame<F>(&mut self, _qh: &QueueHandle<Self>, fill: F)
     where
         F: FnOnce(&mut [u8], i32, i32, i32),
     {
@@ -667,7 +667,6 @@ impl MagnifierWindow {
         let surface = self.layer.wl_surface();
         buffer.attach_to(surface).expect("buffer attach");
         surface.damage(0, 0, width as i32, height as i32);
-        surface.frame(qh, FrameCallbackData(surface.clone()));
         self.layer.commit();
     }
 
@@ -676,14 +675,21 @@ impl MagnifierWindow {
             return;
         };
 
+        if let Some(last) = self.last_redraw
+            && last.elapsed() < std::time::Duration::from_millis(16)
+        {
+            return;
+        }
+        self.last_redraw = Some(std::time::Instant::now());
+
         let zoom = self.state.zoom;
         let view_w = (self.width as f64 / zoom).ceil() as i32;
         let view_h = (self.height as f64 / zoom).ceil() as i32;
         let scale = self.capture_scale();
         let (center_x, center_y) = if self.pointer_seen {
             (
-                self.frozen_center_logical.0 * scale,
-                self.frozen_center_logical.1 * scale,
+                self.state.pointer_position.0 * scale,
+                self.state.pointer_position.1 * scale,
             )
         } else {
             (source.width as i32 / 2, source.height as i32 / 2)
@@ -838,11 +844,10 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         state,
         exit: false,
         first_configure: true,
-        redraw_pending: false,
+        last_redraw: None,
         width: 1920,
         height: 1080,
         current_output: None,
-        frozen_center_logical: (0, 0),
         pointer_seen: false,
         keyboard: None,
         pointer: None,
