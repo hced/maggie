@@ -15,9 +15,9 @@
 ## 3. Screen Capture & Modes — *Implemented*
 * **Frozen-frame model:** The screen is captured exactly **once** at startup via `zwlr_screencopy` (`capture_output` on the current output). The SHM buffer (XRGB8888/ARGB8888) is converted to RGBA with a stride-aware row copy, honoring the `y_invert` flag.
 * **Capture-before-content:** The fullscreen layer-shell overlay (`Layer::Overlay`) is committed at startup but presents **no image data until the first captured frame is ready**; the initial screencopy therefore never contains the overlay, avoiding the Droste-effect self-feedback that plagues live-capture magnifiers.
-* **Static view:** After the first frame, the overlay displays a static, nearest-neighbor zoomed view of the frozen frame. Zoom keys `1`–`9` re-scale the same frozen frame; the screen is never re-captured at runtime.
+* **Frozen view:** After the first frame, the overlay displays a nearest-neighbor zoomed view of the frozen frame. Zoom keys `1`–`9` re-scale the same frozen frame; the screen is never re-captured at runtime.
 * **Failure handling:** A failed capture is retried up to **3 times**; if all retries fail, the overlay renders black.
-* **Zoom centering:** The zoomed view is centered on the pointer position **at capture time**; if the pointer was never seen, the screen center is used.
+* **Zoom centering:** The viewport follows the **live cursor** over the frozen frame — the view is centered on the content under the cursor and clamped at the capture edges; if the cursor was never seen, it centers on the capture. Zoom keys `1`–`9` re-scale.
 * **No live mode:** Continuous live capture is explicitly **out of scope**; the interactive live-magnifier idea (including an earlier planned `--live` flag) was dropped. Behavior modes that assumed a live view (see §6) are obsolete until redefined.
 
 ---
@@ -42,8 +42,8 @@
 ---
 
 ## 6. Behavior Modes — *Revised*
-* The former **Center Cursor** / **Edge Pan** / **Miniature Window** modes assumed a live, moving view and are now **obsolete** in the frozen-frame model; they are pending redefinition or removal. Mode-switch bindings (`Ctrl+C`/`Ctrl+E`/`Ctrl+M`) still exist in code but have no rendering effect.
-* **Actual behavior:** The zoomed view is centered on the pointer position at capture time (or screen center if the pointer was never seen) and does not follow the cursor afterward. See §3.
+* The former **Center Cursor** / **Edge Pan** / **Miniature Window** modes remain **obsolete/removed** in the frozen-frame model; they are pending redefinition or removal. Mode-switch bindings (`Ctrl+C`/`Ctrl+E`/`Ctrl+M`) still exist in code but have no rendering effect.
+* **Cursor-following:** The former "Center Cursor" concept is now the **built-in default behavior** of the frozen viewport — the view follows the live cursor over the frozen frame, clamped at the capture edges. See §3.
 
 ---
 
