@@ -7,7 +7,7 @@ const GLYPH_ADVANCE: i32 = 6 * GLYPH_SCALE;
 const LINE_HEIGHT: i32 = (GLYPH_HEIGHT as i32 + 2) * GLYPH_SCALE;
 const BOX_PADDING: i32 = 16;
 const BOX_MARGIN: i32 = 14;
-const BOX_ALPHA: u8 = 190;
+const BOX_ALPHA: u8 = 255;
 const TEXT_COLOR: [u8; 3] = [0xE6, 0xE6, 0xE6];
 
 fn glyph(character: char) -> Option<&'static [u8; GLYPH_HEIGHT]> {
@@ -119,12 +119,20 @@ pub fn draw_osd(
     let box_w = widest + BOX_PADDING;
     let box_h = lines.len() as i32 * LINE_HEIGHT + BOX_PADDING;
 
-    let cursor_in_top_left = cursor.0 < canvas_w / 2 && cursor.1 < canvas_h / 2;
-    let (box_x, box_y) = if cursor_in_top_left {
-        (canvas_w - BOX_MARGIN - box_w, canvas_h - BOX_MARGIN - box_h)
-    } else {
-        (BOX_MARGIN, BOX_MARGIN)
-    };
+    let corners = [
+        (BOX_MARGIN, BOX_MARGIN),
+        (canvas_w - BOX_MARGIN - box_w, BOX_MARGIN),
+        (BOX_MARGIN, canvas_h - BOX_MARGIN - box_h),
+        (canvas_w - BOX_MARGIN - box_w, canvas_h - BOX_MARGIN - box_h),
+    ];
+    let (box_x, box_y) = corners
+        .into_iter()
+        .max_by(|a, b| {
+            let da = ((a.0 + box_w / 2 - cursor.0) as f64).hypot((a.1 + box_h / 2 - cursor.1) as f64);
+            let db = ((b.0 + box_w / 2 - cursor.0) as f64).hypot((b.1 + box_h / 2 - cursor.1) as f64);
+            da.total_cmp(&db)
+        })
+        .unwrap();
 
     let pad = BOX_PADDING / 2;
     for y in box_y..(box_y + box_h).min(canvas_h) {
@@ -222,5 +230,44 @@ mod tests {
             })
             .collect();
         assert!(*text_ys.iter().min().unwrap() > 200 / 2, "box should be bottom-right");
+    }
+
+    #[test]
+    fn draw_osd_picks_farthest_corner() {
+        let corners = [
+            ("top-left", (150, 150)),
+            ("top-right", (10, 150)),
+            ("bottom-left", (150, 10)),
+            ("bottom-right", (10, 10)),
+        ];
+        for (name, cursor) in corners {
+            let mut canvas = vec![0u8; 200 * 200 * 4];
+            let lines = vec!["zoom".to_string()];
+            draw_osd(&mut canvas, 200, 200, &lines, cursor);
+            let pixels: Vec<[u8; 4]> =
+                canvas.chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]).collect();
+            let text_xs: Vec<i32> = (0..200)
+                .filter(|&x| {
+                    (0..200).any(|y| {
+                        let p = &pixels[(y * 200 + x) as usize];
+                        p[3] == 255 && p[2] > 200
+                    })
+                })
+                .collect();
+            let text_ys: Vec<i32> = (0..200)
+                .filter(|&y| {
+                    (0..200).any(|x| {
+                        let p = &pixels[(y * 200 + x) as usize];
+                        p[3] == 255 && p[2] > 200
+                    })
+                })
+                .collect();
+            let min_x = *text_xs.iter().min().unwrap();
+            let min_y = *text_ys.iter().min().unwrap();
+            let expect_left = name == "top-left" || name == "bottom-left";
+            let expect_top = name == "top-left" || name == "top-right";
+            assert_eq!(min_x < 100, expect_left, "wrong x placement for {name}");
+            assert_eq!(min_y < 100, expect_top, "wrong y placement for {name}");
+        }
     }
 }

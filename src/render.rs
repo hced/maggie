@@ -52,6 +52,32 @@ impl RgbaBuffer {
 
         result
     }
+
+    pub fn sample_bilinear(&self, x: f64, y: f64) -> [u8; 4] {
+        let max_x = (self.width - 1).max(0) as f64;
+        let max_y = (self.height - 1).max(0) as f64;
+        let x = x.clamp(0.0, max_x);
+        let y = y.clamp(0.0, max_y);
+        let x0 = x.floor() as i32;
+        let y0 = y.floor() as i32;
+        let x1 = (x0 + 1).min(self.width - 1);
+        let y1 = (y0 + 1).min(self.height - 1);
+        let fx = (x - x0 as f64) as f32;
+        let fy = (y - y0 as f64) as f32;
+
+        let p00 = self.pixel(x0, y0).unwrap_or([0; 4]);
+        let p01 = self.pixel(x1, y0).unwrap_or([0; 4]);
+        let p10 = self.pixel(x0, y1).unwrap_or([0; 4]);
+        let p11 = self.pixel(x1, y1).unwrap_or([0; 4]);
+
+        let mut out = [0u8; 4];
+        for c in 0..4 {
+            let top = p00[c] as f32 + (p01[c] as f32 - p00[c] as f32) * fx;
+            let bottom = p10[c] as f32 + (p11[c] as f32 - p10[c] as f32) * fx;
+            out[c] = (top + (bottom - top) * fy).round() as u8;
+        }
+        out
+    }
 }
 
 pub struct Renderer {
@@ -65,6 +91,26 @@ impl Renderer {
 
     pub fn render_nearest_neighbor(&mut self, source: &RgbaBuffer) -> RgbaBuffer {
         source.nearest_neighbor_scale(self.scale_factor)
+    }
+
+    pub fn render_bilinear(
+        &self,
+        source: &RgbaBuffer,
+        origin: (f64, f64),
+        dest_w: i32,
+        dest_h: i32,
+    ) -> RgbaBuffer {
+        let zoom = self.scale_factor;
+        let mut result = RgbaBuffer::new(dest_w, dest_h);
+        for y in 0..dest_h {
+            let sy = origin.1 + (y as f64 + 0.5) / zoom;
+            for x in 0..dest_w {
+                let sx = origin.0 + (x as f64 + 0.5) / zoom;
+                let pixel = source.sample_bilinear(sx, sy);
+                result.set_pixel(x, y, pixel);
+            }
+        }
+        result
     }
 
     pub fn update_scale_factor(&mut self, new_scale: f64) {

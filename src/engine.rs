@@ -4,12 +4,14 @@ use std::num::NonZeroU32;
 
 use smithay_client_toolkit::compositor::CompositorState;
 use smithay_client_toolkit::compositor::CompositorHandler;
+use smithay_client_toolkit::compositor::FrameCallbackData;
 use smithay_client_toolkit::delegate_registry;
 use smithay_client_toolkit::output::OutputHandler;
 use smithay_client_toolkit::output::OutputState;
 use smithay_client_toolkit::registry::ProvidesRegistryState;
 use smithay_client_toolkit::registry::RegistryState;
 use smithay_client_toolkit::registry_handlers;
+use smithay_client_toolkit::seat::pointer::PointerEventKind;
 use smithay_client_toolkit::seat::pointer::PointerHandler;
 use smithay_client_toolkit::seat::pointer::PointerEvent;
 use smithay_client_toolkit::seat::keyboard::KeyboardHandler;
@@ -31,7 +33,7 @@ use smithay_client_toolkit::shm::ShmHandler;
 
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{
-    wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
+    wl_callback, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
 };
 use wayland_client::{Connection, QueueHandle};
 use wayland_client::Proxy;
@@ -45,6 +47,12 @@ use crate::capture::CaptureManager;
 use crate::config::MagnifierConfig;
 use crate::render::Renderer;
 use crate::render::RgbaBuffer;
+
+const MIN_ZOOM: f64 = 1.0;
+const MAX_ZOOM: f64 = 32.0;
+const WHEEL_ZOOM_STEP: f64 = 0.1;
+const EASE_TAU: f64 = 0.04;
+const EASE_EPSILON: f64 = 0.05;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum MagnifierMode {
@@ -98,9 +106,7 @@ impl MagnifierState {
 }
 
 pub struct CapturedFrame {
-    width: u32,
-    height: u32,
-    data: Vec<u8>,
+    pub buffer: RgbaBuffer,
 }
 
 pub struct MagnifierWindow {
@@ -125,10 +131,15 @@ pub struct MagnifierWindow {
     exit: bool,
     first_configure: bool,
     last_redraw: Option<std::time::Instant>,
+    last_anim_tick: Option<std::time::Instant>,
+    view_center: Option<(f64, f64)>,
+    animating: bool,
+    frame_callback: Option<wl_callback::WlCallback>,
     width: u32,
     height: u32,
     current_output: Option<wl_output::WlOutput>,
     pointer_seen: bool,
+    pointer_position_f: (f64, f64),
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
 }
@@ -234,9 +245,11 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
                         }
                     }
                     state.captured = Some(CapturedFrame {
-                        width: width as u32,
-                        height: height as u32,
-                        data,
+                        buffer: RgbaBuffer {
+                            width: width as i32,
+                            height: height as i32,
+                            data,
+                        },
                     });
                     tracing::info!("Captured {}x{} frame", width, height);
                 }
@@ -327,10 +340,13 @@ impl CompositorHandler for MagnifierWindow {
     fn frame(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_surface::WlSurface,
         _: u32,
     ) {
+        if self.animating {
+            self.draw_frame(qh);
+        }
     }
 
     fn surface_enter(
@@ -393,13 +409,39 @@ impl PointerHandler for MagnifierWindow {
                 continue;
             }
             self.pointer_seen = true;
-            let position = (event.position.0 as i32, event.position.1 as i32);
-            if position != self.state.pointer_position {
-                self.state.pointer_position = position;
-                moved = true;
+            match event.kind {
+                PointerEventKind::Motion { .. } => {
+                    let position = (event.position.0, event.position.1);
+                    if position != self.pointer_position_f {
+                        self.pointer_position_f = position;
+                        self.state.pointer_position = (position.0 as i32, position.1 as i32);
+                        moved = true;
+                    }
+                }
+                PointerEventKind::Axis { vertical, .. } => {
+                    let steps = if vertical.value120 != 0 {
+                        vertical.value120 as f64 / 120.0
+                    } else {
+                        vertical.discrete as f64
+                    };
+                    if steps != 0.0 {
+                        let new_zoom = (self.state.zoom * (1.0 + steps * WHEEL_ZOOM_STEP))
+                            .clamp(MIN_ZOOM, MAX_ZOOM);
+                        if (new_zoom - self.state.zoom).abs() > 1e-9 {
+                            self.state.zoom = new_zoom;
+                            self.state.renderer.update_scale_factor(new_zoom);
+                            self.view_center = None;
+                            self.animating = false;
+                            tracing::info!("Wheel zoom set to {}", self.state.zoom);
+                            self.draw_frame(qh);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         if moved {
+            self.animating = true;
             self.draw_frame(qh);
         }
     }
@@ -453,6 +495,8 @@ impl KeyboardHandler for MagnifierWindow {
             _ => None,
         } {
             self.state.handle_zoom_key(zoom_level);
+            self.view_center = None;
+            self.animating = false;
             self.draw_frame(qh);
         }
 
@@ -641,7 +685,13 @@ impl MagnifierWindow {
         ]
     }
 
-    fn render_frame<F>(&mut self, _qh: &QueueHandle<Self>, fill: F)
+    fn request_frame_callback(&mut self, qh: &QueueHandle<Self>) {
+        let surface = self.layer.wl_surface().clone();
+        let callback = surface.clone().frame(qh, FrameCallbackData(surface));
+        self.frame_callback = Some(callback);
+    }
+
+    fn render_frame<F>(&mut self, qh: &QueueHandle<Self>, fill: F)
     where
         F: FnOnce(&mut [u8], i32, i32, i32),
     {
@@ -667,52 +717,81 @@ impl MagnifierWindow {
         let surface = self.layer.wl_surface();
         buffer.attach_to(surface).expect("buffer attach");
         surface.damage(0, 0, width as i32, height as i32);
+        if self.animating {
+            self.request_frame_callback(qh);
+        }
         self.layer.commit();
     }
 
     fn draw_frame(&mut self, qh: &QueueHandle<Self>) {
-        let Some(source) = self.captured.as_ref() else {
+        let Some(captured) = self.captured.as_ref() else {
             return;
         };
+        let source_w = captured.buffer.width;
+        let source_h = captured.buffer.height;
 
         if let Some(last) = self.last_redraw
             && last.elapsed() < std::time::Duration::from_millis(16)
         {
+            if self.animating {
+                self.request_frame_callback(qh);
+            }
             return;
         }
         self.last_redraw = Some(std::time::Instant::now());
 
         let zoom = self.state.zoom;
-        let view_w = (self.width as f64 / zoom).ceil() as i32;
-        let view_h = (self.height as f64 / zoom).ceil() as i32;
         let scale = self.capture_scale();
-        let (center_x, center_y) = if self.pointer_seen {
+        let target = if self.pointer_seen {
             (
-                self.state.pointer_position.0 * scale,
-                self.state.pointer_position.1 * scale,
+                self.pointer_position_f.0 * scale as f64,
+                self.pointer_position_f.1 * scale as f64,
             )
         } else {
-            (source.width as i32 / 2, source.height as i32 / 2)
+            (source_w as f64 / 2.0, source_h as f64 / 2.0)
         };
 
-        let max_x = (source.width as i32 - view_w).max(0);
-        let max_y = (source.height as i32 - view_h).max(0);
-        let src_x = (center_x - view_w / 2).clamp(0, max_x);
-        let src_y = (center_y - view_h / 2).clamp(0, max_y);
-        let src_w = view_w.min(source.width as i32);
-        let src_h = view_h.min(source.height as i32);
-
-        let region = RgbaBuffer {
-            width: src_w,
-            height: src_h,
-            data: extract_region(&source.data, source.width as i32, src_x, src_y, src_w, src_h),
+        let (center_x, center_y, animating) = match self.view_center {
+            Some((cx, cy)) => {
+                let dist = ((cx - target.0).powi(2) + (cy - target.1).powi(2)).sqrt();
+                if dist < EASE_EPSILON {
+                    self.view_center = Some(target);
+                    self.animating = false;
+                    (target.0, target.1, false)
+                } else {
+                    let dt = self
+                        .last_anim_tick
+                        .map_or(0.016, |t| t.elapsed().as_secs_f64());
+                    self.last_anim_tick = Some(std::time::Instant::now());
+                    let k = 1.0 - (-dt / EASE_TAU).exp();
+                    let nx = cx + (target.0 - cx) * k;
+                    let ny = cy + (target.1 - cy) * k;
+                    (nx, ny, true)
+                }
+            }
+            None => {
+                self.view_center = Some(target);
+                (target.0, target.1, false)
+            }
         };
-        let scaled = self.state.renderer.render_nearest_neighbor(&region);
+        self.animating = animating;
 
-        let dest_w = scaled.width.min(self.width as i32);
-        let dest_h = scaled.height.min(self.height as i32);
+        let view_w = self.width as f64 / zoom;
+        let view_h = self.height as f64 / zoom;
+        let src_x = (center_x - view_w / 2.0).clamp(0.0, (source_w as f64 - view_w).max(0.0));
+        let src_y = (center_y - view_h / 2.0).clamp(0.0, (source_h as f64 - view_h).max(0.0));
+
+        let dest_w = (view_w.min(source_w as f64) * zoom).round() as i32;
+        let dest_h = (view_h.min(source_h as f64) * zoom).round() as i32;
         let off_x = ((self.width as i32 - dest_w) / 2).max(0);
         let off_y = ((self.height as i32 - dest_h) / 2).max(0);
+
+        let scaled = self.state.renderer.render_bilinear(
+            &captured.buffer,
+            (src_x, src_y),
+            dest_w,
+            dest_h,
+        );
 
         let show_osd = self.state.osd_visible;
         let osd_lines = self.osd_lines();
@@ -751,35 +830,19 @@ impl MagnifierWindow {
         };
         let path = self.capture_manager.generate_screenshot_path()?;
         let file = std::fs::File::create(&path)?;
+        let buffer = &captured.buffer;
         let mut encoder = png::Encoder::new(
             std::io::BufWriter::new(file),
-            captured.width,
-            captured.height,
+            buffer.width as u32,
+            buffer.height as u32,
         );
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header()?;
-        writer.write_image_data(&captured.data)?;
+        writer.write_image_data(&buffer.data)?;
         tracing::info!("Screenshot saved to {}", path.display());
         Ok(())
     }
-}
-
-fn extract_region(
-    data: &[u8],
-    width: i32,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity((w * h * 4) as usize);
-    for row in 0..h {
-        let src = ((y + row) as usize * width as usize + x as usize) * 4;
-        let dest = &data[src..src + (w as usize) * 4];
-        out.extend_from_slice(dest);
-    }
-    out
 }
 
 pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
@@ -844,10 +907,15 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         exit: false,
         first_configure: true,
         last_redraw: None,
+        last_anim_tick: None,
+        view_center: None,
+        animating: false,
+        frame_callback: None,
         width: 1920,
         height: 1080,
         current_output: None,
         pointer_seen: false,
+        pointer_position_f: (0.0, 0.0),
         keyboard: None,
         pointer: None,
     };
