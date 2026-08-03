@@ -15,14 +15,31 @@ pub enum CursorFollow {
     Inertia,
 }
 
+/// How the scroll wheel changes the zoom.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollZoomMode {
+    /// Each wheel notch steps to the next zoom level of the `1`–`9` keys
+    /// (default).
+    #[default]
+    Levels,
+    /// Each wheel notch multiplies the zoom factor by a fixed step (10 %).
+    Factor,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MagnifierConfig {
     pub default_zoom: Option<f64>,
     #[serde(default)]
     pub cursor_follow: CursorFollow,
+    #[serde(default)]
+    pub scroll_zoom_mode: ScrollZoomMode,
+    #[serde(default)]
+    pub invert_scroll_zoom: bool,
     pub keybindings: Keybindings,
     pub screenshot_path: String,
     pub screenshot_filename_pattern: String,
+    #[serde(default)]
     pub show_osd: bool,
 }
 
@@ -44,6 +61,8 @@ impl Default for MagnifierConfig {
         MagnifierConfig {
             default_zoom: Some(3.0),
             cursor_follow: CursorFollow::Snap,
+            scroll_zoom_mode: ScrollZoomMode::Levels,
+            invert_scroll_zoom: false,
             keybindings: Keybindings {
                 toggle_osd: "k".to_string(),
                 screenshot_manual: "s".to_string(),
@@ -57,7 +76,7 @@ impl Default for MagnifierConfig {
             },
             screenshot_path: "~/Pictures".to_string(),
             screenshot_filename_pattern: "maggie_%Y%m%d_%H%M%S.png".to_string(),
-            show_osd: false,
+            show_osd: true,
         }
     }
 }

@@ -52,6 +52,8 @@ use crate::render::RgbaBuffer;
 const MIN_ZOOM: f64 = 1.0;
 const MAX_ZOOM: f64 = 32.0;
 const WHEEL_ZOOM_STEP: f64 = 0.1;
+/// Linux input event code for the right mouse button.
+const BTN_RIGHT: u32 = 0x111;
 const EASE_TAU: f64 = 0.04;
 const EASE_EPSILON: f64 = 0.05;
 /// Momentum decay time constant for the `inertia` cursor-follow style.
@@ -452,15 +454,43 @@ impl PointerHandler for MagnifierWindow {
                         moved = true;
                     }
                 }
+                PointerEventKind::Press { button, .. } => {
+                    // Right mouse button quits, same as Q.
+                    if button == BTN_RIGHT {
+                        self.exit = true;
+                    }
+                }
                 PointerEventKind::Axis { vertical, .. } => {
-                    let steps = if vertical.value120 != 0 {
+                    let mut steps = if vertical.value120 != 0 {
                         vertical.value120 as f64 / 120.0
                     } else {
                         vertical.discrete as f64
                     };
                     if steps != 0.0 {
-                        let new_zoom = (self.state.zoom * (1.0 + steps * WHEEL_ZOOM_STEP))
-                            .clamp(MIN_ZOOM, MAX_ZOOM);
+                        if self.state.config.invert_scroll_zoom {
+                            steps = -steps;
+                        }
+                        let new_zoom = match self.state.config.scroll_zoom_mode {
+                            crate::config::ScrollZoomMode::Levels => {
+                                let whole =
+                                    (self.state.zoom - self.state.zoom.floor()).abs() < 1e-9;
+                                if steps > 0.0 {
+                                    if whole {
+                                        self.state.zoom + 1.0
+                                    } else {
+                                        self.state.zoom.ceil()
+                                    }
+                                } else if whole {
+                                    self.state.zoom - 1.0
+                                } else {
+                                    self.state.zoom.floor()
+                                }
+                                .clamp(1.0, 9.0)
+                            }
+                            crate::config::ScrollZoomMode::Factor => (self.state.zoom
+                                * (1.0 + steps * WHEEL_ZOOM_STEP))
+                                .clamp(MIN_ZOOM, MAX_ZOOM),
+                        };
                         if (new_zoom - self.state.zoom).abs() > 1e-9 {
                             self.state.zoom = new_zoom;
                             self.state.renderer.update_scale_factor(new_zoom);
@@ -708,7 +738,7 @@ impl MagnifierWindow {
             format!("{}  manual selection", config_key.screenshot_manual),
             format!("{}  window selection", config_key.screenshot_window),
             format!("{}  config window", config_key.config_window),
-            "Q / Esc  quit".to_string(),
+            "Q / Esc / RMB  quit".to_string(),
         ]
     }
 

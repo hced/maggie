@@ -40,6 +40,22 @@ void main() {
 }
 "#;
 
+/// Vertex shader for the OSD pass: samples the texture in top-down order. The
+/// captured frame is stored flipped (bottom-up, see the screencopy y-invert
+/// handling) to compensate the flip in `VERTEX_SHADER`, but the OSD sprite is
+/// top-down — reusing the flipped shader would render the legend upside down
+/// and out of its box.
+const OSD_VERTEX_SHADER: &str = r#"
+attribute vec2 a_pos;
+uniform vec4 u_src;
+varying vec2 v_uv;
+void main() {
+    vec2 ndc = vec2(a_pos.x * 2.0 - 1.0, a_pos.y * 2.0 - 1.0);
+    v_uv = u_src.xy + vec2(a_pos.x, a_pos.y) * u_src.zw;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+}
+"#;
+
 const FRAGMENT_SHADER: &str = r#"
 precision mediump float;
 varying vec2 v_uv;
@@ -69,12 +85,14 @@ pub struct GpuRenderer {
     context: egl::Context,
     egl_window: wayland_egl::WlEglSurface,
     program: GLuint,
+    osd_program: GLuint,
     vao: GLuint,
     vbo: GLuint,
     frame_tex: GLuint,
     osd_tex: GLuint,
     a_pos_loc: GLint,
     u_src_loc: GLint,
+    osd_u_src_loc: GLint,
     width: i32,
     height: i32,
 }
@@ -153,7 +171,7 @@ impl GpuRenderer {
                 .unwrap_or(ptr::null())
         });
 
-        let program = Self::build_program()?;
+        let program = Self::build_program(VERTEX_SHADER)?;
         let u_src_loc = get_uniform_location(program, c"u_src".as_ptr());
         let a_pos_loc = get_attrib_location(program, c"a_pos".as_ptr());
         if u_src_loc < 0 || a_pos_loc < 0 {
@@ -166,6 +184,16 @@ impl GpuRenderer {
         let u_tex_loc = get_uniform_location(program, c"u_tex".as_ptr());
         if u_tex_loc < 0 {
             anyhow::bail!("Shader uniform u_tex not found");
+        }
+        let osd_program = Self::build_program(OSD_VERTEX_SHADER)?;
+        let osd_u_src_loc = get_uniform_location(osd_program, c"u_src".as_ptr());
+        let osd_u_tex_loc = get_uniform_location(osd_program, c"u_tex".as_ptr());
+        if osd_u_src_loc < 0 || osd_u_tex_loc < 0 {
+            anyhow::bail!(
+                "OSD shader locations not found (u_src={}, u_tex={})",
+                osd_u_src_loc,
+                osd_u_tex_loc
+            );
         }
 
         let mut vao = 0;
@@ -218,6 +246,8 @@ impl GpuRenderer {
             gles2::TexParameteri(gles2::TEXTURE_2D, gles2::TEXTURE_WRAP_T, gles2::CLAMP_TO_EDGE as GLint);
             gles2::UseProgram(program);
             gles2::Uniform1i(u_tex_loc, 0);
+            gles2::UseProgram(osd_program);
+            gles2::Uniform1i(osd_u_tex_loc, 0);
             gles2::ActiveTexture(gles2::TEXTURE0);
             check_gl_error("init");
         }
@@ -229,12 +259,14 @@ impl GpuRenderer {
             context,
             egl_window,
             program,
+            osd_program,
             vao,
             vbo,
             frame_tex,
             osd_tex,
             a_pos_loc,
             u_src_loc,
+            osd_u_src_loc,
             width: width * RENDER_SCALE,
             height: height * RENDER_SCALE,
         };
@@ -252,11 +284,11 @@ impl GpuRenderer {
         Ok(renderer)
     }
 
-    fn build_program() -> anyhow::Result<GLuint> {
+    fn build_program(vertex_shader: &str) -> anyhow::Result<GLuint> {
         unsafe {
             let vs = gles2::CreateShader(gles2::VERTEX_SHADER);
-            let vs_src = VERTEX_SHADER.as_ptr() as *const GLchar;
-            let vs_len = VERTEX_SHADER.len() as GLint;
+            let vs_src = vertex_shader.as_ptr() as *const GLchar;
+            let vs_len = vertex_shader.len() as GLint;
             gles2::ShaderSource(vs, 1, &vs_src, &vs_len);
             gles2::CompileShader(vs);
             let mut ok: GLint = 0;
@@ -390,6 +422,7 @@ impl GpuRenderer {
                 gles2::BlendFunc(gles2::SRC_ALPHA, gles2::ONE_MINUS_SRC_ALPHA);
                 gles2::ActiveTexture(gles2::TEXTURE0);
                 gles2::BindTexture(gles2::TEXTURE_2D, self.osd_tex);
+                gles2::UseProgram(self.osd_program);
                 gles2::TexImage2D(
                     gles2::TEXTURE_2D,
                     0,
@@ -414,9 +447,10 @@ impl GpuRenderer {
                     verts.as_ptr() as *const GLvoid,
                     gles2::STREAM_DRAW,
                 );
-                gles2::Uniform4f(self.u_src_loc, 0.0, 0.0, 1.0, 1.0);
+                gles2::Uniform4f(self.osd_u_src_loc, 0.0, 0.0, 1.0, 1.0);
                 gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
                 gles2::Disable(gles2::BLEND);
+                gles2::UseProgram(self.program);
             }
 
             check_gl_error("draw");
@@ -436,6 +470,7 @@ impl Drop for GpuRenderer {
             gles2::DeleteTextures(1, &self.frame_tex);
             gles2::DeleteTextures(1, &self.osd_tex);
             gles2::DeleteProgram(self.program);
+            gles2::DeleteProgram(self.osd_program);
         }
         let _ = self.egl.make_current(self.display, None, None, None);
         let _ = self.egl.destroy_context(self.display, self.context);

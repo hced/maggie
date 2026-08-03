@@ -23,7 +23,7 @@
 * **Cursor-following motion:** The view center is tracked at **sub-pixel precision** (fractional logical pointer position mapped into source space via per-axis source/viewport ratios `scale_x`/`scale_y`, so capture buffers whose aspect ratio differs from the output are handled correctly). The motion style is selected by the `cursor_follow` config option (§4): `snap` (**default** — instant linear motion, no easing or delay), `ease` (exponential smoothing toward the cursor, τ = 40 ms, driven by `wl_surface` frame callbacks until settled — the former default), or `inertia` (ease while moving plus a **momentum glide** after the cursor stops, with damping). Eased positions shift the magnified content continuously on the CPU fallback (bilinear); on the GPU path they are quantized to source texels by nearest-neighbor sampling.
 * **Input responsiveness during animation:** Keyboard input (the app's own global keys — zoom/OSD/screenshot bindings) works even while the panning animation is running: the **EGL swap interval is set to 0** so frame redraws never block the event loop. The layer surface's keyboard interactivity is **`on-demand`** (not `exclusive`), so compositor-level global keybindings keep working.
 * **Viewport rendering:** The viewport is rendered from the frozen frame as a textured quad. The **GPU path** samples the frame texture with **nearest-neighbor** filtering into a buffer at **2× the layer's logical size** (`wl_surface.set_buffer_scale(2)`), yielding the crisp, pixelated magnifier look. The **CPU fallback** (`src/render.rs`) renders with **bilinear interpolation** at fractional source offsets, shifting the magnified content continuously. Both paths clamp at the capture edges (edge-extension) rather than showing bars.
-* **Scroll-wheel zoom:** The scroll wheel zooms in/out in **10 % steps** per notch (high-resolution `value120` wheel deltas supported; continuous touchpad scroll is ignored). Zoom is clamped to **1×–32×**.
+* **Scroll-wheel zoom:** The scroll wheel zooms in/out in one of two modes selected by `scroll_zoom_mode` (§4): **`levels`** (**default** — each notch steps to the next zoom level of the `1`–`9` keys, i.e. zoom ±1 on whole-number levels clamped to 1–9; from a fractional zoom it snaps to the nearest whole level in the scroll direction) or **`factor`** (the former behavior — each notch multiplies the zoom by **10 %**, clamped to **1×–32×**). The `invert_scroll_zoom` option (§4) reverses the wheel direction. High-resolution `value120` wheel deltas are supported; continuous touchpad scroll is ignored.
 * **Viewport clamping:** The viewport is clamped to the capture bounds so it always fills the screen and sticks at the edges; consequently, the pointer drifts off-center as it approaches the screen edges.
 * **No live mode:** Continuous live capture is explicitly **out of scope**; the interactive live-magnifier idea (including an earlier planned `--live` flag) was dropped. Behavior modes that assumed a live view (see §6) are obsolete until redefined.
 
@@ -35,15 +35,19 @@
 * **Storage Requirements:**
   * **Default Zoom Level** (floating point).
   * **Cursor-Follow Mode** (`cursor_follow`): `snap` (default) | `ease` | `inertia` — see §3.
+  * **Scroll-Wheel Zoom Mode** (`scroll_zoom_mode`): `levels` (default) | `factor` — see §3.
+  * **Invert Scroll-Wheel Zoom** (`invert_scroll_zoom`): boolean, default `false` — see §3.
+  * **OSD Visibility** (`show_osd`): boolean, default `true` — see §7.
   * **Keybindings** for all in-app functions.
   * **Screenshot Path** (default: `~/Pictures`).
   * **Screenshot Filename Pattern:** Utilizes standard `strftime` formatting tokens (supporting dynamic variables such as `%Y` for year, `%m` for month, `%d` for day, `%H` for hour, `%M` for minute, etc., defaulting to `maggie_%Y%m%d_%H%M%S.png`).
+* **Serde defaults:** Newer options (`cursor_follow`, `scroll_zoom_mode`, `invert_scroll_zoom`, `show_osd`) carry `#[serde(default)]`, so config files written before these options existed remain loadable.
 * **Status:** Loading from disk is implemented; the listed `strftime` tokens are evaluated on save. **Write-on-change persistence is not wired up** — `save_config` exists but is unused, so runtime adjustments never reach disk.
 
 ---
 
 ## 5. Visuals & Rendering — *Implemented* (AA toggle: *Stub*)
-* **Zoom & Scaling:** Controlled via numeric keyboard keys `1` through `9` to switch zoom levels, or the scroll wheel (10 % steps, 1×–32×); keys and wheel re-scale the frozen frame.
+* **Zoom & Scaling:** Controlled via numeric keyboard keys `1` through `9` to switch zoom levels, or the scroll wheel (default `levels` mode: steps of 1 per notch on the `1`–`9` levels; `factor` mode: 10 % steps, 1×–32× — see §3); keys and wheel re-scale the frozen frame.
 * **Rendering Preference:** The default **GPU path** (EGL/GLES2) renders the viewport with **nearest-neighbor** sampling at a **2× buffer scale** for a crisp, pixelated magnifier look; sub-pixel cursor-following is then quantized to source texels (see §3). The **CPU fallback** uses **bilinear interpolation**, which shifts the magnified content continuously during sub-pixel cursor movement. The active path is selected automatically at startup — GPU if EGL/GLES2 initializes, CPU otherwise (see §2).
 * **Anti-Aliasing Toggle:** An optional toggle bound to the `A` key, implemented only if it does not introduce development complexity. — *Stub: key is bound but not yet functional.*
 
@@ -57,10 +61,11 @@
 
 ## 7. OSD (On-Screen Display) Key Legend — *Implemented*
 * Toggable via the `K` key (configurable via `keybindings.toggle_osd`).
-* Off by default, unless configured to always show via the configuration file (`show_osd`).
+* **On by default**, configurable via the `show_osd` configuration file option (§4).
 * Dynamically stays or moves out of the way of the cursor position: the legend box is placed in the **corner farthest from the cursor** (4-corner logic, considering the box center).
 * The legend background is **opaque** (solid dark box, alpha 255) so no magnified content or text ghost shows through.
-* Rendered with a built-in 5×7 bitmap font (`src/osd.rs`) drawn at **2× scale** (5×7 glyphs scaled 2×, i.e. rendered at 10×14); lists zoom level, `1`–`9` zoom, `K` OSD toggle, `F` fullscreen screenshot, `S`/`W`/`C` (pending), and `Q`/`Esc` quit.
+* Rendered with a built-in 5×7 bitmap font (`src/osd.rs`) drawn at **2× scale** (5×7 glyphs scaled 2×, i.e. rendered at 10×14); lists zoom level, `1`–`9` zoom, `K` OSD toggle, `F` fullscreen screenshot, `S`/`W`/`C` (pending), and `Q`/`Esc`/`RMB` quit.
+* **Rendering fix:** The OSD quad is drawn with its own dedicated vertex shader that samples textures **top-down**, because the captured frame texture is stored **bottom-up** (screencopy `y_invert`) so the main shader's Y-flip compensates it. Previously the top-down OSD sprite was rendered upside down and outside its box, leaving only the opaque background visible as an empty black box; the legend text now renders upright inside the box.
 
 ---
 
