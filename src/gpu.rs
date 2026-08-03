@@ -73,6 +73,7 @@ pub struct GpuRenderer {
     vbo: GLuint,
     frame_tex: GLuint,
     osd_tex: GLuint,
+    a_pos_loc: GLint,
     u_src_loc: GLint,
     width: i32,
     height: i32,
@@ -148,6 +149,18 @@ impl GpuRenderer {
 
         let program = Self::build_program()?;
         let u_src_loc = get_uniform_location(program, c"u_src".as_ptr());
+        let a_pos_loc = get_attrib_location(program, c"a_pos".as_ptr());
+        if u_src_loc < 0 || a_pos_loc < 0 {
+            anyhow::bail!(
+                "Shader locations not found (u_src={}, a_pos={})",
+                u_src_loc,
+                a_pos_loc
+            );
+        }
+        let u_tex_loc = get_uniform_location(program, c"u_tex".as_ptr());
+        if u_tex_loc < 0 {
+            anyhow::bail!("Shader uniform u_tex not found");
+        }
 
         let mut vao = 0;
         let mut vbo = 0;
@@ -158,16 +171,17 @@ impl GpuRenderer {
             gles2::BindVertexArrayOES(vao);
             gles2::GenBuffers(1, &mut vbo);
             gles2::BindBuffer(gles2::ARRAY_BUFFER, vbo);
-            let loc = get_attrib_location(program, c"a_pos".as_ptr());
-            gles2::EnableVertexAttribArray(loc as GLuint);
+            gles2::EnableVertexAttribArray(a_pos_loc as GLuint);
             gles2::VertexAttribPointer(
-                loc as GLuint,
+                a_pos_loc as GLuint,
                 2,
                 gles2::FLOAT,
                 gles2::FALSE,
                 0,
                 ptr::null(),
             );
+            gles2::PixelStorei(gles2::UNPACK_ALIGNMENT, 4);
+            gles2::PixelStorei(gles2::PACK_ALIGNMENT, 4);
             gles2::GenTextures(1, &mut frame_tex);
             gles2::BindTexture(gles2::TEXTURE_2D, frame_tex);
             gles2::TexParameteri(
@@ -197,8 +211,9 @@ impl GpuRenderer {
             gles2::TexParameteri(gles2::TEXTURE_2D, gles2::TEXTURE_WRAP_S, gles2::CLAMP_TO_EDGE as GLint);
             gles2::TexParameteri(gles2::TEXTURE_2D, gles2::TEXTURE_WRAP_T, gles2::CLAMP_TO_EDGE as GLint);
             gles2::UseProgram(program);
-            gles2::Uniform1i(get_uniform_location(program, c"u_tex".as_ptr()), 0);
+            gles2::Uniform1i(u_tex_loc, 0);
             gles2::ActiveTexture(gles2::TEXTURE0);
+            check_gl_error("init");
         }
 
         let renderer = GpuRenderer {
@@ -212,6 +227,7 @@ impl GpuRenderer {
             vbo,
             frame_tex,
             osd_tex,
+            a_pos_loc,
             u_src_loc,
             width: width * RENDER_SCALE,
             height: height * RENDER_SCALE,
@@ -331,19 +347,36 @@ impl GpuRenderer {
             gles2::UseProgram(self.program);
             gles2::BindVertexArrayOES(self.vao);
             gles2::BindBuffer(gles2::ARRAY_BUFFER, self.vbo);
+            gles2::EnableVertexAttribArray(self.a_pos_loc as GLuint);
+            gles2::VertexAttribPointer(
+                self.a_pos_loc as GLuint,
+                2,
+                gles2::FLOAT,
+                gles2::FALSE,
+                0,
+                ptr::null(),
+            );
 
             if let Some((x, y, w, h)) = src {
                 gles2::ActiveTexture(gles2::TEXTURE0);
                 gles2::BindTexture(gles2::TEXTURE_2D, self.frame_tex);
-                let verts: [GLfloat; 8] = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+                let verts: [GLfloat; 12] = [
+                    0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0,
+                ];
                 gles2::BufferData(
                     gles2::ARRAY_BUFFER,
                     size_of_val(&verts) as GLsizeiptr,
                     verts.as_ptr() as *const GLvoid,
                     gles2::STREAM_DRAW,
                 );
-                gles2::Uniform4f(self.u_src_loc, x as GLfloat, y as GLfloat, w as GLfloat, h as GLfloat);
-                gles2::DrawArrays(gles2::TRIANGLE_STRIP, 0, 4);
+                gles2::Uniform4f(
+                    self.u_src_loc,
+                    x as GLfloat,
+                    y as GLfloat,
+                    w as GLfloat,
+                    h as GLfloat,
+                );
+                gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
             }
 
             if let Some(sprite) = osd {
@@ -366,7 +399,9 @@ impl GpuRenderer {
                 let y0 = sprite.y as GLfloat / self.height as GLfloat;
                 let x1 = (sprite.x + sprite.width) as GLfloat / self.width as GLfloat;
                 let y1 = (sprite.y + sprite.height) as GLfloat / self.height as GLfloat;
-                let verts: [GLfloat; 8] = [x0, y0, x1, y0, x1, y1, x0, y1];
+                let verts: [GLfloat; 12] = [
+                    x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1,
+                ];
                 gles2::BufferData(
                     gles2::ARRAY_BUFFER,
                     size_of_val(&verts) as GLsizeiptr,
@@ -374,9 +409,11 @@ impl GpuRenderer {
                     gles2::STREAM_DRAW,
                 );
                 gles2::Uniform4f(self.u_src_loc, 0.0, 0.0, 1.0, 1.0);
-                gles2::DrawArrays(gles2::TRIANGLE_STRIP, 0, 4);
+                gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
                 gles2::Disable(gles2::BLEND);
             }
+
+            check_gl_error("draw");
         }
         self.egl
             .swap_buffers(self.display, self.surface)
@@ -407,4 +444,14 @@ fn get_attrib_location(program: GLuint, name: *const GLchar) -> GLint {
 
 fn get_uniform_location(program: GLuint, name: *const GLchar) -> GLint {
     unsafe { gles2::GetUniformLocation(program, name) }
+}
+
+fn check_gl_error(stage: &str) {
+    loop {
+        let err = unsafe { gles2::GetError() };
+        if err == gles2::NO_ERROR {
+            break;
+        }
+        tracing::warn!("GL error 0x{err:04x} after {stage}");
+    }
 }
