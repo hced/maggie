@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/branding/maggie_logo/maggie_logo_256.png" alt="Maggie Logo" width="256">
+  <img src="assets/branding/maggie_logo/maggie_logo_512.png" alt="Maggie Logo" width="512">
 </p>
 
 # Maggie
@@ -8,7 +8,7 @@ Native Wayland screen magnifier and utility.
 
 ---
 
-**⚠ Status:** Maggie is built for **<u>Linux only</u>**. It's at **v0.1.0** and is developed and tested primarily on my own Linux distro with the **Niri** compositor. It's **Wayland-only** — X11 is not supported, and other compositors (Sway, Hyprland, KWin, GNOME…) are untested and may not work correctly.
+**⚠ Status:** Maggie is built for **<u>Linux only</u>**. It's developed and tested primarily on my own setup, using the **Niri** compositor. It's **Wayland-only** — X11 is not supported, and other compositors (Sway, Hyprland, KWin, GNOME…) are untested and may not work correctly (feel free to report any compat issues).
 
 ---
 
