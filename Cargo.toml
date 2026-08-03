@@ -7,6 +7,8 @@ edition = "2024"
 wayland-client = { version = "0.31", features = ["log"] }
 smithay-client-toolkit = "0.21"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-egl = "0.32"
+khronos-egl = { version = "6.0.0", features = ["dynamic", "1_5"] }
 clap = { version = "4.5", features = ["derive"] }
 ron = "0.8"
 serde = { version = "1.0", features = ["derive"] }
@@ -17,3 +19,6 @@ chrono = { version = "0.4", features = ["clock"] }
 dirs = "5.0"
 memmap2 = "0.9"
 png = "0.18"
+
+[build-dependencies]
+gl_generator = "0.14"

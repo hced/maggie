@@ -7,6 +7,7 @@ mod input;
 mod render;
 mod capture;
 mod engine;
+mod gpu;
 mod osd;
 
 #[derive(Parser, Debug)]

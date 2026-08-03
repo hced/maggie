@@ -9,6 +9,7 @@
 * **Language:** Rust (Edition 2024)
 * **Display Server Protocol:** Native Wayland exclusively.
 * **Task Management:** Managed via a project root `Justfile` (e.g., `just build`, `just run`, `just check`, `just test`).
+* **GPU Acceleration:** Rendering is GPU-accelerated via **EGL + OpenGL ES 2** (`src/gpu.rs`): the frozen frame and OSD legend are drawn as textured quads and presented through a `wl_egl_window` at a 2× buffer scale. If EGL/GLES initialization fails, the app **automatically falls back to the CPU rendering path** (`src/render.rs`), which remains fully functional; the choice is made once at startup.
 
 ---
 
@@ -18,8 +19,8 @@
 * **Frozen view:** After the first frame, the overlay displays a nearest-neighbor zoomed view of the frozen frame. Zoom keys `1`–`9` re-scale the same frozen frame; the screen is never re-captured at runtime.
 * **Failure handling:** A failed capture is retried up to **3 times**; if all retries fail, the overlay renders black.
 * **Zoom centering:** The viewport follows the **live cursor** over the frozen frame — the view is centered on the content under the cursor and clamped at the capture edges; if the cursor was never seen, it centers on the capture. Zoom keys `1`–`9` re-scale.
-* **Smooth cursor-following:** The view center is tracked at **sub-pixel precision** (fractional logical pointer position converted via the output scale) and **eases** toward the cursor with exponential smoothing (τ = 40 ms, driven by `wl_surface` frame callbacks until settled), producing smooth magnified motion instead of per-pixel snaps.
-* **Viewport rendering:** The viewport is rendered from the frozen frame with **bilinear interpolation** at fractional source offsets, so sub-pixel cursor movement shifts the magnified content continuously. At the capture edges the image is clamped (edge-extension) rather than showing bars.
+* **Smooth cursor-following:** The view center is tracked at **sub-pixel precision** (fractional logical pointer position mapped into source space via per-axis source/viewport ratios `scale_x`/`scale_y`, so capture buffers whose aspect ratio differs from the output are handled correctly) and **eases** toward the cursor with exponential smoothing (τ = 40 ms, driven by `wl_surface` frame callbacks until settled). The eased position shifts the magnified content continuously on the CPU fallback (bilinear); on the GPU path it is quantized to source texels by nearest-neighbor sampling.
+* **Viewport rendering:** The viewport is rendered from the frozen frame as a textured quad. The **GPU path** samples the frame texture with **nearest-neighbor** filtering into a buffer at **2× the layer's logical size** (`wl_surface.set_buffer_scale(2)`), yielding the crisp, pixelated magnifier look. The **CPU fallback** (`src/render.rs`) renders with **bilinear interpolation** at fractional source offsets, shifting the magnified content continuously. Both paths clamp at the capture edges (edge-extension) rather than showing bars.
 * **Scroll-wheel zoom:** The scroll wheel zooms in/out in **10 % steps** per notch (high-resolution `value120` wheel deltas supported; continuous touchpad scroll is ignored). Zoom is clamped to **1×–32×**.
 * **Viewport clamping:** The viewport is clamped to the capture bounds so it always fills the screen and sticks at the edges; consequently, the pointer drifts off-center as it approaches the screen edges.
 * **No live mode:** Continuous live capture is explicitly **out of scope**; the interactive live-magnifier idea (including an earlier planned `--live` flag) was dropped. Behavior modes that assumed a live view (see §6) are obsolete until redefined.
@@ -40,7 +41,7 @@
 
 ## 5. Visuals & Rendering — *Implemented* (AA toggle: *Stub*)
 * **Zoom & Scaling:** Controlled via numeric keyboard keys `1` through `9` to switch zoom levels, or the scroll wheel (10 % steps, 1×–32×); keys and wheel re-scale the frozen frame.
-* **Rendering Preference:** The viewport is rendered with **bilinear interpolation** to enable smooth sub-pixel cursor-following (see §3). A nearest-neighbor renderer remains available for crisp pixellated visuals.
+* **Rendering Preference:** The default **GPU path** (EGL/GLES2) renders the viewport with **nearest-neighbor** sampling at a **2× buffer scale** for a crisp, pixelated magnifier look; sub-pixel cursor-following is then quantized to source texels (see §3). The **CPU fallback** uses **bilinear interpolation**, which shifts the magnified content continuously during sub-pixel cursor movement. The active path is selected automatically at startup — GPU if EGL/GLES2 initializes, CPU otherwise (see §2).
 * **Anti-Aliasing Toggle:** An optional toggle bound to the `A` key, implemented only if it does not introduce development complexity. — *Stub: key is bound but not yet functional.*
 
 ---

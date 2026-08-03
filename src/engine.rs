@@ -45,6 +45,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 
 use crate::capture::CaptureManager;
 use crate::config::MagnifierConfig;
+use crate::gpu::GpuRenderer;
 use crate::render::Renderer;
 use crate::render::RgbaBuffer;
 
@@ -127,10 +128,10 @@ pub struct MagnifierWindow {
     capture_retries: u8,
     capture_manager: CaptureManager,
     captured: Option<CapturedFrame>,
+    gpu: Option<GpuRenderer>,
     state: MagnifierState,
     exit: bool,
     first_configure: bool,
-    last_redraw: Option<std::time::Instant>,
     last_anim_tick: Option<std::time::Instant>,
     view_center: Option<(f64, f64)>,
     animating: bool,
@@ -251,6 +252,9 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
                             data,
                         },
                     });
+                    if let Some(gpu) = &mut state.gpu {
+                        gpu.upload_frame(&state.captured.as_ref().unwrap().buffer);
+                    }
                     tracing::info!("Captured {}x{} frame", width, height);
                 }
                 state.draw_frame(qh);
@@ -385,10 +389,20 @@ impl LayerShellHandler for MagnifierWindow {
     ) {
         self.width = NonZeroU32::new(configure.new_size.0).map_or(self.width, |v| v.get());
         self.height = NonZeroU32::new(configure.new_size.1).map_or(self.height, |v| v.get());
+        if let Some(gpu) = &mut self.gpu {
+            gpu.resize(self.width as i32, self.height as i32);
+        }
 
         if self.first_configure {
             self.first_configure = false;
             self.request_screencopy(qh);
+            if let Some(output) = self.current_output.clone()
+                && let Some(info) = self.output_state.info(&output)
+                && let Some((w, h)) = info.logical_size
+            {
+                self.layer.set_size(w.max(0) as u32, h.max(0) as u32);
+                self.layer.commit();
+            }
         }
 
         self.layer.commit();
@@ -660,17 +674,6 @@ impl MagnifierWindow {
         let _frame = manager.capture_output(true as i32, &output, qh, ScreencastFrameData);
     }
 
-    fn capture_scale(&self) -> i32 {
-        match self
-            .current_output
-            .as_ref()
-            .and_then(|o| self.output_state.info(o))
-        {
-            Some(info) => info.scale_factor.max(1),
-            None => 1,
-        }
-    }
-
     fn osd_lines(&self) -> Vec<String> {
         let config_key = &self.state.config.keybindings;
         vec![
@@ -730,22 +733,13 @@ impl MagnifierWindow {
         let source_w = captured.buffer.width;
         let source_h = captured.buffer.height;
 
-        if let Some(last) = self.last_redraw
-            && last.elapsed() < std::time::Duration::from_millis(16)
-        {
-            if self.animating {
-                self.request_frame_callback(qh);
-            }
-            return;
-        }
-        self.last_redraw = Some(std::time::Instant::now());
-
         let zoom = self.state.zoom;
-        let scale = self.capture_scale();
+        let scale_x = source_w as f64 / self.width as f64;
+        let scale_y = source_h as f64 / self.height as f64;
         let target = if self.pointer_seen {
             (
-                self.pointer_position_f.0 * scale as f64,
-                self.pointer_position_f.1 * scale as f64,
+                self.pointer_position_f.0 * scale_x,
+                self.pointer_position_f.1 * scale_y,
             )
         } else {
             (source_w as f64 / 2.0, source_h as f64 / 2.0)
@@ -766,6 +760,7 @@ impl MagnifierWindow {
                     let k = 1.0 - (-dt / EASE_TAU).exp();
                     let nx = cx + (target.0 - cx) * k;
                     let ny = cy + (target.1 - cy) * k;
+                    self.view_center = Some((nx, ny));
                     (nx, ny, true)
                 }
             }
@@ -780,6 +775,35 @@ impl MagnifierWindow {
         let view_h = self.height as f64 / zoom;
         let src_x = (center_x - view_w / 2.0).clamp(0.0, (source_w as f64 - view_w).max(0.0));
         let src_y = (center_y - view_h / 2.0).clamp(0.0, (source_h as f64 - view_h).max(0.0));
+
+        let lines = self.osd_lines();
+
+        if let Some(gpu) = &mut self.gpu {
+            let osd = if self.state.osd_visible {
+                crate::osd::build_osd_sprite(
+                    &lines,
+                    (
+                        self.state.pointer_position.0 * crate::gpu::RENDER_SCALE,
+                        self.state.pointer_position.1 * crate::gpu::RENDER_SCALE,
+                    ),
+                    self.width as i32 * crate::gpu::RENDER_SCALE,
+                    self.height as i32 * crate::gpu::RENDER_SCALE,
+                )
+            } else {
+                None
+            };
+            let uv = (
+                src_x / source_w as f64,
+                src_y / source_h as f64,
+                view_w.min(source_w as f64) / source_w as f64,
+                view_h.min(source_h as f64) / source_h as f64,
+            );
+            gpu.draw(Some(uv), osd.as_ref());
+            if self.animating {
+                self.request_frame_callback(qh);
+            }
+            return;
+        }
 
         let dest_w = (view_w.min(source_w as f64) * zoom).round() as i32;
         let dest_h = (view_h.min(source_h as f64) * zoom).round() as i32;
@@ -813,6 +837,10 @@ impl MagnifierWindow {
     }
 
     fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
+        if let Some(gpu) = &mut self.gpu {
+            gpu.draw(None, None);
+            return;
+        }
         self.render_frame(qh, |canvas, _width, _height, _stride| {
             canvas.chunks_exact_mut(4).for_each(|chunk| {
                 chunk[0] = 0;
@@ -878,6 +906,24 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
     layer.set_size(0, 0);
     layer.commit();
 
+    let gpu = GpuRenderer::init(
+        conn.backend().display_ptr() as *mut std::os::raw::c_void,
+        layer.wl_surface(),
+        1920,
+        1080,
+    )
+    .map(Some)
+    .unwrap_or_else(|e| {
+        tracing::warn!("GPU rendering unavailable, falling back to CPU path: {:#}", e);
+        None
+    });
+
+    if gpu.is_some() {
+        layer
+            .wl_surface()
+            .set_buffer_scale(crate::gpu::RENDER_SCALE);
+    }
+
     let pool = SlotPool::new(1920 * 1080 * 4, &shm)?;
     let capture_manager = CaptureManager::new(
         config.screenshot_path.clone(),
@@ -903,10 +949,10 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         capture_retries: 0,
         capture_manager,
         captured: None,
+        gpu,
         state,
         exit: false,
         first_configure: true,
-        last_redraw: None,
         last_anim_tick: None,
         view_center: None,
         animating: false,

@@ -106,8 +106,52 @@ pub fn draw_osd(
     lines: &[String],
     cursor: (i32, i32),
 ) {
-    if lines.is_empty() || canvas_w <= 0 || canvas_h <= 0 {
+    let Some(sprite) = build_osd_sprite(lines, cursor, canvas_w, canvas_h) else {
         return;
+    };
+
+    for y in sprite.y..(sprite.y + sprite.height) {
+        if y < 0 || y >= canvas_h {
+            continue;
+        }
+        let src_row = &sprite.buffer.data
+            [((y - sprite.y) as usize) * (sprite.width as usize) * 4..];
+        let dst_start = ((y * canvas_w + sprite.x.max(0)) as usize) * 4;
+        let dst_end = ((y * canvas_w + (sprite.x + sprite.width).min(canvas_w)) as usize) * 4;
+        if dst_end <= dst_start {
+            continue;
+        }
+        let skip = (sprite.x.max(0) - sprite.x) as usize;
+        for (dst_px, src_px) in canvas[dst_start..dst_end]
+            .chunks_exact_mut(4)
+            .zip(src_row[skip * 4..].chunks_exact(4))
+        {
+            if src_px[3] == 0 {
+                continue;
+            }
+            dst_px.copy_from_slice(src_px);
+        }
+    }
+}
+
+/// An OSD legend rendered into its own tight buffer, ready for compositing at
+/// `(x, y)` on a `screen_w x screen_h` surface.
+pub struct OsdSprite {
+    pub buffer: crate::render::RgbaBuffer,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+pub fn build_osd_sprite(
+    lines: &[String],
+    cursor: (i32, i32),
+    screen_w: i32,
+    screen_h: i32,
+) -> Option<OsdSprite> {
+    if lines.is_empty() || screen_w <= 0 || screen_h <= 0 {
+        return None;
     }
 
     let widest = lines
@@ -121,9 +165,9 @@ pub fn draw_osd(
 
     let corners = [
         (BOX_MARGIN, BOX_MARGIN),
-        (canvas_w - BOX_MARGIN - box_w, BOX_MARGIN),
-        (BOX_MARGIN, canvas_h - BOX_MARGIN - box_h),
-        (canvas_w - BOX_MARGIN - box_w, canvas_h - BOX_MARGIN - box_h),
+        (screen_w - BOX_MARGIN - box_w, BOX_MARGIN),
+        (BOX_MARGIN, screen_h - BOX_MARGIN - box_h),
+        (screen_w - BOX_MARGIN - box_w, screen_h - BOX_MARGIN - box_h),
     ];
     let (box_x, box_y) = corners
         .into_iter()
@@ -134,17 +178,15 @@ pub fn draw_osd(
         })
         .unwrap();
 
+    let mut buffer = crate::render::RgbaBuffer {
+        width: box_w,
+        height: box_h,
+        data: vec![0u8; (box_w * box_h * 4) as usize],
+    };
+
     let pad = BOX_PADDING / 2;
-    for y in box_y..(box_y + box_h).min(canvas_h) {
-        if y < 0 {
-            continue;
-        }
-        let row_start = (y * canvas_w + box_x.max(0)) * 4;
-        let row_end = (y * canvas_w + (box_x + box_w).min(canvas_w)) * 4;
-        if row_end <= row_start {
-            continue;
-        }
-        for pixel in canvas[row_start as usize..row_end as usize].chunks_exact_mut(4) {
+    for row in buffer.data.chunks_exact_mut((box_w * 4) as usize) {
+        for pixel in row.chunks_exact_mut(4) {
             pixel[0] = 0;
             pixel[1] = 0;
             pixel[2] = 0;
@@ -154,15 +196,23 @@ pub fn draw_osd(
 
     for (index, line) in lines.iter().enumerate() {
         draw_text(
-            canvas,
-            canvas_w,
-            canvas_h,
-            box_x + pad,
-            box_y + pad + index as i32 * LINE_HEIGHT,
+            &mut buffer.data,
+            box_w,
+            box_h,
+            pad,
+            pad + index as i32 * LINE_HEIGHT,
             line,
             TEXT_COLOR,
         );
     }
+
+    Some(OsdSprite {
+        buffer,
+        x: box_x,
+        y: box_y,
+        width: box_w,
+        height: box_h,
+    })
 }
 
 #[cfg(test)]
