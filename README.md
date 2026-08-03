@@ -4,19 +4,21 @@ Native Wayland screen magnifier and utility tool, written in Rust (Edition 2024)
 
 ---
 
-**⚠ Status:** Maggie is at **v0.1.0** and is developed and tested primarily on the author's own Linux distro with the **Niri** compositor. It is **Linux / Wayland-only** — X11 is not supported, and other compositors (Sway, Hyprland, KWin, GNOME…) are untested and may not work correctly.
+**⚠ Status:** I'm built for **<u>Linux only</u>**. I'm at **v0.1.0** and I'm developed and tested primarily on my own Linux distro with the **Niri** compositor. I'm **Wayland-only** — X11 is not supported, and other compositors (Sway, Hyprland, KWin, GNOME…) are untested and may not work correctly.
 
 ---
 
 ## Overview
 
-Maggie is a **frozen-frame** screen magnifier: it captures the screen exactly once at startup via `zwlr_screencopy` and displays a fullscreen, cursor-following, pixelated view of that frame as a layer-shell overlay — no live capture, no compositor window rules required. It runs natively on Wayland compositors exposing `wlr-layer-shell` + `wlr-screencopy`, such as minimal desktop environments and tiling window managers in the spirit of Niri.
+I'm a **frozen-frame** screen magnifier: I capture the screen exactly once at startup via `zwlr_screencopy` and show a fullscreen, cursor-following, pixelated view of that frame as a layer-shell overlay — no live capture, no compositor window rules required. I run natively on Wayland compositors exposing `wlr-layer-shell` + `wlr-screencopy`, such as minimal desktop environments and tiling window managers in the spirit of Niri.
 
-Rendering is GPU-accelerated via **EGL + OpenGL ES 2** (nearest-neighbor, crisp magnifier look), with a fully functional **CPU bilinear fallback** when EGL/GLES2 is unavailable.
+I render GPU-accelerated via **EGL + OpenGL ES 2** (nearest-neighbor, crisp magnifier look), with a fully functional **CPU bilinear fallback** when EGL/GLES2 is unavailable. And yes — Linux only.
 
 ## Features
 
 ### Working
+
+Here's what I can do today:
 
 - **Keyboard zoom:** `1`–`9` switch zoom levels instantly.
 - **Scroll-wheel zoom:** `levels` mode (steps through 1–9) or `factor` mode (10 % steps, clamped to 1×–32×); wheel direction is reversed by default, flippable via the `invert_scroll_zoom` config option; high-resolution `value120` deltas supported.
@@ -29,6 +31,8 @@ Rendering is GPU-accelerated via **EGL + OpenGL ES 2** (nearest-neighbor, crisp 
 - **Quit:** `Q`, `Escape`, or right mouse button.
 
 ### Keybindings
+
+These are my default keybindings:
 
 | Key | Action |
 |---|---|
@@ -60,13 +64,13 @@ cargo build --release
 cp target/release/maggie /usr/local/bin/
 ```
 
-System dependency (Linux): `libwayland-dev` (Wayland client libraries).
+The only system dependency is `libwayland-dev` (Wayland client libraries).
 
-The `justfile` provides developer conveniences: `just build`, `just run`, `just tests`, `just check`, `just lint`.
+I come with a `justfile` for developer conveniences: `just build`, `just run`, `just tests`, `just check`, `just lint` — and a full release workflow (`just release`, `just push-release-tag`).
 
 ## Configuration
 
-Maggie reads `~/.config/maggie/config.ron` (Rusty Object Notation). If the file is absent, sensible defaults are used. Options:
+I read my configuration from `~/.config/maggie/config.ron` (Rusty Object Notation). If the file is absent, I fall back to sensible defaults. Options:
 
 - `default_zoom` — initial zoom level (floating point).
 - `cursor_follow` — `snap` (default) | `ease` | `inertia`.
@@ -81,15 +85,15 @@ Newer options carry `#[serde(default)]`, so config files written before they exi
 
 ## Architecture
 
-Maggie is a single-binary Wayland client built on `wayland-client` + `smithay-client-toolkit`.
+I'm a single-binary Wayland client built on `wayland-client` + `smithay-client-toolkit`.
 
 ### Design highlights
 
-- **Frozen-frame model** — `zwlr_screencopy` captures the current output exactly once at startup; the SHM buffer (XRGB8888/ARGB8888) is converted to RGBA with a stride-aware row copy honoring `y_invert`. Failed captures retry up to 3 times, then the overlay renders black.
-- **Capture-before-content** — the overlay is committed at startup but presents no image data until the first frame arrives, so the initial screencopy never contains the overlay — avoiding the Droste-effect self-feedback that plagues live-capture magnifiers.
-- **Fullscreen layer-shell overlay** — `Layer::Overlay` with all anchors and an **exclusive zone of −1** ("dont care"), so the compositor hands it the full physical screen instead of shrinking it around bars/docks. The surface re-asserts its size on every configure and redraws immediately. Keyboard interactivity is `on-demand`, keeping compositor-level global keybindings alive.
-- **Lazy GPU init** — the `wl_egl_window` is created at the first configure, when the real output size is known, so the very first presented buffer is already fullscreen. EGL is loaded dynamically (`khronos-egl`); GLES2 bindings are generated at build time by `gl_generator`.
-- **Swap interval 0** — frame redraws never block the event loop, so input works during panning animations.
+- **Frozen-frame model** — I capture the current output exactly once at startup via `zwlr_screencopy`; the SHM buffer (XRGB8888/ARGB8888) is converted to RGBA with a stride-aware row copy honoring `y_invert`. Failed captures retry up to 3 times, then the overlay renders black.
+- **Capture-before-content** — my overlay is committed at startup but presents no image data until the first frame arrives, so the initial screencopy never contains the overlay — avoiding the Droste-effect self-feedback that plagues live-capture magnifiers.
+- **Fullscreen layer-shell overlay** — `Layer::Overlay` with all anchors and an **exclusive zone of −1** ("dont care"), so the compositor hands me the full physical screen instead of shrinking me around bars/docks. I re-assert my size on every configure and redraw immediately. Keyboard interactivity is `on-demand`, keeping compositor-level global keybindings alive.
+- **Lazy GPU init** — I create my `wl_egl_window` at the first configure, when the real output size is known, so my very first presented buffer is already fullscreen. EGL is loaded dynamically (`khronos-egl`); GLES2 bindings are generated at build time by `gl_generator`.
+- **Swap interval 0** — my frame redraws never block the event loop, so input works during panning animations.
 - **Event-driven input** — pointer motion at sub-pixel precision, wheel deltas, and keyboard events are handled in a `blocking_dispatch` loop; panning animations are driven by `wl_surface` frame callbacks.
 
 ### Module breakdown
@@ -107,7 +111,7 @@ Maggie is a single-binary Wayland client built on `wayland-client` + `smithay-cl
 
 ## Roadmap
 
-Broader compositor / distro support is a desired direction, but **not yet implemented**:
+Broader compositor and distro support is a direction I'd like to grow into, but **none of it is implemented yet**:
 
 | Target | Status |
 |---|---|
@@ -117,7 +121,7 @@ Broader compositor / distro support is a desired direction, but **not yet implem
 | GNOME (Mutter) | Not implemented |
 | KDE (KWin) | Not implemented |
 
-The frozen-frame + layer-shell design is compositor-agnostic at the protocol level, but each environment needs its own capture path (GNOME notably lacks `zwlr_screencopy`), and layering/anchoring behavior differs between compositors.
+My frozen-frame + layer-shell design is compositor-agnostic at the protocol level, but each environment needs its own capture path (GNOME notably lacks `zwlr_screencopy`), and layering/anchoring behavior differs between compositors.
 
 Planned or under consideration (per `SPEC.md` — not commitments):
 
@@ -131,15 +135,17 @@ Planned or under consideration (per `SPEC.md` — not commitments):
 
 ### Packaging
 
-Tag pushes (`v*`) trigger the CI workflow, which builds a `--release` binary, runs the test suite, and publishes a packaged archive with checksums to a GitHub Release.
+Tag pushes (`v*`) trigger my CI workflow, which builds a `--release` binary, runs the test suite, and publishes a packaged archive with checksums to a GitHub Release.
 
 ## Limitations
 
-- **No live capture mode** — the screen is captured once at startup; the view is frozen until exit (by design).
+Here's what I don't do (yet):
+
+- **No live capture mode** — I capture the screen once at startup; my view is frozen until exit (by design).
 - **Config is load-only** — runtime changes never reach disk; edit `config.ron` manually.
 - **Only `F` screenshot works** — `S` and `W` are not implemented; `Escape` quits rather than cancelling.
 - **`A` and `C` are inert** — bound, but log "not yet implemented".
-- **Wayland-only, Niri-oriented** — other compositors untested; X11 unsupported.
+- **Linux / Wayland-only** — other compositors untested; X11 unsupported.
 
 ## Author
 
