@@ -439,19 +439,25 @@ impl PointerHandler for MagnifierWindow {
         _: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
-        let mut moved = false;
         for event in events {
             if &event.surface != self.layer.wl_surface() {
                 continue;
             }
             self.pointer_seen = true;
             match event.kind {
+                PointerEventKind::Enter { .. } => {
+                    let position = event.position;
+                    self.pointer_position_f = position;
+                    self.state.pointer_position = (position.0 as i32, position.1 as i32);
+                    self.draw_frame(qh);
+                }
                 PointerEventKind::Motion { .. } => {
-                    let position = (event.position.0, event.position.1);
+                    let position = event.position;
                     if position != self.pointer_position_f {
                         self.pointer_position_f = position;
                         self.state.pointer_position = (position.0 as i32, position.1 as i32);
-                        moved = true;
+                        self.animating = true;
+                        self.draw_frame(qh);
                     }
                 }
                 PointerEventKind::Press { button, .. } => {
@@ -505,10 +511,6 @@ impl PointerHandler for MagnifierWindow {
                 }
                 _ => {}
             }
-        }
-        if moved {
-            self.animating = true;
-            self.draw_frame(qh);
         }
     }
 }
