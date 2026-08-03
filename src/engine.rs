@@ -967,6 +967,12 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
 
     let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("maggie"), None);
     layer.set_anchor(Anchor::all());
+    // A negative exclusive zone marks the surface as "dont care": the
+    // compositor hands it the full output geometry instead of shrinking it
+    // around the reserved zones of lower layer-shell surfaces (bars, docks).
+    // Without this, niri sizes the overlay to the screen minus the top bar,
+    // leaving the real bar covering the magnifier's top strip.
+    layer.set_exclusive_zone(-1);
     // On-demand keyboard focus (not exclusive): the compositor's own global
     // keybindings keep working while the magnifier stays keyboard-receivable.
     layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
