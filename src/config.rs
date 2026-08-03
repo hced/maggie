@@ -2,9 +2,24 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Motion style for following the cursor over the frozen frame.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorFollow {
+    /// Instant linear motion — no easing, no delay (default).
+    #[default]
+    Snap,
+    /// Exponential smoothing toward the cursor (former default behavior).
+    Ease,
+    /// Ease while moving, then a damped momentum glide after the cursor stops.
+    Inertia,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MagnifierConfig {
     pub default_zoom: Option<f64>,
+    #[serde(default)]
+    pub cursor_follow: CursorFollow,
     pub keybindings: Keybindings,
     pub screenshot_path: String,
     pub screenshot_filename_pattern: String,
@@ -28,6 +43,7 @@ impl Default for MagnifierConfig {
     fn default() -> Self {
         MagnifierConfig {
             default_zoom: Some(3.0),
+            cursor_follow: CursorFollow::Snap,
             keybindings: Keybindings {
                 toggle_osd: "k".to_string(),
                 screenshot_manual: "s".to_string(),

@@ -141,6 +141,12 @@ impl GpuRenderer {
         egl.make_current(display, Some(surface), Some(surface), Some(context))
             .map_err(|e| anyhow::anyhow!("Failed to make EGL context current: {e:?}"))?;
 
+        // Swap interval 0: never block in eglSwapBuffers waiting for buffer
+        // release, so the event loop stays responsive (keys keep working)
+        // while the panning animation redraws every frame.
+        egl.swap_interval(display, 0)
+            .map_err(|e| anyhow::anyhow!("Failed to set EGL swap interval: {e:?}"))?;
+
         gles2::load_with(|name| {
             egl.get_proc_address(name)
                 .map(|f| f as *const c_void)

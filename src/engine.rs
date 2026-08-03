@@ -54,6 +54,10 @@ const MAX_ZOOM: f64 = 32.0;
 const WHEEL_ZOOM_STEP: f64 = 0.1;
 const EASE_TAU: f64 = 0.04;
 const EASE_EPSILON: f64 = 0.05;
+/// Momentum decay time constant for the `inertia` cursor-follow style.
+const INERTIA_TAU: f64 = 0.12;
+/// Velocity (source px/s) below which an inertia glide is considered settled.
+const INERTIA_EPS: f64 = 1.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum MagnifierMode {
@@ -134,6 +138,8 @@ pub struct MagnifierWindow {
     first_configure: bool,
     last_anim_tick: Option<std::time::Instant>,
     view_center: Option<(f64, f64)>,
+    view_velocity: (f64, f64),
+    last_target: Option<(f64, f64)>,
     animating: bool,
     frame_callback: Option<wl_callback::WlCallback>,
     width: u32,
@@ -389,6 +395,15 @@ impl LayerShellHandler for MagnifierWindow {
     ) {
         self.width = NonZeroU32::new(configure.new_size.0).map_or(self.width, |v| v.get());
         self.height = NonZeroU32::new(configure.new_size.1).map_or(self.height, |v| v.get());
+
+        if let Some((w, h)) = self.output_logical_size()
+            && (w != self.width || h != self.height)
+        {
+            self.width = w;
+            self.height = h;
+            self.layer.set_size(w, h);
+        }
+
         if let Some(gpu) = &mut self.gpu {
             gpu.resize(self.width as i32, self.height as i32);
         }
@@ -396,13 +411,10 @@ impl LayerShellHandler for MagnifierWindow {
         if self.first_configure {
             self.first_configure = false;
             self.request_screencopy(qh);
-            if let Some(output) = self.current_output.clone()
-                && let Some(info) = self.output_state.info(&output)
-                && let Some((w, h)) = info.logical_size
-            {
-                self.layer.set_size(w.max(0) as u32, h.max(0) as u32);
-                self.layer.commit();
-            }
+        }
+
+        if self.captured.is_some() {
+            self.draw_frame(qh);
         }
 
         self.layer.commit();
@@ -445,6 +457,8 @@ impl PointerHandler for MagnifierWindow {
                             self.state.zoom = new_zoom;
                             self.state.renderer.update_scale_factor(new_zoom);
                             self.view_center = None;
+                            self.view_velocity = (0.0, 0.0);
+                            self.last_target = None;
                             self.animating = false;
                             tracing::info!("Wheel zoom set to {}", self.state.zoom);
                             self.draw_frame(qh);
@@ -510,6 +524,8 @@ impl KeyboardHandler for MagnifierWindow {
         } {
             self.state.handle_zoom_key(zoom_level);
             self.view_center = None;
+            self.view_velocity = (0.0, 0.0);
+            self.last_target = None;
             self.animating = false;
             self.draw_frame(qh);
         }
@@ -694,6 +710,23 @@ impl MagnifierWindow {
         self.frame_callback = Some(callback);
     }
 
+    /// Logical size of the output the surface is on, falling back to the first
+    /// known output. Used to size the viewport over the entire physical screen
+    /// (shell bars included) regardless of what the compositor first proposes.
+    fn output_logical_size(&self) -> Option<(u32, u32)> {
+        if let Some(output) = &self.current_output
+            && let Some((w, h)) = self.output_state.info(output).and_then(|i| i.logical_size)
+        {
+            return Some((w.max(0) as u32, h.max(0) as u32));
+        }
+        for output in self.output_state.outputs() {
+            if let Some((w, h)) = self.output_state.info(&output).and_then(|i| i.logical_size) {
+                return Some((w.max(0) as u32, h.max(0) as u32));
+            }
+        }
+        None
+    }
+
     fn render_frame<F>(&mut self, qh: &QueueHandle<Self>, fill: F)
     where
         F: FnOnce(&mut [u8], i32, i32, i32),
@@ -747,21 +780,52 @@ impl MagnifierWindow {
 
         let (center_x, center_y, animating) = match self.view_center {
             Some((cx, cy)) => {
-                let dist = ((cx - target.0).powi(2) + (cy - target.1).powi(2)).sqrt();
-                if dist < EASE_EPSILON {
-                    self.view_center = Some(target);
-                    self.animating = false;
-                    (target.0, target.1, false)
-                } else {
-                    let dt = self
-                        .last_anim_tick
-                        .map_or(0.016, |t| t.elapsed().as_secs_f64());
-                    self.last_anim_tick = Some(std::time::Instant::now());
-                    let k = 1.0 - (-dt / EASE_TAU).exp();
-                    let nx = cx + (target.0 - cx) * k;
-                    let ny = cy + (target.1 - cy) * k;
-                    self.view_center = Some((nx, ny));
-                    (nx, ny, true)
+                let dt = self.last_anim_tick.map_or(0.016, |t| t.elapsed().as_secs_f64());
+                self.last_anim_tick = Some(std::time::Instant::now());
+                match self.state.config.cursor_follow {
+                    crate::config::CursorFollow::Snap => {
+                        self.view_center = Some(target);
+                        self.animating = false;
+                        (target.0, target.1, false)
+                    }
+                    crate::config::CursorFollow::Ease => {
+                        let dist = ((cx - target.0).powi(2) + (cy - target.1).powi(2)).sqrt();
+                        if dist < EASE_EPSILON {
+                            self.view_center = Some(target);
+                            self.animating = false;
+                            (target.0, target.1, false)
+                        } else {
+                            let k = 1.0 - (-dt / EASE_TAU).exp();
+                            let nx = cx + (target.0 - cx) * k;
+                            let ny = cy + (target.1 - cy) * k;
+                            self.view_center = Some((nx, ny));
+                            (nx, ny, true)
+                        }
+                    }
+                    crate::config::CursorFollow::Inertia => {
+                        let cursor_moved = self.last_target != Some(target);
+                        let (mut vx, mut vy) = self.view_velocity;
+                        if cursor_moved {
+                            vx += (target.0 - cx) * (dt / EASE_TAU);
+                            vy += (target.1 - cy) * (dt / EASE_TAU);
+                        } else {
+                            let decay = (-dt / INERTIA_TAU).exp();
+                            vx *= decay;
+                            vy *= decay;
+                        }
+                        let nx = cx + vx * dt;
+                        let ny = cy + vy * dt;
+                        self.view_velocity = (vx, vy);
+                        self.view_center = Some((nx, ny));
+                        let settled = !cursor_moved && vx.hypot(vy) < INERTIA_EPS;
+                        if settled {
+                            self.animating = false;
+                            self.view_center = Some(target);
+                            (target.0, target.1, false)
+                        } else {
+                            (nx, ny, true)
+                        }
+                    }
                 }
             }
             None => {
@@ -769,6 +833,7 @@ impl MagnifierWindow {
                 (target.0, target.1, false)
             }
         };
+        self.last_target = Some(target);
         self.animating = animating;
 
         let view_w = self.width as f64 / zoom;
@@ -902,7 +967,9 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
 
     let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("maggie"), None);
     layer.set_anchor(Anchor::all());
-    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+    // On-demand keyboard focus (not exclusive): the compositor's own global
+    // keybindings keep working while the magnifier stays keyboard-receivable.
+    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
     layer.set_size(0, 0);
     layer.commit();
 
@@ -955,6 +1022,8 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         first_configure: true,
         last_anim_tick: None,
         view_center: None,
+        view_velocity: (0.0, 0.0),
+        last_target: None,
         animating: false,
         frame_callback: None,
         width: 1920,
