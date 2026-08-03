@@ -133,6 +133,7 @@ pub struct MagnifierWindow {
     capture_manager: CaptureManager,
     captured: Option<CapturedFrame>,
     gpu: Option<GpuRenderer>,
+    gpu_init_failed: bool,
     state: MagnifierState,
     exit: bool,
     first_configure: bool,
@@ -387,7 +388,7 @@ impl LayerShellHandler for MagnifierWindow {
 
     fn configure(
         &mut self,
-        _: &Connection,
+        conn: &Connection,
         qh: &QueueHandle<Self>,
         _: &LayerSurface,
         configure: LayerSurfaceConfigure,
@@ -404,9 +405,16 @@ impl LayerShellHandler for MagnifierWindow {
             self.layer.set_size(w, h);
         }
 
+        self.ensure_gpu(conn);
+
         if let Some(gpu) = &mut self.gpu {
             gpu.resize(self.width as i32, self.height as i32);
         }
+
+        self.pool
+            .resize(self.width as usize * self.height as usize * 4)
+            .map_err(|e| tracing::warn!("Failed to resize shm pool: {e}"))
+            .ok();
 
         if self.first_configure {
             self.first_configure = false;
@@ -710,6 +718,36 @@ impl MagnifierWindow {
         self.frame_callback = Some(callback);
     }
 
+    /// Initialize the GPU renderer at first configure, once the real output
+    /// size is known. The EGL window is created at its final size so the very
+    /// first presented buffer already covers the whole output; resizing a
+    /// wl_egl_window before the first swap has no effect in practice.
+    fn ensure_gpu(&mut self, conn: &Connection) {
+        if self.gpu.is_some() || self.gpu_init_failed {
+            return;
+        }
+        match GpuRenderer::init(
+            conn.backend().display_ptr() as *mut std::os::raw::c_void,
+            self.layer.wl_surface(),
+            self.width as i32,
+            self.height as i32,
+        ) {
+            Ok(mut gpu) => {
+                self.layer
+                    .wl_surface()
+                    .set_buffer_scale(crate::gpu::RENDER_SCALE);
+                if let Some(captured) = &self.captured {
+                    gpu.upload_frame(&captured.buffer);
+                }
+                self.gpu = Some(gpu);
+            }
+            Err(e) => {
+                self.gpu_init_failed = true;
+                tracing::warn!("GPU rendering unavailable, falling back to CPU path: {:#}", e);
+            }
+        }
+    }
+
     /// Logical size of the output the surface is on, falling back to the first
     /// known output. Used to size the viewport over the entire physical screen
     /// (shell bars included) regardless of what the compositor first proposes.
@@ -979,24 +1017,6 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
     layer.set_size(0, 0);
     layer.commit();
 
-    let gpu = GpuRenderer::init(
-        conn.backend().display_ptr() as *mut std::os::raw::c_void,
-        layer.wl_surface(),
-        1920,
-        1080,
-    )
-    .map(Some)
-    .unwrap_or_else(|e| {
-        tracing::warn!("GPU rendering unavailable, falling back to CPU path: {:#}", e);
-        None
-    });
-
-    if gpu.is_some() {
-        layer
-            .wl_surface()
-            .set_buffer_scale(crate::gpu::RENDER_SCALE);
-    }
-
     let pool = SlotPool::new(1920 * 1080 * 4, &shm)?;
     let capture_manager = CaptureManager::new(
         config.screenshot_path.clone(),
@@ -1022,7 +1042,8 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         capture_retries: 0,
         capture_manager,
         captured: None,
-        gpu,
+        gpu: None,
+        gpu_init_failed: false,
         state,
         exit: false,
         first_configure: true,
