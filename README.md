@@ -4,7 +4,7 @@
 
 # Maggie
 
-Native Wayland screen magnifier and utility.
+Native Wayland screen magnifier utility.
 
 ---
 
