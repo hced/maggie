@@ -467,7 +467,7 @@ impl PointerHandler for MagnifierWindow {
                         vertical.discrete as f64
                     };
                     if steps != 0.0 {
-                        if self.state.config.invert_scroll_zoom {
+                        if !self.state.config.invert_scroll_zoom {
                             steps = -steps;
                         }
                         let new_zoom = match self.state.config.scroll_zoom_mode {
