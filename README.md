@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/branding/maggie_logo/maggie_logo_512.png" alt="Maggie Logo" width="512">
+</p>
+
 # Maggie
 
 Native Wayland screen magnifier and utility tool, written in Rust.
