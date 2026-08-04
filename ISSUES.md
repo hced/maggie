@@ -1,0 +1,1 @@
+- After a while, when having moved the mouse around for some time, the delayed motion starts to kick in, which I don't like. Can we figure out why that happens? Can we make no inertia be the default?

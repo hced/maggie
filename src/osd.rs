@@ -12,48 +12,132 @@ const TEXT_COLOR: [u8; 3] = [0xE6, 0xE6, 0xE6];
 
 fn glyph(character: char) -> Option<&'static [u8; GLYPH_HEIGHT]> {
     match character {
-        ' ' => Some(&[0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000]),
-        '0' => Some(&[0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110]),
-        '1' => Some(&[0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]),
-        '2' => Some(&[0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111]),
-        '3' => Some(&[0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110]),
-        '4' => Some(&[0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010]),
-        '5' => Some(&[0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110]),
-        '6' => Some(&[0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110]),
-        '7' => Some(&[0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000]),
-        '8' => Some(&[0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110]),
-        '9' => Some(&[0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100]),
-        'a' | 'A' => Some(&[0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111]),
-        'b' | 'B' => Some(&[0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b01110]),
-        'c' | 'C' => Some(&[0b00000, 0b00000, 0b01110, 0b10000, 0b10000, 0b10001, 0b01110]),
-        'd' | 'D' => Some(&[0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10001, 0b01111]),
-        'e' | 'E' => Some(&[0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110]),
-        'f' | 'F' => Some(&[0b00110, 0b01001, 0b01000, 0b11100, 0b01000, 0b01000, 0b01000]),
-        'g' | 'G' => Some(&[0b00000, 0b01111, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110]),
-        'h' | 'H' => Some(&[0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001]),
-        'i' | 'I' => Some(&[0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110]),
-        'j' | 'J' => Some(&[0b00010, 0b00000, 0b00110, 0b00010, 0b00010, 0b10010, 0b01100]),
-        'k' | 'K' => Some(&[0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010]),
-        'l' | 'L' => Some(&[0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]),
-        'm' | 'M' => Some(&[0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10101, 0b10101]),
-        'n' | 'N' => Some(&[0b00000, 0b00000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001]),
-        'o' | 'O' => Some(&[0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110]),
-        'p' | 'P' => Some(&[0b00000, 0b00000, 0b10110, 0b11001, 0b10001, 0b11110, 0b10000]),
-        'q' | 'Q' => Some(&[0b00000, 0b00000, 0b01101, 0b10011, 0b10001, 0b01111, 0b00001]),
-        'r' | 'R' => Some(&[0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000]),
-        's' | 'S' => Some(&[0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110]),
-        't' | 'T' => Some(&[0b01000, 0b01000, 0b11100, 0b01000, 0b01000, 0b01001, 0b00110]),
-        'u' | 'U' => Some(&[0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101]),
-        'v' | 'V' => Some(&[0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100]),
-        'w' | 'W' => Some(&[0b00000, 0b00000, 0b10101, 0b10101, 0b10101, 0b10101, 0b01010]),
-        'x' | 'X' => Some(&[0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001]),
-        'y' | 'Y' => Some(&[0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b01111, 0b00001]),
-        'z' | 'Z' => Some(&[0b00000, 0b00000, 0b11111, 0b00010, 0b00100, 0b01000, 0b11111]),
-        '-' => Some(&[0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000]),
-        '/' => Some(&[0b00001, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b10000]),
-        '+' => Some(&[0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000]),
-        '.' => Some(&[0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100]),
-        ':' => Some(&[0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000]),
+        ' ' => Some(&[
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000,
+        ]),
+        '0' => Some(&[
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ]),
+        '1' => Some(&[
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ]),
+        '2' => Some(&[
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ]),
+        '3' => Some(&[
+            0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110,
+        ]),
+        '4' => Some(&[
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ]),
+        '5' => Some(&[
+            0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+        ]),
+        '6' => Some(&[
+            0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ]),
+        '7' => Some(&[
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ]),
+        '8' => Some(&[
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ]),
+        '9' => Some(&[
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100,
+        ]),
+        'a' | 'A' => Some(&[
+            0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111,
+        ]),
+        'b' | 'B' => Some(&[
+            0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b01110,
+        ]),
+        'c' | 'C' => Some(&[
+            0b00000, 0b00000, 0b01110, 0b10000, 0b10000, 0b10001, 0b01110,
+        ]),
+        'd' | 'D' => Some(&[
+            0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10001, 0b01111,
+        ]),
+        'e' | 'E' => Some(&[
+            0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110,
+        ]),
+        'f' | 'F' => Some(&[
+            0b00110, 0b01001, 0b01000, 0b11100, 0b01000, 0b01000, 0b01000,
+        ]),
+        'g' | 'G' => Some(&[
+            0b00000, 0b01111, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110,
+        ]),
+        'h' | 'H' => Some(&[
+            0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001,
+        ]),
+        'i' | 'I' => Some(&[
+            0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ]),
+        'j' | 'J' => Some(&[
+            0b00010, 0b00000, 0b00110, 0b00010, 0b00010, 0b10010, 0b01100,
+        ]),
+        'k' | 'K' => Some(&[
+            0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010,
+        ]),
+        'l' | 'L' => Some(&[
+            0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ]),
+        'm' | 'M' => Some(&[
+            0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10101, 0b10101,
+        ]),
+        'n' | 'N' => Some(&[
+            0b00000, 0b00000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001,
+        ]),
+        'o' | 'O' => Some(&[
+            0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110,
+        ]),
+        'p' | 'P' => Some(&[
+            0b00000, 0b00000, 0b10110, 0b11001, 0b10001, 0b11110, 0b10000,
+        ]),
+        'q' | 'Q' => Some(&[
+            0b00000, 0b00000, 0b01101, 0b10011, 0b10001, 0b01111, 0b00001,
+        ]),
+        'r' | 'R' => Some(&[
+            0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000,
+        ]),
+        's' | 'S' => Some(&[
+            0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110,
+        ]),
+        't' | 'T' => Some(&[
+            0b01000, 0b01000, 0b11100, 0b01000, 0b01000, 0b01001, 0b00110,
+        ]),
+        'u' | 'U' => Some(&[
+            0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101,
+        ]),
+        'v' | 'V' => Some(&[
+            0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ]),
+        'w' | 'W' => Some(&[
+            0b00000, 0b00000, 0b10101, 0b10101, 0b10101, 0b10101, 0b01010,
+        ]),
+        'x' | 'X' => Some(&[
+            0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001,
+        ]),
+        'y' | 'Y' => Some(&[
+            0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b01111, 0b00001,
+        ]),
+        'z' | 'Z' => Some(&[
+            0b00000, 0b00000, 0b11111, 0b00010, 0b00100, 0b01000, 0b11111,
+        ]),
+        '-' => Some(&[
+            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ]),
+        '/' => Some(&[
+            0b00001, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b10000,
+        ]),
+        '+' => Some(&[
+            0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000,
+        ]),
+        '.' => Some(&[
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
+        ]),
+        ':' => Some(&[
+            0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000,
+        ]),
         _ => None,
     }
 }
@@ -114,8 +198,8 @@ pub fn draw_osd(
         if y < 0 || y >= canvas_h {
             continue;
         }
-        let src_row = &sprite.buffer.data
-            [((y - sprite.y) as usize) * (sprite.width as usize) * 4..];
+        let src_row =
+            &sprite.buffer.data[((y - sprite.y) as usize) * (sprite.width as usize) * 4..];
         let dst_start = ((y * canvas_w + sprite.x.max(0)) as usize) * 4;
         let dst_end = ((y * canvas_w + (sprite.x + sprite.width).min(canvas_w)) as usize) * 4;
         if dst_end <= dst_start {
@@ -172,8 +256,10 @@ pub fn build_osd_sprite(
     let (box_x, box_y) = corners
         .into_iter()
         .max_by(|a, b| {
-            let da = ((a.0 + box_w / 2 - cursor.0) as f64).hypot((a.1 + box_h / 2 - cursor.1) as f64);
-            let db = ((b.0 + box_w / 2 - cursor.0) as f64).hypot((b.1 + box_h / 2 - cursor.1) as f64);
+            let da =
+                ((a.0 + box_w / 2 - cursor.0) as f64).hypot((a.1 + box_h / 2 - cursor.1) as f64);
+            let db =
+                ((b.0 + box_w / 2 - cursor.0) as f64).hypot((b.1 + box_h / 2 - cursor.1) as f64);
             da.total_cmp(&db)
         })
         .unwrap();
@@ -225,21 +311,35 @@ mod tests {
         draw_text(&mut canvas, 20, 20, 0, 0, "0", [230, 230, 230]);
         let on_pixels = canvas.chunks_exact(4).filter(|p| p[3] == 255).count();
         assert!(on_pixels > 10, "expected glyph pixels, got {on_pixels}");
-        assert_eq!(canvas.chunks_exact(4).filter(|p| p[3] != 0 && p[3] != 255).count(), 0);
+        assert_eq!(
+            canvas
+                .chunks_exact(4)
+                .filter(|p| p[3] != 0 && p[3] != 255)
+                .count(),
+            0
+        );
     }
 
     #[test]
     fn draw_text_clips_out_of_bounds() {
         let mut canvas = vec![0u8; 20 * 20 * 4];
-        draw_text(&mut canvas, 20, 20, 100, 100, "Hello OSD 123", [255, 255, 255]);
+        draw_text(
+            &mut canvas,
+            20,
+            20,
+            100,
+            100,
+            "Hello OSD 123",
+            [255, 255, 255],
+        );
         assert!(canvas.iter().all(|&b| b == 0));
         let mut canvas = vec![0u8; 20 * 20 * 4];
         draw_text(&mut canvas, 20, 20, 19, 19, "H", [255, 255, 255]);
-        let on = canvas
-            .chunks_exact(4)
-            .filter(|p| p[3] == 255)
-            .count();
-        assert!(on > 0 && on <= 7, "only in-bounds glyph pixels drawn, got {on}");
+        let on = canvas.chunks_exact(4).filter(|p| p[3] == 255).count();
+        assert!(
+            on > 0 && on <= 7,
+            "only in-bounds glyph pixels drawn, got {on}"
+        );
     }
 
     #[test]
@@ -251,9 +351,18 @@ mod tests {
             "k  toggle OSD".to_string(),
         ];
         draw_osd(&mut canvas, 200, 200, &lines, (150, 150));
-        let pixels: Vec<[u8; 4]> = canvas.chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]).collect();
-        assert!(pixels.iter().any(|p| p[3] == BOX_ALPHA && p[0] == 0), "box not drawn");
-        assert!(pixels.iter().any(|p| p[3] == 255 && p[2] > 200), "text not drawn");
+        let pixels: Vec<[u8; 4]> = canvas
+            .chunks_exact(4)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .collect();
+        assert!(
+            pixels.iter().any(|p| p[3] == BOX_ALPHA && p[0] == 0),
+            "box not drawn"
+        );
+        assert!(
+            pixels.iter().any(|p| p[3] == 255 && p[2] > 200),
+            "text not drawn"
+        );
         let text_ys: Vec<i32> = (0..200)
             .filter(|&y| {
                 (0..200).any(|x| {
@@ -262,7 +371,10 @@ mod tests {
                 })
             })
             .collect();
-        assert!(*text_ys.iter().min().unwrap() < 200 / 2, "box should be top-left");
+        assert!(
+            *text_ys.iter().min().unwrap() < 200 / 2,
+            "box should be top-left"
+        );
     }
 
     #[test]
@@ -270,7 +382,10 @@ mod tests {
         let mut canvas = vec![0u8; 200 * 200 * 4];
         let lines = vec!["k  toggle OSD".to_string()];
         draw_osd(&mut canvas, 200, 200, &lines, (10, 10));
-        let pixels: Vec<[u8; 4]> = canvas.chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]).collect();
+        let pixels: Vec<[u8; 4]> = canvas
+            .chunks_exact(4)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .collect();
         let text_ys: Vec<i32> = (0..200)
             .filter(|&y| {
                 (0..200).any(|x| {
@@ -279,7 +394,10 @@ mod tests {
                 })
             })
             .collect();
-        assert!(*text_ys.iter().min().unwrap() > 200 / 2, "box should be bottom-right");
+        assert!(
+            *text_ys.iter().min().unwrap() > 200 / 2,
+            "box should be bottom-right"
+        );
     }
 
     #[test]
@@ -294,8 +412,10 @@ mod tests {
             let mut canvas = vec![0u8; 200 * 200 * 4];
             let lines = vec!["zoom".to_string()];
             draw_osd(&mut canvas, 200, 200, &lines, cursor);
-            let pixels: Vec<[u8; 4]> =
-                canvas.chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]).collect();
+            let pixels: Vec<[u8; 4]> = canvas
+                .chunks_exact(4)
+                .map(|p| [p[0], p[1], p[2], p[3]])
+                .collect();
             let text_xs: Vec<i32> = (0..200)
                 .filter(|&x| {
                     (0..200).any(|y| {

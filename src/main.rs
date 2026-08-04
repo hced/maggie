@@ -2,13 +2,14 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::prelude::*;
 
-mod config;
-mod input;
-mod render;
 mod capture;
+mod config;
+mod cursor;
 mod engine;
 mod gpu;
+mod input;
 mod osd;
+mod render;
 
 #[derive(Parser, Debug)]
 #[command(name = "maggie", version, about = "Native Wayland screen magnifier")]

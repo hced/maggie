@@ -20,5 +20,8 @@ fn main() {
     registry.write_bindings(GlobalGenerator, &mut buf).unwrap();
 
     let source = String::from_utf8(buf).unwrap().replace(" -> ()", "");
-    File::create(&dest).unwrap().write_all(source.as_bytes()).unwrap();
+    File::create(&dest)
+        .unwrap()
+        .write_all(source.as_bytes())
+        .unwrap();
 }

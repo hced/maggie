@@ -2,8 +2,8 @@
 
 use std::num::NonZeroU32;
 
-use smithay_client_toolkit::compositor::CompositorState;
 use smithay_client_toolkit::compositor::CompositorHandler;
+use smithay_client_toolkit::compositor::CompositorState;
 use smithay_client_toolkit::compositor::FrameCallbackData;
 use smithay_client_toolkit::delegate_registry;
 use smithay_client_toolkit::output::OutputHandler;
@@ -11,32 +11,32 @@ use smithay_client_toolkit::output::OutputState;
 use smithay_client_toolkit::registry::ProvidesRegistryState;
 use smithay_client_toolkit::registry::RegistryState;
 use smithay_client_toolkit::registry_handlers;
-use smithay_client_toolkit::seat::pointer::PointerEventKind;
-use smithay_client_toolkit::seat::pointer::PointerHandler;
-use smithay_client_toolkit::seat::pointer::PointerEvent;
-use smithay_client_toolkit::seat::keyboard::KeyboardHandler;
-use smithay_client_toolkit::seat::keyboard::KeyEvent;
-use smithay_client_toolkit::seat::keyboard::Keysym;
-use smithay_client_toolkit::seat::keyboard::Modifiers;
-use smithay_client_toolkit::seat::keyboard::RawModifiers;
 use smithay_client_toolkit::seat::Capability;
 use smithay_client_toolkit::seat::SeatHandler;
 use smithay_client_toolkit::seat::SeatState;
+use smithay_client_toolkit::seat::keyboard::KeyEvent;
+use smithay_client_toolkit::seat::keyboard::KeyboardHandler;
+use smithay_client_toolkit::seat::keyboard::Keysym;
+use smithay_client_toolkit::seat::keyboard::Modifiers;
+use smithay_client_toolkit::seat::keyboard::RawModifiers;
+use smithay_client_toolkit::seat::pointer::PointerEvent;
+use smithay_client_toolkit::seat::pointer::PointerEventKind;
+use smithay_client_toolkit::seat::pointer::PointerHandler;
+use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
     LayerSurfaceConfigure,
 };
-use smithay_client_toolkit::shell::WaylandSurface;
-use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::Shm;
 use smithay_client_toolkit::shm::ShmHandler;
+use smithay_client_toolkit::shm::slot::SlotPool;
 
+use wayland_client::Proxy;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{
     wl_callback, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
 };
 use wayland_client::{Connection, QueueHandle};
-use wayland_client::Proxy;
 
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1::Flags, zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
@@ -152,8 +152,10 @@ pub struct MagnifierWindow {
     pointer_position_f: (f64, f64),
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
+    magnified_cursor: Option<crate::cursor::MagnifiedCursor>,
+    blank_cursor_surface: Option<wl_surface::WlSurface>,
+    cursor_pool: Option<SlotPool>,
 }
-
 
 struct ScreencastManagerData;
 
@@ -167,7 +169,8 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyManagerV1, Magni
         _: <ZwlrScreencopyManagerV1 as Proxy>::Event,
         _: &Connection,
         _: &QueueHandle<MagnifierWindow>,
-    ) {}
+    ) {
+    }
 }
 
 struct ScreencastFrameData;
@@ -185,7 +188,12 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
     ) {
         use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::Event;
         match event {
-            Event::Buffer { format, width, height, stride } => {
+            Event::Buffer {
+                format,
+                width,
+                height,
+                stride,
+            } => {
                 tracing::debug!(
                     "Screencopy buffer: {}x{} stride={} format={}",
                     width,
@@ -213,12 +221,9 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
                         return;
                     }
                 };
-                if let Ok((buffer, _canvas)) = pool.create_buffer(
-                    width as i32,
-                    height as i32,
-                    stride as i32,
-                    format,
-                ) {
+                if let Ok((buffer, _canvas)) =
+                    pool.create_buffer(width as i32, height as i32, stride as i32, format)
+                {
                     frame.copy(buffer.wl_buffer());
                     state.screencast_pool = Some(pool);
                     state.screencast_buffer = Some(buffer);
@@ -234,15 +239,13 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
             Event::Ready { .. } => {
                 tracing::debug!("Screencopy frame ready");
                 state.capture_retries = 0;
-                if let (Some(mut pool), Some(buffer)) = (
-                    state.screencast_pool.take(),
-                    state.screencast_buffer.take(),
-                ) && let Some(canvas) = buffer.canvas(&mut pool)
+                if let (Some(mut pool), Some(buffer)) =
+                    (state.screencast_pool.take(), state.screencast_buffer.take())
+                    && let Some(canvas) = buffer.canvas(&mut pool)
                 {
                     let stride = state.screencast_stride.unwrap_or(buffer.stride() as u32) as usize;
-                    let width = state
-                        .screencast_width
-                        .unwrap_or(buffer.stride() as u32 / 4) as usize;
+                    let width =
+                        state.screencast_width.unwrap_or(buffer.stride() as u32 / 4) as usize;
                     let height = state.screencast_height.unwrap_or(buffer.height() as u32) as usize;
                     let mut data = Vec::with_capacity(width * height * 4);
                     if state.y_invert {
@@ -279,7 +282,7 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
                     state.screencast_pool = None;
                     state.screencast_buffer = None;
                     state.request_screencopy(qh);
-                } else {
+                } else if state.captured.is_none() {
                     tracing::error!(
                         "Screencopy capture failed after {} retries, showing black overlay",
                         state.capture_retries
@@ -287,6 +290,15 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
                     state.screencast_pool = None;
                     state.screencast_buffer = None;
                     state.draw_black_overlay(qh);
+                } else {
+                    // A failed clean re-capture must never replace an already
+                    // good frozen frame (e.g. with the black overlay).
+                    tracing::error!(
+                        "Screencopy re-capture failed after {} retries; keeping existing frame",
+                        state.capture_retries
+                    );
+                    state.screencast_pool = None;
+                    state.screencast_buffer = None;
                 }
             }
             _ => {
@@ -350,13 +362,7 @@ impl CompositorHandler for MagnifierWindow {
     ) {
     }
 
-    fn frame(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: u32,
-    ) {
+    fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
         if self.animating {
             self.draw_frame(qh);
         }
@@ -418,9 +424,16 @@ impl LayerShellHandler for MagnifierWindow {
             .map_err(|e| tracing::warn!("Failed to resize shm pool: {e}"))
             .ok();
 
-        if self.first_configure {
+        if self.first_configure && self.request_screencopy(qh) {
+            // Request the first capture immediately, before anything has been
+            // rendered: the frame appears as fast as possible after launch,
+            // contains no feedback of our own output, and — because the
+            // capture is requested with `overlay_cursor = 0` — no baked system
+            // cursor either. The view then centers exactly on the pointer's
+            // launch position when the pointer enters the surface. If the
+            // request could not be issued yet (no output known), keep
+            // `first_configure` set so the next configure retries it.
             self.first_configure = false;
-            self.request_screencopy(qh);
         }
 
         if self.captured.is_some() {
@@ -445,10 +458,20 @@ impl PointerHandler for MagnifierWindow {
             }
             self.pointer_seen = true;
             match event.kind {
-                PointerEventKind::Enter { .. } => {
+                PointerEventKind::Enter { serial, .. } => {
                     let position = event.position;
                     self.pointer_position_f = position;
                     self.state.pointer_position = (position.0 as i32, position.1 as i32);
+                    // Hide the hardware cursor by setting a blank cursor surface
+                    if let (Some(pointer), Some(surface)) =
+                        (&self.pointer, &self.blank_cursor_surface)
+                    {
+                        pointer.set_cursor(serial, Some(surface), 0, 0);
+                    }
+                    // The first capture already happened at first configure
+                    // (cursor-free via `overlay_cursor = 0`). This enter is
+                    // where the pointer was at launch, so `draw_frame` now
+                    // centers the view exactly on that position.
                     self.draw_frame(qh);
                 }
                 PointerEventKind::Motion { .. } => {
@@ -464,6 +487,12 @@ impl PointerHandler for MagnifierWindow {
                     // Right mouse button quits, same as Q.
                     if button == BTN_RIGHT {
                         self.exit = true;
+                    }
+                }
+                PointerEventKind::Leave { serial, .. } => {
+                    // Restore default cursor when leaving our surface
+                    if let Some(pointer) = &self.pointer {
+                        pointer.set_cursor(serial, None, 0, 0);
                     }
                 }
                 PointerEventKind::Axis { vertical, .. } => {
@@ -500,6 +529,9 @@ impl PointerHandler for MagnifierWindow {
                         if (new_zoom - self.state.zoom).abs() > 1e-9 {
                             self.state.zoom = new_zoom;
                             self.state.renderer.update_scale_factor(new_zoom);
+                            if let Some(cursor) = &mut self.magnified_cursor {
+                                cursor.update_zoom(new_zoom);
+                            }
                             self.view_center = None;
                             self.view_velocity = (0.0, 0.0);
                             self.last_target = None;
@@ -563,6 +595,9 @@ impl KeyboardHandler for MagnifierWindow {
             _ => None,
         } {
             self.state.handle_zoom_key(zoom_level);
+            if let Some(cursor) = &mut self.magnified_cursor {
+                cursor.update_zoom(self.state.zoom);
+            }
             self.view_center = None;
             self.view_velocity = (0.0, 0.0);
             self.last_target = None;
@@ -664,7 +699,26 @@ impl SeatHandler for MagnifierWindow {
                 .seat_state
                 .get_pointer(qh, &seat)
                 .expect("Failed to create pointer");
-            self.pointer = Some(pointer);
+            self.pointer = Some(pointer.clone());
+
+            // Create a blank cursor surface (1x1 transparent) to hide the hardware cursor.
+            // The pool is kept on the window so the backing wl_shm_pool survives: dropping
+            // it here would invalidate the buffer while the compositor may still reference it.
+            let cursor_surface = self.compositor_state.create_surface(qh);
+            let mut cursor_pool =
+                SlotPool::new(4, &self.shm).expect("Failed to create cursor pool");
+            if let Ok((buffer, canvas)) =
+                cursor_pool.create_buffer(1, 1, 4, wl_shm::Format::Argb8888)
+            {
+                canvas[0] = 0; // R
+                canvas[1] = 0; // G
+                canvas[2] = 0; // B
+                canvas[3] = 0; // A (transparent)
+                buffer.attach_to(&cursor_surface).expect("buffer attach");
+                cursor_surface.commit();
+                self.blank_cursor_surface = Some(cursor_surface);
+                self.cursor_pool = Some(cursor_pool);
+            }
         }
     }
 
@@ -683,6 +737,8 @@ impl SeatHandler for MagnifierWindow {
         if capability == Capability::Pointer && self.pointer.is_some() {
             tracing::debug!("Unsetting pointer capability");
             self.pointer.take().unwrap().release();
+            self.blank_cursor_surface.take();
+            self.cursor_pool.take();
         }
     }
 
@@ -714,9 +770,13 @@ fn keysym_to_string(keysym: Keysym) -> String {
 smithay_client_toolkit::delegate_dispatch2!(MagnifierWindow);
 
 impl MagnifierWindow {
-    fn request_screencopy(&mut self, qh: &QueueHandle<Self>) {
+    /// Request a screencopy of the current output. Returns `false` (without
+    /// retrying) when the capture cannot be issued yet — e.g. no output is
+    /// known — so callers can retry later instead of leaving the overlay
+    /// permanently invisible.
+    fn request_screencopy(&mut self, qh: &QueueHandle<Self>) -> bool {
         let Some(manager) = &self.screencast_manager else {
-            return;
+            return false;
         };
         let output = self
             .current_output
@@ -724,10 +784,16 @@ impl MagnifierWindow {
             .or_else(|| self.output_state.outputs().next());
         let Some(output) = output else {
             tracing::error!("No output available for screencopy");
-            return;
+            return false;
         };
 
-        let _frame = manager.capture_output(true as i32, &output, qh, ScreencastFrameData);
+        // `overlay_cursor = 0`: the wlr-screencopy protocol requires the
+        // compositor to NOT include the cursor in the capture. This is the
+        // definitive cursor-exclusion mechanism (honored by niri, wlroots,
+        // KWin, Hyprland, ...) — the frozen frame can never contain a baked
+        // copy of the system cursor, regardless of pointer focus or timing.
+        let _frame = manager.capture_output(false as i32, &output, qh, ScreencastFrameData);
+        true
     }
 
     fn osd_lines(&self) -> Vec<String> {
@@ -736,7 +802,10 @@ impl MagnifierWindow {
             format!("maggie  zoom {}x", self.state.zoom),
             "1-9  zoom level".to_string(),
             format!("{}  toggle OSD", config_key.toggle_osd),
-            format!("{}  screenshot fullscreen", config_key.screenshot_fullscreen),
+            format!(
+                "{}  screenshot fullscreen",
+                config_key.screenshot_fullscreen
+            ),
             format!("{}  manual selection", config_key.screenshot_manual),
             format!("{}  window selection", config_key.screenshot_window),
             format!("{}  config window", config_key.config_window),
@@ -775,7 +844,10 @@ impl MagnifierWindow {
             }
             Err(e) => {
                 self.gpu_init_failed = true;
-                tracing::warn!("GPU rendering unavailable, falling back to CPU path: {:#}", e);
+                tracing::warn!(
+                    "GPU rendering unavailable, falling back to CPU path: {:#}",
+                    e
+                );
             }
         }
     }
@@ -850,7 +922,9 @@ impl MagnifierWindow {
 
         let (center_x, center_y, animating) = match self.view_center {
             Some((cx, cy)) => {
-                let dt = self.last_anim_tick.map_or(0.016, |t| t.elapsed().as_secs_f64());
+                let dt = self
+                    .last_anim_tick
+                    .map_or(0.016, |t| t.elapsed().as_secs_f64());
                 self.last_anim_tick = Some(std::time::Instant::now());
                 match self.state.config.cursor_follow {
                     crate::config::CursorFollow::Snap => {
@@ -913,6 +987,25 @@ impl MagnifierWindow {
 
         let lines = self.osd_lines();
 
+        // Dest size and letterbox offset of the magnified quad (the GPU path
+        // fills the whole buffer and ignores the offsets).
+        let dest_w = (view_w.min(source_w as f64) * zoom).round() as i32;
+        let dest_h = (view_h.min(source_h as f64) * zoom).round() as i32;
+        let off_x = ((self.width as i32 - dest_w) / 2).max(0);
+        let off_y = ((self.height as i32 - dest_h) / 2).max(0);
+
+        // Compute the magnified cursor position in logical screen coordinates:
+        // the spot where the content currently under the pointer lands in the
+        // viewport. Fractional pointer input keeps it gliding smoothly.
+        let cursor_logical = if self.pointer_seen && self.magnified_cursor.is_some() {
+            Some((
+                (self.pointer_position_f.0 * scale_x - src_x) * zoom + off_x as f64,
+                (self.pointer_position_f.1 * scale_y - src_y) * zoom + off_y as f64,
+            ))
+        } else {
+            None
+        };
+
         if let Some(gpu) = &mut self.gpu {
             let osd = if self.state.osd_visible {
                 crate::osd::build_osd_sprite(
@@ -933,28 +1026,52 @@ impl MagnifierWindow {
                 view_w.min(source_w as f64) / source_w as f64,
                 view_h.min(source_h as f64) / source_h as f64,
             );
-            gpu.draw(Some(uv), osd.as_ref());
+            // The GPU buffer is RENDER_SCALE x the logical size, so both the
+            // cursor sprite, its hotspot and its position must be scaled to
+            // match.
+            let cursor = cursor_logical.map(|(cx, cy)| {
+                let (buf, (hx, hy)) = self
+                    .magnified_cursor
+                    .as_mut()
+                    .expect("magnified cursor present")
+                    .sprite(crate::gpu::RENDER_SCALE as f64);
+                (
+                    (
+                        (cx * crate::gpu::RENDER_SCALE as f64) as i32,
+                        (cy * crate::gpu::RENDER_SCALE as f64) as i32,
+                    ),
+                    buf,
+                    (hx, hy),
+                )
+            });
+            gpu.draw(Some(uv), osd.as_ref(), cursor.as_ref());
             if self.animating {
                 self.request_frame_callback(qh);
             }
             return;
         }
 
-        let dest_w = (view_w.min(source_w as f64) * zoom).round() as i32;
-        let dest_h = (view_h.min(source_h as f64) * zoom).round() as i32;
-        let off_x = ((self.width as i32 - dest_w) / 2).max(0);
-        let off_y = ((self.height as i32 - dest_h) / 2).max(0);
-
-        let scaled = self.state.renderer.render_bilinear(
-            &captured.buffer,
-            (src_x, src_y),
-            dest_w,
-            dest_h,
-        );
+        let scaled =
+            self.state
+                .renderer
+                .render_bilinear(&captured.buffer, (src_x, src_y), dest_w, dest_h);
 
         let show_osd = self.state.osd_visible;
         let osd_lines = self.osd_lines();
-        let osd_cursor = self.state.pointer_position;
+        let osd_cursor = self.state.pointer_position; // Precompute the cursor sprite up front: the fill closure below cannot
+        // borrow `self` while `render_frame` holds `&mut self`.
+        let cursor_buf = cursor_logical.map(|(cx, cy)| {
+            let (buf, (hx, hy)) = self
+                .magnified_cursor
+                .as_mut()
+                .expect("magnified cursor present")
+                .sprite(1.0);
+            (
+                (cx as i32, cy as i32),
+                buf,
+                (hx.round() as i32, hy.round() as i32),
+            )
+        });
 
         self.render_frame(qh, |canvas, width, height, stride| {
             canvas.fill(0);
@@ -965,15 +1082,60 @@ impl MagnifierWindow {
                 dest_row[..(dest_w as usize) * 4]
                     .copy_from_slice(&src_row[..(dest_w as usize) * 4]);
             }
+            if let Some((cursor_pos, ref cursor_sprite, hotspot)) = cursor_buf {
+                Self::draw_cursor_at(canvas, stride, cursor_pos, cursor_sprite, hotspot);
+            }
             if show_osd {
                 crate::osd::draw_osd(canvas, width, height, &osd_lines, osd_cursor);
             }
         });
     }
 
+    /// Blit a magnified-cursor sprite so its hotspot lands exactly on `pos`.
+    /// `stride` is the byte stride of a canvas row (width * 4); the usable
+    /// pixel width of each row is stride / 4.
+    fn draw_cursor_at(
+        canvas: &mut [u8],
+        stride: i32,
+        pos: (i32, i32),
+        cursor: &RgbaBuffer,
+        hotspot: (i32, i32),
+    ) {
+        let (cursor_w, cursor_h) = (cursor.width, cursor.height);
+        let (pos_x, pos_y) = pos;
+        let (hot_x, hot_y) = hotspot;
+        let canvas_w = stride / 4;
+        let canvas_h = canvas.len() as i32 / stride;
+
+        for y in 0..cursor_h {
+            let dest_y = pos_y - hot_y + y;
+            if dest_y < 0 || dest_y >= canvas_h {
+                continue;
+            }
+            for x in 0..cursor_w {
+                let dest_x = pos_x - hot_x + x;
+                if dest_x < 0 || dest_x >= canvas_w {
+                    continue;
+                }
+                let src_idx = ((y as usize) * (cursor_w as usize) + x as usize) * 4;
+                let dest_idx = (dest_y as usize) * (stride as usize) + (dest_x as usize) * 4;
+                let src_pixel = &cursor.data[src_idx..src_idx + 4];
+                let dest_pixel = &mut canvas[dest_idx..dest_idx + 4];
+
+                // Alpha blending
+                let src_a = src_pixel[3] as f32 / 255.0;
+                for i in 0..4 {
+                    dest_pixel[i] = (src_pixel[i] as f32 * src_a
+                        + dest_pixel[i] as f32 * (1.0 - src_a))
+                        .round() as u8;
+                }
+            }
+        }
+    }
+
     fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
         if let Some(gpu) = &mut self.gpu {
-            gpu.draw(None, None);
+            gpu.draw(None, None, None);
             return;
         }
         self.render_frame(qh, |canvas, _width, _height, _stride| {
@@ -1023,8 +1185,8 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Compositor not available: {:?}", e))?;
     let layer_shell = LayerShell::bind(&globals, &qh)
         .map_err(|e| anyhow::anyhow!("Layer shell not available: {:?}", e))?;
-    let shm = Shm::bind(&globals, &qh)
-        .map_err(|e| anyhow::anyhow!("SHM not available: {:?}", e))?;
+    let shm =
+        Shm::bind(&globals, &qh).map_err(|e| anyhow::anyhow!("SHM not available: {:?}", e))?;
     let output_state = OutputState::new(&globals, &qh);
 
     let screencast_manager = globals
@@ -1035,7 +1197,8 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
 
     let surface = compositor.create_surface(&qh);
 
-    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("maggie"), None);
+    let layer =
+        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("maggie"), None);
     layer.set_anchor(Anchor::all());
     // A negative exclusive zone marks the surface as "dont care": the
     // compositor hands it the full output geometry instead of shrinking it
@@ -1055,6 +1218,7 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         config.screenshot_filename_pattern.clone(),
     );
     let state = MagnifierState::new(config, initial_zoom);
+    let start_zoom = state.zoom;
 
     let mut window = MagnifierWindow {
         registry_state: RegistryState::new(&globals),
@@ -1092,6 +1256,9 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         pointer_position_f: (0.0, 0.0),
         keyboard: None,
         pointer: None,
+        magnified_cursor: Some(crate::cursor::MagnifiedCursor::new(start_zoom)),
+        blank_cursor_surface: None,
+        cursor_pool: None,
     };
 
     tracing::info!(
@@ -1104,13 +1271,104 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
     }
 
     loop {
-        event_queue.blocking_dispatch(&mut window)?;
-
         if window.exit {
             tracing::info!("Exiting");
             break;
         }
+        // Block on the display, dispatching as events arrive (pointer motion,
+        // capture Ready, frame callbacks). The first capture was already
+        // requested at first configure, so the frame appears with no delay.
+        event_queue.blocking_dispatch(&mut window)?;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the magnified-cursor blit: `draw_cursor_at` must
+    /// draw the reticle (white ring + black center) at the requested position
+    /// without mirroring, and never write outside the canvas.
+    fn canvas_at(canvas: &[u8], stride: i32, x: i32, y: i32) -> Option<[u8; 4]> {
+        if x < 0 || y < 0 || x >= stride / 4 || y >= canvas.len() as i32 / stride {
+            return None;
+        }
+        let i = (y as usize * stride as usize + x as usize * 4) as usize;
+        Some([canvas[i], canvas[i + 1], canvas[i + 2], canvas[i + 3]])
+    }
+    #[test]
+    fn draw_cursor_at_blits_ring_and_center_unmirrored() {
+        let mut canvas = vec![0u8; 64 * 64 * 4];
+        let stride = 64 * 4;
+        let (sprite, (hx, hy)) = crate::cursor::MagnifiedCursor::from_reticle(1.0).sprite(1.0);
+        let hotspot = (hx.round() as i32, hy.round() as i32);
+
+        MagnifierWindow::draw_cursor_at(&mut canvas, stride, (32, 32), &sprite, hotspot);
+
+        // Black center lands at the requested spot (reticle hotspot is center).
+        assert_eq!(canvas_at(&canvas, stride, 32, 32), Some([0, 0, 0, 255]));
+        // White ring is present (sprite is not a plain black square).
+        assert_eq!(
+            canvas_at(&canvas, stride, 32 + 5, 32),
+            Some([255, 255, 255, 255])
+        );
+        // Corners of the sprite footprint stay untouched (transparent region).
+        assert_eq!(
+            canvas_at(&canvas, stride, 32 + 7, 32 + 7),
+            Some([0, 0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn draw_cursor_at_moves_with_position_without_mirroring() {
+        let mut canvas = vec![0u8; 64 * 64 * 4];
+        let stride = 64 * 4;
+        let (sprite, (hx, hy)) = crate::cursor::MagnifiedCursor::from_reticle(1.0).sprite(1.0);
+        let hotspot = (hx.round() as i32, hy.round() as i32);
+
+        MagnifierWindow::draw_cursor_at(&mut canvas, stride, (40, 32), &sprite, hotspot);
+        // Center moved +8 in x: the pixel at 40 must be the black center, and
+        // the mirrored destination (24) must stay untouched.
+        assert_eq!(canvas_at(&canvas, stride, 40, 32), Some([0, 0, 0, 255]));
+        assert_eq!(canvas_at(&canvas, stride, 24, 32), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn draw_cursor_at_places_hotspot_at_pos() {
+        let mut canvas = vec![0u8; 64 * 64 * 4];
+        let stride = 64 * 4;
+        // A synthetic 2x2 sprite with a green pixel at (0, 0) and a red
+        // hotspot pixel at (1, 1).
+        let mut base = crate::render::RgbaBuffer::new(2, 2);
+        base.set_pixel(0, 0, [0, 255, 0, 255]);
+        base.set_pixel(1, 1, [255, 0, 0, 255]);
+        let mut cursor = crate::cursor::MagnifiedCursor::from_parts_for_test(base, (1.0, 1.0));
+        let (sprite, (hx, hy)) = cursor.sprite(1.0);
+        let hotspot = (hx.round() as i32, hy.round() as i32);
+
+        MagnifierWindow::draw_cursor_at(&mut canvas, stride, (50, 50), &sprite, hotspot);
+        // The hotspot pixel of the sprite lands exactly on pos.
+        assert_eq!(canvas_at(&canvas, stride, 50, 50), Some([255, 0, 0, 255]));
+        // The rest of the sprite extends up-left of the hotspot.
+        assert_eq!(canvas_at(&canvas, stride, 49, 49), Some([0, 255, 0, 255]));
+    }
+
+    #[test]
+    fn draw_cursor_at_clamps_at_canvas_edges_without_panicking() {
+        let mut canvas = vec![0u8; 64 * 64 * 4];
+        let stride = 64 * 4;
+        let (sprite, (hx, hy)) = crate::cursor::MagnifiedCursor::from_reticle(1.0).sprite(1.0);
+        let hotspot = (hx.round() as i32, hy.round() as i32);
+
+        // Sprite center at each corner: most of the sprite is clipped, but the
+        // blit must not panic or write out of bounds.
+        for pos in [(0, 0), (0, 63), (63, 0), (63, 63)] {
+            canvas.fill(0);
+            MagnifierWindow::draw_cursor_at(&mut canvas, stride, pos, &sprite, hotspot);
+        }
+        // A fully out-of-view sprite is a no-op.
+        MagnifierWindow::draw_cursor_at(&mut canvas, stride, (-50, -50), &sprite, hotspot);
+    }
 }

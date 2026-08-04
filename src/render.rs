@@ -22,7 +22,12 @@ impl RgbaBuffer {
             return None;
         }
         let idx = ((y * self.width + x) * 4) as usize;
-        Some([self.data[idx], self.data[idx + 1], self.data[idx + 2], self.data[idx + 3]])
+        Some([
+            self.data[idx],
+            self.data[idx + 1],
+            self.data[idx + 2],
+            self.data[idx + 3],
+        ])
     }
 
     pub fn set_pixel(&mut self, x: i32, y: i32, rgba: [u8; 4]) {

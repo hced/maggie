@@ -9,6 +9,10 @@ use crate::osd::OsdSprite;
 use crate::render::RgbaBuffer;
 use wayland_client::Proxy;
 
+/// A magnified-cursor sprite ready to draw: its screen position, the sprite
+/// buffer, and the hotspot offset inside the sprite (in sprite pixels).
+pub type CursorSprite<'a> = &'a ((i32, i32), RgbaBuffer, (f64, f64));
+
 mod gles2 {
     #![allow(
         non_snake_case,
@@ -40,18 +44,19 @@ void main() {
 }
 "#;
 
-/// Vertex shader for the OSD pass: samples the texture in top-down order. The
-/// captured frame is stored flipped (bottom-up, see the screencopy y-invert
-/// handling) to compensate the flip in `VERTEX_SHADER`, but the OSD sprite is
-/// top-down — reusing the flipped shader would render the legend upside down
-/// and out of its box.
-const OSD_VERTEX_SHADER: &str = r#"
+/// Vertex shader for sprite passes (magnified cursor, OSD legend). The quad
+/// covers the sprite rect given by `u_rect` in normalized screen coordinates
+/// (y down); `a_pos` maps the whole texture into the quad so the full sprite
+/// is sampled inside its rect, upright. The NDC y-flip is applied explicitly
+/// here, so this pass is independent of the frame texture's flip handling.
+const SPRITE_VERTEX_SHADER: &str = r#"
 attribute vec2 a_pos;
-uniform vec4 u_src;
+uniform vec4 u_rect;
 varying vec2 v_uv;
 void main() {
-    vec2 ndc = vec2(a_pos.x * 2.0 - 1.0, a_pos.y * 2.0 - 1.0);
-    v_uv = u_src.xy + vec2(a_pos.x, a_pos.y) * u_src.zw;
+    vec2 screen = u_rect.xy + a_pos * u_rect.zw;
+    vec2 ndc = vec2(screen.x * 2.0 - 1.0, 1.0 - screen.y * 2.0);
+    v_uv = a_pos;
     gl_Position = vec4(ndc, 0.0, 1.0);
 }
 "#;
@@ -85,14 +90,15 @@ pub struct GpuRenderer {
     context: egl::Context,
     egl_window: wayland_egl::WlEglSurface,
     program: GLuint,
-    osd_program: GLuint,
+    sprite_program: GLuint,
     vao: GLuint,
     vbo: GLuint,
     frame_tex: GLuint,
     osd_tex: GLuint,
+    cursor_tex: GLuint,
     a_pos_loc: GLint,
     u_src_loc: GLint,
-    osd_u_src_loc: GLint,
+    u_rect_loc: GLint,
     width: i32,
     height: i32,
 }
@@ -185,14 +191,14 @@ impl GpuRenderer {
         if u_tex_loc < 0 {
             anyhow::bail!("Shader uniform u_tex not found");
         }
-        let osd_program = Self::build_program(OSD_VERTEX_SHADER)?;
-        let osd_u_src_loc = get_uniform_location(osd_program, c"u_src".as_ptr());
-        let osd_u_tex_loc = get_uniform_location(osd_program, c"u_tex".as_ptr());
-        if osd_u_src_loc < 0 || osd_u_tex_loc < 0 {
+        let sprite_program = Self::build_program(SPRITE_VERTEX_SHADER)?;
+        let u_rect_loc = get_uniform_location(sprite_program, c"u_rect".as_ptr());
+        let sprite_u_tex_loc = get_uniform_location(sprite_program, c"u_tex".as_ptr());
+        if u_rect_loc < 0 || sprite_u_tex_loc < 0 {
             anyhow::bail!(
-                "OSD shader locations not found (u_src={}, u_tex={})",
-                osd_u_src_loc,
-                osd_u_tex_loc
+                "Sprite shader locations not found (u_rect={}, u_tex={})",
+                u_rect_loc,
+                sprite_u_tex_loc
             );
         }
 
@@ -200,6 +206,7 @@ impl GpuRenderer {
         let mut vbo = 0;
         let mut frame_tex = 0;
         let mut osd_tex = 0;
+        let mut cursor_tex = 0;
         unsafe {
             gles2::GenVertexArraysOES(1, &mut vao);
             gles2::BindVertexArrayOES(vao);
@@ -228,8 +235,16 @@ impl GpuRenderer {
                 gles2::TEXTURE_MAG_FILTER,
                 gles2::NEAREST as GLint,
             );
-            gles2::TexParameteri(gles2::TEXTURE_2D, gles2::TEXTURE_WRAP_S, gles2::CLAMP_TO_EDGE as GLint);
-            gles2::TexParameteri(gles2::TEXTURE_2D, gles2::TEXTURE_WRAP_T, gles2::CLAMP_TO_EDGE as GLint);
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_WRAP_S,
+                gles2::CLAMP_TO_EDGE as GLint,
+            );
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_WRAP_T,
+                gles2::CLAMP_TO_EDGE as GLint,
+            );
             gles2::GenTextures(1, &mut osd_tex);
             gles2::BindTexture(gles2::TEXTURE_2D, osd_tex);
             gles2::TexParameteri(
@@ -242,12 +257,42 @@ impl GpuRenderer {
                 gles2::TEXTURE_MAG_FILTER,
                 gles2::LINEAR as GLint,
             );
-            gles2::TexParameteri(gles2::TEXTURE_2D, gles2::TEXTURE_WRAP_S, gles2::CLAMP_TO_EDGE as GLint);
-            gles2::TexParameteri(gles2::TEXTURE_2D, gles2::TEXTURE_WRAP_T, gles2::CLAMP_TO_EDGE as GLint);
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_WRAP_S,
+                gles2::CLAMP_TO_EDGE as GLint,
+            );
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_WRAP_T,
+                gles2::CLAMP_TO_EDGE as GLint,
+            );
+            gles2::GenTextures(1, &mut cursor_tex);
+            gles2::BindTexture(gles2::TEXTURE_2D, cursor_tex);
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_MIN_FILTER,
+                gles2::NEAREST as GLint,
+            );
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_MAG_FILTER,
+                gles2::NEAREST as GLint,
+            );
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_WRAP_S,
+                gles2::CLAMP_TO_EDGE as GLint,
+            );
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_WRAP_T,
+                gles2::CLAMP_TO_EDGE as GLint,
+            );
             gles2::UseProgram(program);
             gles2::Uniform1i(u_tex_loc, 0);
-            gles2::UseProgram(osd_program);
-            gles2::Uniform1i(osd_u_tex_loc, 0);
+            gles2::UseProgram(sprite_program);
+            gles2::Uniform1i(sprite_u_tex_loc, 0);
             gles2::ActiveTexture(gles2::TEXTURE0);
             check_gl_error("init");
         }
@@ -259,14 +304,15 @@ impl GpuRenderer {
             context,
             egl_window,
             program,
-            osd_program,
+            sprite_program,
             vao,
             vbo,
             frame_tex,
             osd_tex,
+            cursor_tex,
             a_pos_loc,
             u_src_loc,
-            osd_u_src_loc,
+            u_rect_loc,
             width: width * RENDER_SCALE,
             height: height * RENDER_SCALE,
         };
@@ -298,7 +344,10 @@ impl GpuRenderer {
                 gles2::GetShaderiv(vs, gles2::INFO_LOG_LENGTH, &mut len);
                 let mut log = vec![0u8; len.max(1) as usize];
                 gles2::GetShaderInfoLog(vs, len, ptr::null_mut(), log.as_mut_ptr() as *mut GLchar);
-                anyhow::bail!("Vertex shader compile error: {}", String::from_utf8_lossy(&log));
+                anyhow::bail!(
+                    "Vertex shader compile error: {}",
+                    String::from_utf8_lossy(&log)
+                );
             }
 
             let fs = gles2::CreateShader(gles2::FRAGMENT_SHADER);
@@ -313,7 +362,10 @@ impl GpuRenderer {
                 gles2::GetShaderiv(fs, gles2::INFO_LOG_LENGTH, &mut len);
                 let mut log = vec![0u8; len.max(1) as usize];
                 gles2::GetShaderInfoLog(fs, len, ptr::null_mut(), log.as_mut_ptr() as *mut GLchar);
-                anyhow::bail!("Fragment shader compile error: {}", String::from_utf8_lossy(&log));
+                anyhow::bail!(
+                    "Fragment shader compile error: {}",
+                    String::from_utf8_lossy(&log)
+                );
             }
 
             let program = gles2::CreateProgram();
@@ -377,7 +429,12 @@ impl GpuRenderer {
     /// coordinates) optionally overlaid with an OSD sprite, then present.
     ///
     /// `src` is `(x, y, w, h)` in texture space (0.0..1.0).
-    pub fn draw(&mut self, src: Option<(f64, f64, f64, f64)>, osd: Option<&OsdSprite>) {
+    pub fn draw(
+        &mut self,
+        src: Option<(f64, f64, f64, f64)>,
+        osd: Option<&OsdSprite>,
+        cursor: Option<CursorSprite>,
+    ) {
         unsafe {
             gles2::Viewport(0, 0, self.width, self.height);
             gles2::ClearColor(0.0, 0.0, 0.0, 1.0);
@@ -398,9 +455,8 @@ impl GpuRenderer {
             if let Some((x, y, w, h)) = src {
                 gles2::ActiveTexture(gles2::TEXTURE0);
                 gles2::BindTexture(gles2::TEXTURE_2D, self.frame_tex);
-                let verts: [GLfloat; 12] = [
-                    0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0,
-                ];
+                let verts: [GLfloat; 12] =
+                    [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
                 gles2::BufferData(
                     gles2::ARRAY_BUFFER,
                     size_of_val(&verts) as GLsizeiptr,
@@ -417,12 +473,52 @@ impl GpuRenderer {
                 gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
             }
 
+            if let Some((pos, cursor_buf, (hx, hy))) = cursor {
+                gles2::Enable(gles2::BLEND);
+                gles2::BlendFunc(gles2::SRC_ALPHA, gles2::ONE_MINUS_SRC_ALPHA);
+                gles2::ActiveTexture(gles2::TEXTURE0);
+                gles2::BindTexture(gles2::TEXTURE_2D, self.cursor_tex);
+                gles2::UseProgram(self.sprite_program);
+                gles2::TexImage2D(
+                    gles2::TEXTURE_2D,
+                    0,
+                    gles2::RGBA as GLint,
+                    cursor_buf.width,
+                    cursor_buf.height,
+                    0,
+                    gles2::RGBA,
+                    gles2::UNSIGNED_BYTE,
+                    cursor_buf.data.as_ptr() as *const GLvoid,
+                );
+                // Place the sprite so its hotspot lands exactly on the pointer
+                // position (the tip of the arrow, like the real cursor).
+                let cx = pos.0 as f32;
+                let cy = pos.1 as f32;
+                let x0 = (cx - *hx as f32) / self.width as f32;
+                let y0 = (cy - *hy as f32) / self.height as f32;
+                let x1 = (cx + cursor_buf.width as f32 - *hx as f32) / self.width as f32;
+                let y1 = (cy + cursor_buf.height as f32 - *hy as f32) / self.height as f32;
+                // Unit quad: the sprite shader computes screen = u_rect.xy +
+                // a_pos * u_rect.zw, so the rect lives entirely in u_rect.
+                let verts: [GLfloat; 12] =
+                    [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+                gles2::BufferData(
+                    gles2::ARRAY_BUFFER,
+                    size_of_val(&verts) as GLsizeiptr,
+                    verts.as_ptr() as *const GLvoid,
+                    gles2::STREAM_DRAW,
+                );
+                gles2::Uniform4f(self.u_rect_loc, x0, y0, x1 - x0, y1 - y0);
+                gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
+                gles2::Disable(gles2::BLEND);
+            }
+
             if let Some(sprite) = osd {
                 gles2::Enable(gles2::BLEND);
                 gles2::BlendFunc(gles2::SRC_ALPHA, gles2::ONE_MINUS_SRC_ALPHA);
                 gles2::ActiveTexture(gles2::TEXTURE0);
                 gles2::BindTexture(gles2::TEXTURE_2D, self.osd_tex);
-                gles2::UseProgram(self.osd_program);
+                gles2::UseProgram(self.sprite_program);
                 gles2::TexImage2D(
                     gles2::TEXTURE_2D,
                     0,
@@ -438,19 +534,17 @@ impl GpuRenderer {
                 let y0 = sprite.y as GLfloat / self.height as GLfloat;
                 let x1 = (sprite.x + sprite.width) as GLfloat / self.width as GLfloat;
                 let y1 = (sprite.y + sprite.height) as GLfloat / self.height as GLfloat;
-                let verts: [GLfloat; 12] = [
-                    x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1,
-                ];
+                let verts: [GLfloat; 12] =
+                    [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
                 gles2::BufferData(
                     gles2::ARRAY_BUFFER,
                     size_of_val(&verts) as GLsizeiptr,
                     verts.as_ptr() as *const GLvoid,
                     gles2::STREAM_DRAW,
                 );
-                gles2::Uniform4f(self.osd_u_src_loc, 0.0, 0.0, 1.0, 1.0);
+                gles2::Uniform4f(self.u_rect_loc, x0, y0, x1 - x0, y1 - y0);
                 gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
                 gles2::Disable(gles2::BLEND);
-                gles2::UseProgram(self.program);
             }
 
             check_gl_error("draw");
@@ -469,8 +563,9 @@ impl Drop for GpuRenderer {
             gles2::DeleteVertexArraysOES(1, &self.vao);
             gles2::DeleteTextures(1, &self.frame_tex);
             gles2::DeleteTextures(1, &self.osd_tex);
+            gles2::DeleteTextures(1, &self.cursor_tex);
             gles2::DeleteProgram(self.program);
-            gles2::DeleteProgram(self.osd_program);
+            gles2::DeleteProgram(self.sprite_program);
         }
         let _ = self.egl.make_current(self.display, None, None, None);
         let _ = self.egl.destroy_context(self.display, self.context);

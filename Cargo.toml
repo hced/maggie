@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 wayland-client = { version = "0.31", features = ["log"] }
+xcursor = "0.3"
 smithay-client-toolkit = "0.21"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-egl = "0.32"
