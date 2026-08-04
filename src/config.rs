@@ -15,19 +15,6 @@ pub enum CursorFollow {
     Inertia,
 }
 
-/// How the area beyond the captured frame is filled while hold-to-zooming
-/// near the capture edge (the magnified cursor sits at the viewport center, so
-/// the view is allowed to extend past the frozen frame to keep it there).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum HtzEdgeFill {
-    /// Repeat the edge pixel row/column (CLAMP_TO_EDGE sampling).
-    Stretch,
-    /// Solid black beyond the capture. (default)
-    #[default]
-    Black,
-}
-
 /// How the scroll wheel changes the zoom.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -86,11 +73,6 @@ pub struct MagnifierConfig {
     pub scroll_zoom_mode: ScrollZoomMode,
     #[serde(default)]
     pub invert_scroll_zoom: bool,
-    /// How the region beyond the capture is filled while hold-to-zooming near
-    /// the edge (the view always extends past the frozen frame during
-    /// hold-to-zoom so the cursor can stay at the viewport center).
-    #[serde(default)]
-    pub htz_edge_fill: HtzEdgeFill,
     pub keybindings: Keybindings,
     pub screenshot_path: String,
     pub screenshot_filename_pattern: String,
@@ -139,7 +121,6 @@ impl Default for MagnifierConfig {
             cursor_follow: CursorFollow::Snap,
             scroll_zoom_mode: ScrollZoomMode::Levels,
             invert_scroll_zoom: false,
-            htz_edge_fill: HtzEdgeFill::Black,
             keybindings: Keybindings {
                 toggle_osd: "k".to_string(),
                 screenshot_manual: "s".to_string(),
@@ -271,17 +252,9 @@ mod tests {
     }
 
     #[test]
-    fn htz_edge_fill_defaults_and_roundtrip() {
-        // Old configs (no htz_edge_fill field) load with the default.
-        assert_eq!(MagnifierConfig::default().htz_edge_fill, HtzEdgeFill::Black);
-        // Custom values survive a save/load round-trip.
-        let mut config = MagnifierConfig::default();
-        config.htz_edge_fill = HtzEdgeFill::Stretch;
-        let encoded = ron::to_string(&config).expect("serialize");
-        let decoded: MagnifierConfig = ron::from_str(&encoded).expect("deserialize");
-        assert_eq!(decoded.htz_edge_fill, HtzEdgeFill::Stretch);
-        // A config written while the old `htz_edge_behavior` option existed
-        // still loads (ron ignores unknown fields) and keeps the fill.
+    fn config_with_removed_edge_fill_field_still_loads() {
+        // Configs written while the `htz_edge_behavior` / `htz_edge_fill`
+        // options existed still load (ron ignores unknown fields).
         let legacy = ron::from_str::<MagnifierConfig>(
             "(htz_edge_behavior: pin, htz_edge_fill: stretch, keybindings: (\n\
              toggle_osd: \"k\", screenshot_manual: \"s\", screenshot_window: \"w\",\n\
@@ -291,8 +264,11 @@ mod tests {
              hold_to_zoom: \"Space\"), screenshot_path: \"x\",\n\
              screenshot_filename_pattern: \"maggie_%Y%m%d_%H%M%S.png\")",
         )
-        .expect("legacy config with unknown field loads");
-        assert_eq!(legacy.htz_edge_fill, HtzEdgeFill::Stretch);
+        .expect("legacy config with unknown fields loads");
+        // Removed options fall back to defaults; the rest is intact.
+        assert_eq!(legacy.keybindings.hold_to_zoom, "Space");
+        assert_eq!(legacy.keybindings.config_window, "Tab");
+        assert_eq!(legacy.screenshot_path, "x");
     }
 }
 

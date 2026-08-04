@@ -433,26 +433,6 @@ fn config_section(
             ui.label("(zoom change per pixel of vertical motion)");
             ui.end_row();
 
-            ui.label("Beyond-capture fill");
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("htz_edge_fill")
-                    .selected_text(htz_edge_fill_name(config.htz_edge_fill))
-                    .show_ui(ui, |ui| {
-                        for fill in [
-                            crate::config::HtzEdgeFill::Stretch,
-                            crate::config::HtzEdgeFill::Black,
-                        ] {
-                            ui.selectable_value(
-                                &mut config.htz_edge_fill,
-                                fill,
-                                htz_edge_fill_name(fill),
-                            );
-                        }
-                    });
-                ui.label("(region beyond the frozen capture during hold-to-zoom)");
-            });
-            ui.end_row();
-
             ui.label("Screenshot path");
             ui.horizontal(|ui| {
                 ui.add(
@@ -565,13 +545,6 @@ fn scroll_zoom_name(mode: crate::config::ScrollZoomMode) -> &'static str {
     match mode {
         crate::config::ScrollZoomMode::Levels => "levels",
         crate::config::ScrollZoomMode::Factor => "factor",
-    }
-}
-
-fn htz_edge_fill_name(fill: crate::config::HtzEdgeFill) -> &'static str {
-    match fill {
-        crate::config::HtzEdgeFill::Stretch => "stretch",
-        crate::config::HtzEdgeFill::Black => "black",
     }
 }
 

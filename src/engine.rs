@@ -1479,54 +1479,35 @@ impl MagnifierWindow {
         self.last_target = Some(target);
         self.animating = animating;
 
-        // While hold-to-zoom is active the view may sample past the capture
-        // boundary (the cursor sits at the viewport center, so the anchor can
-        // sit near an edge); the region beyond the capture shows the
-        // configured fill. Otherwise the view clamps to the capture as usual.
-        let (src_x, src_y) = if self.hold_to_zoom_active && self.pointer_seen {
-            (center_x - view_w / 2.0, center_y - view_h / 2.0)
-        } else {
-            (
-                (center_x - view_w / 2.0).clamp(0.0, (source_w as f64 - view_w).max(0.0)),
-                (center_y - view_h / 2.0).clamp(0.0, (source_h as f64 - view_h).max(0.0)),
-            )
-        };
+        // The view never clamps to the capture: the magnified cursor always
+        // sits at the dead center of the viewport, so near the screen edges
+        // the view samples past the frozen frame — that region is painted
+        // black. Only the magnified screen moves when the mouse moves; the
+        // cursor sprite stays still in the exact center.
+        let src_x = center_x - view_w / 2.0;
+        let src_y = center_y - view_h / 2.0;
 
         let lines = self.osd_lines();
 
-        // Compute the magnified cursor position in logical screen coordinates:
-        // the spot where the content currently under the pointer lands in the
-        // viewport. Fractional pointer input keeps it gliding smoothly. While
-        // hold-to-zoom is active the sprite is drawn at the center of the
-        // viewport (the landing of the view-center content), so it stays glued
-        // to the pixels under it through any zoom change.
+        // The magnified cursor is always drawn at the exact center of the
+        // viewport (the center of the magnified quad; the quad fills the
+        // screen at zoom >= 1).
         let cursor_logical =
             if self.pointer_seen && self.state.cursor_visible && self.magnified_cursor.is_some() {
-                if self.hold_to_zoom_active {
-                    Some((
-                        (center_x - src_x) * zoom + off_x as f64,
-                        (center_y - src_y) * zoom + off_y as f64,
-                    ))
-                } else {
-                    Some((
-                        (self.pointer_position_f.0 * scale_x - src_x) * zoom + off_x as f64,
-                        (self.pointer_position_f.1 * scale_y - src_y) * zoom + off_y as f64,
-                    ))
-                }
+                Some((
+                    off_x as f64 + dest_w as f64 / 2.0,
+                    off_y as f64 + dest_h as f64 / 2.0,
+                ))
             } else {
                 None
             };
 
-        // The OSD ring marks the magnified cursor (which sits at the viewport
-        // center during hold-to-zoom); fall back to the hand position when no
-        // magnified cursor is drawn.
+        // The OSD ring marks the magnified cursor (always at the viewport
+        // center); fall back to the hand position when no magnified cursor is
+        // drawn.
         let osd_ring = cursor_logical
             .map(|(cx, cy)| (cx as i32, cy as i32))
             .unwrap_or(self.state.pointer_position);
-
-        // Beyond-the-capture fill while hold-to-zoom is active in `Extend`
-        // edge mode (black by default; edge-stretched pixels when `Stretch`).
-        let oob_black = self.state.config.htz_edge_fill == crate::config::HtzEdgeFill::Black;
 
         if let Some(gpu) = &mut self.gpu {
             let osd = if self.state.osd_visible {
@@ -1566,20 +1547,17 @@ impl MagnifierWindow {
                     (hx, hy),
                 )
             });
-            gpu.draw(Some(uv), osd.as_ref(), cursor.as_ref(), oob_black);
+            gpu.draw(Some(uv), osd.as_ref(), cursor.as_ref());
             if self.animating {
                 self.request_frame_callback(qh);
             }
             return;
         }
 
-        let scaled = self.state.renderer.render_bilinear(
-            &captured.buffer,
-            (src_x, src_y),
-            dest_w,
-            dest_h,
-            self.state.config.htz_edge_fill,
-        );
+        let scaled =
+            self.state
+                .renderer
+                .render_bilinear(&captured.buffer, (src_x, src_y), dest_w, dest_h);
 
         let show_osd = self.state.osd_visible;
         let osd_lines = self.osd_lines();
@@ -1660,7 +1638,7 @@ impl MagnifierWindow {
 
     fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
         if let Some(gpu) = &mut self.gpu {
-            gpu.draw(None, None, None, false);
+            gpu.draw(None, None, None);
             return;
         }
         self.render_frame(qh, |canvas, _width, _height, _stride| {

@@ -74,15 +74,15 @@ impl Renderer {
 
     /// Scale the view `origin` (capture px, may extend past the edges in
     /// `Extend` edge mode) to `dest_w`x`dest_h`, bilinear-filtered. Samples
-    /// beyond the capture are either edge-stretched (`Stretch`) or painted
-    /// black (`Black`).
+    /// beyond the capture are painted black (the magnified cursor always sits
+    /// at the viewport center, so the view extends past the frozen frame near
+    /// the screen edges).
     pub fn render_bilinear(
         &self,
         source: &RgbaBuffer,
         origin: (f64, f64),
         dest_w: i32,
         dest_h: i32,
-        edge_fill: crate::config::HtzEdgeFill,
     ) -> RgbaBuffer {
         let zoom = self.scale_factor;
         let inv_zoom = 1.0 / zoom;
@@ -93,15 +93,14 @@ impl Renderer {
         let data = &source.data;
         let mut result = vec![0u8; (dest_w * dest_h * 4) as usize];
 
-        let black = edge_fill == crate::config::HtzEdgeFill::Black;
         for y in 0..dest_h {
             let sy_raw = origin.1 + (y as f64 + 0.5) * inv_zoom;
             let out_row = y as usize * dest_w as usize;
             for x in 0..dest_w {
                 let o = (out_row + x as usize) * 4;
                 let sx_raw = origin.0 + (x as f64 + 0.5) * inv_zoom;
-                if black && (sx_raw < 0.0 || sx_raw > max_x || sy_raw < 0.0 || sy_raw > max_y) {
-                    continue; // leave black
+                if sx_raw < 0.0 || sx_raw > max_x || sy_raw < 0.0 || sy_raw > max_y {
+                    continue; // leave black beyond the capture
                 }
                 let sy = sy_raw.clamp(0.0, max_y);
                 let y0 = sy.floor() as i32;

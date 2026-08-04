@@ -470,16 +470,16 @@ impl GpuRenderer {
     /// Draw one frame: the magnified view (source rect in normalized texture
     /// coordinates) optionally overlaid with an OSD sprite, then present.
     ///
-    /// `src` is `(x, y, w, h)` in texture space (0.0..1.0) — may extend
-    /// outside that square when the view reaches past the capture edge in
-    /// `Extend` mode. `oob_black` paints those out-of-bounds texels black
-    /// (edge-stretch otherwise, via the texture's CLAMP_TO_EDGE wrap).
+    /// `src` is `(x, y, w, h)` in texture space (0.0..1.0) — it may extend
+    /// outside that square when the view reaches past the capture edge (the
+    /// magnified cursor always sits at the viewport center, so near the
+    /// screen edges the view samples past the frozen frame; those texels are
+    /// painted black by the shader).
     pub fn draw(
         &mut self,
         src: Option<(f64, f64, f64, f64)>,
         osd: Option<&OsdSprite>,
         cursor: Option<CursorSprite>,
-        oob_black: bool,
     ) {
         unsafe {
             gles2::Viewport(0, 0, self.width, self.height);
@@ -491,7 +491,7 @@ impl GpuRenderer {
             gles2::ClearColor(0.0, 0.0, 0.0, 1.0);
             gles2::Clear(gles2::COLOR_BUFFER_BIT);
             gles2::UseProgram(self.program);
-            gles2::Uniform1f(self.u_oob_black_loc, if oob_black { 1.0 } else { 0.0 });
+            gles2::Uniform1f(self.u_oob_black_loc, 1.0);
             gles2::BindVertexArrayOES(self.vao);
             gles2::BindBuffer(gles2::ARRAY_BUFFER, self.vbo);
             gles2::EnableVertexAttribArray(self.a_pos_loc as GLuint);
