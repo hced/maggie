@@ -45,6 +45,8 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 
 use crate::capture::CaptureManager;
 use crate::config::MagnifierConfig;
+use crate::config_window::ConfigWindow;
+use crate::config_window::UiResult;
 use crate::gpu::GpuRenderer;
 use crate::render::Renderer;
 use crate::render::RgbaBuffer;
@@ -54,6 +56,8 @@ const MAX_ZOOM: f64 = 32.0;
 const WHEEL_ZOOM_STEP: f64 = 0.1;
 /// Linux input event code for the right mouse button.
 const BTN_RIGHT: u32 = 0x111;
+/// Linux input event code for the middle mouse button (resets the zoom).
+const BTN_MIDDLE: u32 = 0x112;
 const EASE_TAU: f64 = 0.04;
 const EASE_EPSILON: f64 = 0.05;
 /// Momentum decay time constant for the `inertia` cursor-follow style.
@@ -73,13 +77,20 @@ pub struct MagnifierState {
     pub zoom: f64,
     pub mode: MagnifierMode,
     pub osd_visible: bool,
+    /// Whether the magnified cursor sprite is drawn inside the viewport
+    /// (toggled with the `toggle_cursor` key; independent of the hardware
+    /// cursor, which is always hidden while the pointer is over the viewport).
+    pub cursor_visible: bool,
     pub renderer: Renderer,
     pub pointer_position: (i32, i32),
 }
 
 impl MagnifierState {
     pub fn new(config: MagnifierConfig, initial_zoom: Option<f64>) -> Self {
-        let zoom = initial_zoom.unwrap_or_else(|| config.default_zoom.unwrap_or(3.0));
+        let max_zoom = config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        let zoom = initial_zoom
+            .unwrap_or_else(|| config.default_zoom.unwrap_or(3.0))
+            .clamp(MIN_ZOOM, max_zoom);
         let renderer = Renderer::new(zoom);
 
         let osd_visible = config.show_osd;
@@ -89,21 +100,49 @@ impl MagnifierState {
             zoom,
             mode: MagnifierMode::CenterCursor,
             osd_visible,
+            cursor_visible: true,
             renderer,
             pointer_position: (0, 0),
         }
     }
 
+    /// The zoom level the key `1`–`9` selects: each key is a fraction of the
+    /// configured max zoom, so key 9 always means `max_zoom`. Clamped to at
+    /// least 1× (with `max_zoom < 9` the lower keys would otherwise go
+    /// sub-1×, e.g. 0.44× at `max_zoom = 4`).
+    fn zoom_for_level(&self, key: u8) -> f64 {
+        let max_zoom = self.config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        (max_zoom * (key as f64) / 9.0).clamp(MIN_ZOOM, max_zoom)
+    }
+
     pub fn handle_zoom_key(&mut self, key: u8) {
         if (1..=9).contains(&key) {
-            self.zoom = key as f64;
+            self.zoom = self.zoom_for_level(key);
             self.renderer.update_scale_factor(self.zoom);
             tracing::info!("Zoom set to {}", self.zoom);
         }
     }
 
+    /// Reset the zoom back to the configured default (used by the middle mouse
+    /// button and the `reset_zoom` keybinding).
+    pub fn reset_zoom(&mut self) {
+        let max_zoom = self.config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        let default_zoom = self
+            .config
+            .default_zoom
+            .unwrap_or(3.0)
+            .clamp(MIN_ZOOM, max_zoom);
+        self.zoom = default_zoom;
+        self.renderer.update_scale_factor(default_zoom);
+        tracing::info!("Zoom reset to {}", self.zoom);
+    }
+
     pub fn toggle_osd(&mut self) {
         self.osd_visible = !self.osd_visible;
+    }
+
+    pub fn toggle_cursor(&mut self) {
+        self.cursor_visible = !self.cursor_visible;
     }
 
     pub fn switch_mode(&mut self, mode: MagnifierMode) {
@@ -155,6 +194,31 @@ pub struct MagnifierWindow {
     magnified_cursor: Option<crate::cursor::MagnifiedCursor>,
     blank_cursor_surface: Option<wl_surface::WlSurface>,
     cursor_pool: Option<SlotPool>,
+    /// A cursor surface showing the real system cursor (from the loaded theme)
+    /// at its native size, used while the Configuration window is open so the
+    /// UI is operated with a visible pointer. The hotspot is stored alongside.
+    config_cursor_surface: Option<wl_surface::WlSurface>,
+    config_cursor_pool: Option<SlotPool>,
+    config_cursor_hotspot: Option<(i32, i32)>,
+    /// The egui Configuration window; present while it is open. While it is
+    /// open the whole surface shows the UI and pointer/keyboard input is
+    /// forwarded to it instead of driving the magnifier.
+    config_window: Option<ConfigWindow>,
+    /// Latest wl_pointer enter serial, used to reset the cursor to the default
+    /// (Configuration window open) or re-hide it with the blank surface
+    /// (closed) when the pointer is over the surface.
+    last_pointer_serial: Option<u32>,
+    /// Hold-to-zoom: while the configured modifier is held, vertical pointer
+    /// motion changes the zoom continuously instead of in steps.
+    hold_to_zoom_active: bool,
+    /// Pointer Y (logical) of the previous motion event while hold-to-zoom is
+    /// active; the per-event delta drives the zoom change.
+    hold_zoom_last_y: f64,
+    /// Hold-to-zoom anchor, captured at press: `E` = the content (capture px)
+    /// under the magnified cursor. While the modifier is held the view stays
+    /// centered on `E` and the cursor is drawn at the viewport center, so it
+    /// cannot drift relative to the visuals no matter how the zoom changes.
+    hold_anchor: Option<(f64, f64)>,
 }
 
 struct ScreencastManagerData;
@@ -363,7 +427,8 @@ impl CompositorHandler for MagnifierWindow {
     }
 
     fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
-        if self.animating {
+        // The Configuration window repaints continuously while it is open.
+        if self.animating || self.config_window.is_some() {
             self.draw_frame(qh);
         }
     }
@@ -419,6 +484,10 @@ impl LayerShellHandler for MagnifierWindow {
             gpu.resize(self.width as i32, self.height as i32);
         }
 
+        if let Some(cw) = &mut self.config_window {
+            cw.resize(self.width as i32, self.height as i32);
+        }
+
         self.pool
             .resize(self.width as usize * self.height as usize * 4)
             .map_err(|e| tracing::warn!("Failed to resize shm pool: {e}"))
@@ -457,17 +526,53 @@ impl PointerHandler for MagnifierWindow {
                 continue;
             }
             self.pointer_seen = true;
+            if let PointerEventKind::Enter { serial, .. } = event.kind {
+                self.last_pointer_serial = Some(serial);
+                // Pick the cursor surface for the current mode using this
+                // fresh enter serial (stale serials are ignored by the
+                // compositor, which is why re-asserting elsewhere fails): the
+                // Configuration window shows the real system cursor, the
+                // magnifier hides the hardware cursor with the blank surface.
+                if self.config_window.is_some() {
+                    if self.ensure_config_cursor(qh)
+                        && let (Some(pointer), Some(surface), Some(hot)) = (
+                            &self.pointer,
+                            &self.config_cursor_surface,
+                            self.config_cursor_hotspot,
+                        )
+                    {
+                        pointer.set_cursor(serial, Some(surface), hot.0, hot.1);
+                    }
+                } else if let (Some(pointer), Some(surface)) =
+                    (&self.pointer, &self.blank_cursor_surface)
+                {
+                    pointer.set_cursor(serial, Some(surface), 0, 0);
+                }
+            }
+            // While the Configuration window is open, every pointer event goes
+            // to the egui UI (the magnifier ignores them). A button press also
+            // re-asserts the visible cursor with its fresh serial, covering the
+            // case where the open_config serial was stale (the cursor then
+            // appears on the first click even without leaving the surface).
+            if self.config_window.is_some() {
+                if let PointerEventKind::Press { serial, .. } = event.kind
+                    && self.ensure_config_cursor(qh)
+                    && let (Some(pointer), Some(surface), Some(hot)) = (
+                        &self.pointer,
+                        &self.config_cursor_surface,
+                        self.config_cursor_hotspot,
+                    )
+                {
+                    pointer.set_cursor(serial, Some(surface), hot.0, hot.1);
+                }
+                self.forward_pointer_to_config(event);
+                continue;
+            }
             match event.kind {
-                PointerEventKind::Enter { serial, .. } => {
+                PointerEventKind::Enter { .. } => {
                     let position = event.position;
                     self.pointer_position_f = position;
                     self.state.pointer_position = (position.0 as i32, position.1 as i32);
-                    // Hide the hardware cursor by setting a blank cursor surface
-                    if let (Some(pointer), Some(surface)) =
-                        (&self.pointer, &self.blank_cursor_surface)
-                    {
-                        pointer.set_cursor(serial, Some(surface), 0, 0);
-                    }
                     // The first capture already happened at first configure
                     // (cursor-free via `overlay_cursor = 0`). This enter is
                     // where the pointer was at launch, so `draw_frame` now
@@ -479,6 +584,26 @@ impl PointerHandler for MagnifierWindow {
                     if position != self.pointer_position_f {
                         self.pointer_position_f = position;
                         self.state.pointer_position = (position.0 as i32, position.1 as i32);
+                        // Hold-to-zoom: while the configured modifier is held,
+                        // vertical motion zooms continuously (position-based,
+                        // so it stays smooth at any event rate). Moving up
+                        // zooms in, moving down zooms out; horizontal motion
+                        // is untouched and the view follows it as usual.
+                        if self.hold_to_zoom_active {
+                            let dy = position.1 - self.hold_zoom_last_y;
+                            self.hold_zoom_last_y = position.1;
+                            let max_zoom = self.state.config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+                            let new_zoom = (self.state.zoom
+                                - dy * self.state.config.hold_to_zoom_speed)
+                                .clamp(MIN_ZOOM, max_zoom);
+                            if (new_zoom - self.state.zoom).abs() > 1e-9 {
+                                self.state.zoom = new_zoom;
+                                self.state.renderer.update_scale_factor(new_zoom);
+                                if let Some(cursor) = &mut self.magnified_cursor {
+                                    cursor.update_zoom(new_zoom);
+                                }
+                            }
+                        }
                         self.animating = true;
                         self.draw_frame(qh);
                     }
@@ -487,6 +612,18 @@ impl PointerHandler for MagnifierWindow {
                     // Right mouse button quits, same as Q.
                     if button == BTN_RIGHT {
                         self.exit = true;
+                    }
+                    // Middle mouse button resets the zoom to the default.
+                    if button == BTN_MIDDLE {
+                        self.state.reset_zoom();
+                        if let Some(cursor) = &mut self.magnified_cursor {
+                            cursor.update_zoom(self.state.zoom);
+                        }
+                        self.view_center = None;
+                        self.view_velocity = (0.0, 0.0);
+                        self.last_target = None;
+                        self.animating = false;
+                        self.draw_frame(qh);
                     }
                 }
                 PointerEventKind::Leave { serial, .. } => {
@@ -505,26 +642,40 @@ impl PointerHandler for MagnifierWindow {
                         if !self.state.config.invert_scroll_zoom {
                             steps = -steps;
                         }
+                        let max_zoom = self.state.config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
                         let new_zoom = match self.state.config.scroll_zoom_mode {
                             crate::config::ScrollZoomMode::Levels => {
-                                let whole =
-                                    (self.state.zoom - self.state.zoom.floor()).abs() < 1e-9;
-                                if steps > 0.0 {
-                                    if whole {
-                                        self.state.zoom + 1.0
+                                // The wheel walks the same discrete levels as
+                                // the 1-9 keys: level i = max_zoom * i / 9.
+                                // On a level, step to the neighbour; off a
+                                // level, snap to the next one in the wheel
+                                // direction (mirrors the old ceil/floor
+                                // behaviour, extended to any max zoom).
+                                const LEVELS: f64 = 9.0;
+                                // Clamp the level index so a zoom beyond the
+                                // current max (e.g. max lowered mid-session)
+                                // snaps to the top level instead of walking
+                                // backwards through the wheel.
+                                let idx_f =
+                                    ((self.state.zoom / max_zoom) * LEVELS).clamp(1.0, LEVELS);
+                                let idx = idx_f.round();
+                                let on_level = (idx_f - idx).abs() < 1e-6;
+                                let next = if on_level {
+                                    if steps > 0.0 {
+                                        (idx + 1.0).min(LEVELS)
                                     } else {
-                                        self.state.zoom.ceil()
+                                        (idx - 1.0).max(1.0)
                                     }
-                                } else if whole {
-                                    self.state.zoom - 1.0
+                                } else if steps > 0.0 {
+                                    idx.ceil().min(LEVELS)
                                 } else {
-                                    self.state.zoom.floor()
-                                }
-                                .clamp(1.0, 9.0)
+                                    idx.floor().max(1.0)
+                                };
+                                (max_zoom * next / LEVELS).max(MIN_ZOOM)
                             }
                             crate::config::ScrollZoomMode::Factor => (self.state.zoom
                                 * (1.0 + steps * WHEEL_ZOOM_STEP))
-                                .clamp(MIN_ZOOM, MAX_ZOOM),
+                                .clamp(MIN_ZOOM, max_zoom),
                         };
                         if (new_zoom - self.state.zoom).abs() > 1e-9 {
                             self.state.zoom = new_zoom;
@@ -568,6 +719,10 @@ impl KeyboardHandler for MagnifierWindow {
         _: &wl_surface::WlSurface,
         _: u32,
     ) {
+        // Keyboard focus left the surface (e.g. the compositor moved it): the
+        // key-release for a held hold-to-zoom modifier may never arrive, so
+        // disarm here to avoid an unexpectedly armed state on the next motion.
+        self.hold_to_zoom_active = false;
     }
 
     fn press_key(
@@ -580,7 +735,46 @@ impl KeyboardHandler for MagnifierWindow {
     ) {
         tracing::debug!("Key press: {:?}", event);
 
+        // Configuration window mode: forward keys to egui (typing, focus
+        // navigation) instead of driving the magnifier.
+        if let Some(cw) = &mut self.config_window {
+            if let Some(key) = crate::config_window::keysym_to_egui_key(event.keysym) {
+                cw.key(key, true, false);
+            }
+            if let Some(text) = &event.utf8 {
+                cw.text(text.clone());
+            }
+            self.draw_frame(qh);
+            return;
+        }
+
         let keysym_str = keysym_to_string(event.keysym);
+
+        // Hold-to-zoom: pressing the configured modifier arms smooth zooming.
+        // The baseline is the current pointer Y, so the zoom does not jump on
+        // the first motion event. The anchor `E` = the content under the
+        // magnified cursor (capture px) is captured here; while held, the view
+        // stays centered on `E` and the cursor is drawn at the viewport
+        // center. The view is settled onto `E` immediately so hold-zooming
+        // starts centered even when ease/inertia were lagging.
+        if keysym_str == self.state.config.keybindings.hold_to_zoom {
+            self.hold_to_zoom_active = true;
+            self.hold_zoom_last_y = self.pointer_position_f.1;
+            self.hold_anchor = None;
+            if let Some(captured) = self.captured.as_ref() {
+                let scale_x = captured.buffer.width as f64 / self.width as f64;
+                let scale_y = captured.buffer.height as f64 / self.height as f64;
+                let e = (
+                    self.pointer_position_f.0 * scale_x,
+                    self.pointer_position_f.1 * scale_y,
+                );
+                self.hold_anchor = Some(e);
+                // Settle the view onto the anchor instantly (in snap mode
+                // this is a no-op; in ease/inertia it removes the lag with a
+                // one-time settle, which is the point of holding the key).
+                self.settle_view((e.0, e.1));
+            }
+        }
 
         if let Some(zoom_level) = match keysym_str.as_str() {
             "1" => Some(1),
@@ -620,7 +814,7 @@ impl KeyboardHandler for MagnifierWindow {
                 tracing::error!("Failed to save screenshot: {:#}", e);
             }
         } else if keysym_str == config_key.config_window {
-            tracing::info!("Configuration window - not yet implemented");
+            self.open_config(qh);
         } else if keysym_str == config_key.anti_aliasing {
             tracing::info!("Anti-aliasing toggle - not yet implemented");
         } else if keysym_str == config_key.mode_center_cursor {
@@ -629,6 +823,20 @@ impl KeyboardHandler for MagnifierWindow {
             self.state.switch_mode(MagnifierMode::EdgePan);
         } else if keysym_str == config_key.mode_miniature {
             self.state.switch_mode(MagnifierMode::MiniatureWindow);
+        } else if keysym_str == config_key.toggle_cursor {
+            self.state.toggle_cursor();
+            self.draw_frame(qh);
+            tracing::info!("Magnified cursor visible: {}", self.state.cursor_visible);
+        } else if keysym_str == config_key.reset_zoom {
+            self.state.reset_zoom();
+            if let Some(cursor) = &mut self.magnified_cursor {
+                cursor.update_zoom(self.state.zoom);
+            }
+            self.view_center = None;
+            self.view_velocity = (0.0, 0.0);
+            self.last_target = None;
+            self.animating = false;
+            self.draw_frame(qh);
         }
 
         if event.keysym == Keysym::Escape || event.keysym == Keysym::q {
@@ -639,22 +847,64 @@ impl KeyboardHandler for MagnifierWindow {
     fn repeat_key(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
         event: KeyEvent,
     ) {
         tracing::debug!("Key repeat: {:?}", event);
+        if let Some(cw) = &mut self.config_window
+            && let Some(key) = crate::config_window::keysym_to_egui_key(event.keysym)
+        {
+            cw.key(key, true, true);
+            self.draw_frame(qh);
+        }
     }
 
     fn release_key(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: KeyEvent,
+        event: KeyEvent,
     ) {
+        if let Some(cw) = &mut self.config_window
+            && let Some(key) = crate::config_window::keysym_to_egui_key(event.keysym)
+        {
+            cw.key(key, false, false);
+            self.draw_frame(qh);
+        }
+        // Releasing the hold-to-zoom modifier stops smooth zooming. The
+        // invisible hardware pointer is repositioned so `pointer * scale`
+        // equals the content currently at the viewport center (the content
+        // the magnified cursor points at during hold-to-zoom) — the follow
+        // behavior then keeps the view exactly where it is, so nothing jumps
+        // and no catch-up animation is needed. (Wayland cannot warp the
+        // physical cursor, so the first real mouse motion afterwards
+        // re-centers on the hand as usual.)
+        if keysym_to_string(event.keysym) == self.state.config.keybindings.hold_to_zoom {
+            let was_active = self.hold_to_zoom_active;
+            if was_active
+                && self.pointer_seen
+                && let Some((vcx, vcy)) = self.view_center
+                && let Some(captured) = self.captured.as_ref()
+            {
+                let scale_x = captured.buffer.width as f64 / self.width as f64;
+                let scale_y = captured.buffer.height as f64 / self.height as f64;
+                // Reposition the internal pointer so `pointer * scale`
+                // equals the content currently at the viewport center — the
+                // follow behavior then keeps the view exactly where it is.
+                self.pointer_position_f = (vcx / scale_x, vcy / scale_y);
+                self.state.pointer_position = ((vcx / scale_x) as i32, (vcy / scale_y) as i32);
+                self.settle_view((vcx, vcy));
+            }
+            self.hold_to_zoom_active = false;
+            self.hold_anchor = None;
+            if was_active {
+                self.draw_frame(qh);
+            }
+        }
     }
 
     fn update_modifiers(
@@ -663,10 +913,19 @@ impl KeyboardHandler for MagnifierWindow {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: Modifiers,
+        modifiers: Modifiers,
         _: RawModifiers,
         _: u32,
     ) {
+        if let Some(cw) = &mut self.config_window {
+            cw.set_modifiers(egui::Modifiers {
+                alt: modifiers.alt,
+                ctrl: modifiers.ctrl,
+                shift: modifiers.shift,
+                mac_cmd: modifiers.logo,
+                command: modifiers.ctrl,
+            });
+        }
     }
 }
 
@@ -739,31 +998,51 @@ impl SeatHandler for MagnifierWindow {
             self.pointer.take().unwrap().release();
             self.blank_cursor_surface.take();
             self.cursor_pool.take();
+            self.config_cursor_surface.take();
+            self.config_cursor_pool.take();
+            self.config_cursor_hotspot.take();
         }
     }
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
 
+/// Map a wl_pointer button code to the egui pointer button, if recognized.
+fn wl_button_to_egui(button: u32) -> Option<egui::PointerButton> {
+    match button {
+        0x110 => Some(egui::PointerButton::Primary), // BTN_LEFT
+        0x111 => Some(egui::PointerButton::Secondary), // BTN_RIGHT
+        0x112 => Some(egui::PointerButton::Middle),  // BTN_MIDDLE
+        _ => None,
+    }
+}
+
+/// Normalize a keysym into the string used to match keybindings. Printable
+/// ASCII keysyms map to their character (so any letter/digit/punctuation key
+/// can be bound); the named keys that bindings use get canonical names
+/// (`Tab`, `Escape`, and the modifier keys — either side collapses to the
+/// same name, e.g. `Super_L`/`Super_R` → `Super`); anything else falls back
+/// to its numeric value, which no binding matches.
 fn keysym_to_string(keysym: Keysym) -> String {
+    use smithay_client_toolkit::seat::keyboard::Keysym as K;
     match keysym {
-        Keysym::k => "k".to_string(),
-        Keysym::s => "s".to_string(),
-        Keysym::w => "w".to_string(),
-        Keysym::f => "f".to_string(),
-        Keysym::a => "a".to_string(),
-        Keysym::_1 => "1".to_string(),
-        Keysym::_2 => "2".to_string(),
-        Keysym::_3 => "3".to_string(),
-        Keysym::_4 => "4".to_string(),
-        Keysym::_5 => "5".to_string(),
-        Keysym::_6 => "6".to_string(),
-        Keysym::_7 => "7".to_string(),
-        Keysym::_8 => "8".to_string(),
-        Keysym::_9 => "9".to_string(),
-        Keysym::q => "q".to_string(),
-        Keysym::Escape => "Escape".to_string(),
-        _ => format!("{}", u32::from(keysym)),
+        K::Escape => "Escape".to_string(),
+        K::Tab => "Tab".to_string(),
+        K::space => "Space".to_string(),
+        K::Super_L | K::Super_R => "Super".to_string(),
+        K::Control_L | K::Control_R => "Control".to_string(),
+        K::Alt_L | K::Alt_R => "Alt".to_string(),
+        K::Shift_L | K::Shift_R => "Shift".to_string(),
+        _ => {
+            let value = u32::from(keysym);
+            if (0x21..=0x7E).contains(&value)
+                && let Some(c) = char::from_u32(value)
+            {
+                c.to_string()
+            } else {
+                format!("{}", value)
+            }
+        }
     }
 }
 
@@ -796,6 +1075,17 @@ impl MagnifierWindow {
         true
     }
 
+    /// Instantly settle the cursor-follow state onto `target` — no easing,
+    /// no momentum, no self-animated motion (used at hold-to-zoom press and
+    /// release so nothing lags or jumps).
+    fn settle_view(&mut self, target: (f64, f64)) {
+        self.view_center = Some(target);
+        self.view_velocity = (0.0, 0.0);
+        self.last_target = Some(target);
+        self.last_anim_tick = None;
+        self.animating = false;
+    }
+
     fn osd_lines(&self) -> Vec<String> {
         let config_key = &self.state.config.keybindings;
         vec![
@@ -809,6 +1099,9 @@ impl MagnifierWindow {
             format!("{}  manual selection", config_key.screenshot_manual),
             format!("{}  window selection", config_key.screenshot_window),
             format!("{}  config window", config_key.config_window),
+            format!("{}  toggle cursor", config_key.toggle_cursor),
+            format!("hold {} + move  smooth zoom", config_key.hold_to_zoom),
+            format!("MMB / {}  reset zoom", config_key.reset_zoom),
             "Q / Esc / RMB  quit".to_string(),
         ]
     }
@@ -817,6 +1110,166 @@ impl MagnifierWindow {
         let surface = self.layer.wl_surface().clone();
         let callback = surface.clone().frame(qh, FrameCallbackData(surface));
         self.frame_callback = Some(callback);
+    }
+
+    /// Build the cursor surface that shows the real system cursor at its
+    /// native size (used while the Configuration window is open), converting
+    /// the straight-alpha RGBA theme image into a premultiplied ARGB8888 shm
+    /// buffer. Cached: subsequent calls are no-ops. Returns `false` on
+    /// failure so callers can skip `set_cursor`.
+    fn ensure_config_cursor(&mut self, qh: &QueueHandle<Self>) -> bool {
+        if self.config_cursor_surface.is_some() {
+            return true;
+        }
+        let Some(cursor) = &self.magnified_cursor else {
+            return false;
+        };
+        let (base, (hx, hy)) = cursor.base_image();
+        let (w, h) = (base.width, base.height);
+        let mut pool = match SlotPool::new((w * h * 4) as usize, &self.shm) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Failed to create config cursor pool: {e}");
+                return false;
+            }
+        };
+        let surface = self.compositor_state.create_surface(qh);
+        if let Ok((buffer, canvas)) = pool.create_buffer(w, h, w * 4, wl_shm::Format::Argb8888) {
+            // Straight-alpha RGBA -> premultiplied BGRA (ARGB8888 little-
+            // endian), as the compositor expects for cursor buffers.
+            for (px, out) in base.data.chunks_exact(4).zip(canvas.chunks_exact_mut(4)) {
+                let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
+                out[0] = (b * a / 255) as u8;
+                out[1] = (g * a / 255) as u8;
+                out[2] = (r * a / 255) as u8;
+                out[3] = a as u8;
+            }
+            buffer.attach_to(&surface).expect("buffer attach");
+            surface.commit();
+            self.config_cursor_surface = Some(surface);
+            self.config_cursor_pool = Some(pool);
+            self.config_cursor_hotspot = Some((hx.round() as i32, hy.round() as i32));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Open the egui Configuration window over the whole surface. Requires the
+    /// GPU render path (egui-glow paints into the EGL surface); on the CPU
+    /// fallback the window is unavailable and a warning is logged.
+    fn open_config(&mut self, qh: &QueueHandle<Self>) {
+        if self.config_window.is_some() {
+            return;
+        }
+        let Some(gpu) = &self.gpu else {
+            tracing::warn!("Configuration window requires the GPU render path");
+            return;
+        };
+        match ConfigWindow::new(
+            gpu.glow(),
+            self.width as i32,
+            self.height as i32,
+            self.state.config.clone(),
+        ) {
+            Ok(cw) => self.config_window = Some(cw),
+            Err(e) => {
+                tracing::error!("Failed to open Configuration window: {e:#}");
+                return;
+            }
+        }
+        // Never enter hold-to-zoom inside the window (the modifier would be
+        // forwarded to egui anyway).
+        self.hold_to_zoom_active = false;
+        // Keyboard focus stays `on-demand` (set at startup): niri grants it
+        // to layer surfaces at map time (pointer over the surface) and again
+        // on every click, so the UI's text fields receive keys after the
+        // first click. Crucially, we must NOT toggle interactivity here:
+        // niri clears its remembered on-demand focus while a surface is
+        // `exclusive` and only re-grants it on a click, which would leave the
+        // magnifier's global keys dead after closing the window.
+        // Show the real system cursor so the UI can be operated with a
+        // visible pointer. If the serial is stale the compositor ignores this
+        // call, but the next pointer enter (fresh serial) re-asserts it.
+        if let Some(serial) = self.last_pointer_serial
+            && self.ensure_config_cursor(qh)
+            && let (Some(pointer), Some(surface), Some(hot)) = (
+                &self.pointer,
+                &self.config_cursor_surface,
+                self.config_cursor_hotspot,
+            )
+        {
+            pointer.set_cursor(serial, Some(surface), hot.0, hot.1);
+        }
+        tracing::info!("Configuration window opened");
+        self.draw_frame(qh);
+    }
+
+    /// Close the Configuration window and return to the magnifier.
+    fn close_config(&mut self, qh: &QueueHandle<Self>) {
+        if let Some(mut cw) = self.config_window.take() {
+            cw.destroy();
+        } else {
+            return;
+        }
+        // Interactivity stays `on-demand` (unchanged from startup), so the
+        // keyboard focus held before/while the window was open is preserved
+        // and the magnifier's global keys keep working immediately.
+        // Re-hide the hardware cursor if the pointer is over the surface.
+        if let (Some(pointer), Some(surface), Some(serial)) = (
+            &self.pointer,
+            &self.blank_cursor_surface,
+            self.last_pointer_serial,
+        ) {
+            pointer.set_cursor(serial, Some(surface), 0, 0);
+        }
+        tracing::info!("Configuration window closed");
+        self.draw_frame(qh);
+    }
+
+    /// Route a pointer event to the egui Configuration window.
+    fn forward_pointer_to_config(&mut self, event: &PointerEvent) {
+        let Some(cw) = &mut self.config_window else {
+            return;
+        };
+        match event.kind {
+            PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                let pos = egui::pos2(event.position.0 as f32, event.position.1 as f32);
+                cw.pointer_moved(pos);
+            }
+            PointerEventKind::Press { button, .. } => {
+                if let Some(b) = wl_button_to_egui(button) {
+                    cw.pointer_button(b, true);
+                }
+            }
+            PointerEventKind::Release { button, .. } => {
+                if let Some(b) = wl_button_to_egui(button) {
+                    cw.pointer_button(b, false);
+                }
+            }
+            PointerEventKind::Axis {
+                vertical,
+                horizontal,
+                ..
+            } => {
+                let dy = if vertical.value120 != 0 {
+                    vertical.value120 as f32 / 120.0
+                } else {
+                    vertical.discrete as f32
+                };
+                let dx = if horizontal.value120 != 0 {
+                    horizontal.value120 as f32 / 120.0
+                } else {
+                    horizontal.discrete as f32
+                };
+                // Wayland axis is positive when scrolling down; egui's wheel
+                // delta is positive when scrolling up.
+                cw.pointer_axis(egui::vec2(dx, -dy));
+            }
+            PointerEventKind::Leave { .. } => {
+                cw.pointer_left();
+            }
+        }
     }
 
     /// Initialize the GPU renderer at first configure, once the real output
@@ -902,6 +1355,25 @@ impl MagnifierWindow {
     }
 
     fn draw_frame(&mut self, qh: &QueueHandle<Self>) {
+        // Configuration window mode: paint the egui UI instead of the magnifier.
+        if let Some(mut cw) = self.config_window.take() {
+            let result = cw.update(&mut self.state.config);
+            if result == UiResult::Continue {
+                cw.paint();
+                if let Some(gpu) = &self.gpu {
+                    gpu.swap_buffers();
+                }
+            }
+            self.config_window = Some(cw);
+            if result == UiResult::Close {
+                self.close_config(qh);
+                return;
+            }
+            // Keep repainting while the window is open (widgets, caret, ...).
+            self.request_frame_callback(qh);
+            return;
+        }
+
         let Some(captured) = self.captured.as_ref() else {
             return;
         };
@@ -911,6 +1383,16 @@ impl MagnifierWindow {
         let zoom = self.state.zoom;
         let scale_x = source_w as f64 / self.width as f64;
         let scale_y = source_h as f64 / self.height as f64;
+
+        // Dest size and letterbox offset of the magnified quad (the GPU path
+        // fills the whole buffer and ignores the offsets). Computed early so
+        // the hold-to-zoom anchor below can compensate for the letterbox.
+        let view_w = self.width as f64 / zoom;
+        let view_h = self.height as f64 / zoom;
+        let dest_w = (view_w.min(source_w as f64) * zoom).round() as i32;
+        let dest_h = (view_h.min(source_h as f64) * zoom).round() as i32;
+        let off_x = ((self.width as i32 - dest_w) / 2).max(0);
+        let off_y = ((self.height as i32 - dest_h) / 2).max(0);
         let target = if self.pointer_seen {
             (
                 self.pointer_position_f.0 * scale_x,
@@ -920,99 +1402,139 @@ impl MagnifierWindow {
             (source_w as f64 / 2.0, source_h as f64 / 2.0)
         };
 
-        let (center_x, center_y, animating) = match self.view_center {
-            Some((cx, cy)) => {
-                let dt = self
-                    .last_anim_tick
-                    .map_or(0.016, |t| t.elapsed().as_secs_f64());
-                self.last_anim_tick = Some(std::time::Instant::now());
-                match self.state.config.cursor_follow {
-                    crate::config::CursorFollow::Snap => {
-                        self.view_center = Some(target);
-                        self.animating = false;
-                        (target.0, target.1, false)
-                    }
-                    crate::config::CursorFollow::Ease => {
-                        let dist = ((cx - target.0).powi(2) + (cy - target.1).powi(2)).sqrt();
-                        if dist < EASE_EPSILON {
+        // Hold-to-zoom keeps the magnified cursor at the center of the
+        // viewport: at press we capture `E` = the content (capture px) under
+        // the cursor. While the modifier is held the view is centered on `E`
+        // vertically, so zooming scales around the exact content under the
+        // cursor — the same guarantee a wheel zoom gives (the content under
+        // the cursor stays under it for the whole motion, at any zoom). The
+        // x axis is untouched: the view keeps following the hand (normal
+        // panning), and the cursor stays centered over whatever content the
+        // hand pans to. Easing is bypassed while held.
+        let (center_x, center_y, animating) = if self.hold_to_zoom_active && self.pointer_seen {
+            let e = self.hold_anchor.unwrap_or(target);
+            let (cx, cy) = (target.0, e.1);
+            self.view_center = Some((cx, cy));
+            self.last_anim_tick = None;
+            (cx, cy, false)
+        } else {
+            match self.view_center {
+                Some((cx, cy)) => {
+                    let dt = self
+                        .last_anim_tick
+                        .map_or(0.016, |t| t.elapsed().as_secs_f64());
+                    self.last_anim_tick = Some(std::time::Instant::now());
+                    match self.state.config.cursor_follow {
+                        crate::config::CursorFollow::Snap => {
                             self.view_center = Some(target);
                             self.animating = false;
                             (target.0, target.1, false)
-                        } else {
-                            let k = 1.0 - (-dt / EASE_TAU).exp();
-                            let nx = cx + (target.0 - cx) * k;
-                            let ny = cy + (target.1 - cy) * k;
+                        }
+                        crate::config::CursorFollow::Ease => {
+                            let dist = ((cx - target.0).powi(2) + (cy - target.1).powi(2)).sqrt();
+                            if dist < EASE_EPSILON {
+                                self.view_center = Some(target);
+                                self.animating = false;
+                                (target.0, target.1, false)
+                            } else {
+                                let k = 1.0 - (-dt / EASE_TAU).exp();
+                                let nx = cx + (target.0 - cx) * k;
+                                let ny = cy + (target.1 - cy) * k;
+                                self.view_center = Some((nx, ny));
+                                (nx, ny, true)
+                            }
+                        }
+                        crate::config::CursorFollow::Inertia => {
+                            let cursor_moved = self.last_target != Some(target);
+                            let (mut vx, mut vy) = self.view_velocity;
+                            if cursor_moved {
+                                vx += (target.0 - cx) * (dt / EASE_TAU);
+                                vy += (target.1 - cy) * (dt / EASE_TAU);
+                            } else {
+                                let decay = (-dt / INERTIA_TAU).exp();
+                                vx *= decay;
+                                vy *= decay;
+                            }
+                            let nx = cx + vx * dt;
+                            let ny = cy + vy * dt;
+                            self.view_velocity = (vx, vy);
                             self.view_center = Some((nx, ny));
-                            (nx, ny, true)
-                        }
-                    }
-                    crate::config::CursorFollow::Inertia => {
-                        let cursor_moved = self.last_target != Some(target);
-                        let (mut vx, mut vy) = self.view_velocity;
-                        if cursor_moved {
-                            vx += (target.0 - cx) * (dt / EASE_TAU);
-                            vy += (target.1 - cy) * (dt / EASE_TAU);
-                        } else {
-                            let decay = (-dt / INERTIA_TAU).exp();
-                            vx *= decay;
-                            vy *= decay;
-                        }
-                        let nx = cx + vx * dt;
-                        let ny = cy + vy * dt;
-                        self.view_velocity = (vx, vy);
-                        self.view_center = Some((nx, ny));
-                        let settled = !cursor_moved && vx.hypot(vy) < INERTIA_EPS;
-                        if settled {
-                            self.animating = false;
-                            self.view_center = Some(target);
-                            (target.0, target.1, false)
-                        } else {
-                            (nx, ny, true)
+                            let settled = !cursor_moved && vx.hypot(vy) < INERTIA_EPS;
+                            if settled {
+                                self.animating = false;
+                                self.view_center = Some(target);
+                                (target.0, target.1, false)
+                            } else {
+                                (nx, ny, true)
+                            }
                         }
                     }
                 }
-            }
-            None => {
-                self.view_center = Some(target);
-                (target.0, target.1, false)
+                None => {
+                    self.view_center = Some(target);
+                    (target.0, target.1, false)
+                }
             }
         };
         self.last_target = Some(target);
         self.animating = animating;
 
-        let view_w = self.width as f64 / zoom;
-        let view_h = self.height as f64 / zoom;
-        let src_x = (center_x - view_w / 2.0).clamp(0.0, (source_w as f64 - view_w).max(0.0));
-        let src_y = (center_y - view_h / 2.0).clamp(0.0, (source_h as f64 - view_h).max(0.0));
+        // While hold-to-zoom is active the view may sample past the capture
+        // boundary (the cursor sits at the viewport center, so the anchor can
+        // sit near an edge); the region beyond the capture shows the
+        // configured fill. Otherwise the view clamps to the capture as usual.
+        let (src_x, src_y) = if self.hold_to_zoom_active && self.pointer_seen {
+            (center_x - view_w / 2.0, center_y - view_h / 2.0)
+        } else {
+            (
+                (center_x - view_w / 2.0).clamp(0.0, (source_w as f64 - view_w).max(0.0)),
+                (center_y - view_h / 2.0).clamp(0.0, (source_h as f64 - view_h).max(0.0)),
+            )
+        };
 
         let lines = self.osd_lines();
 
-        // Dest size and letterbox offset of the magnified quad (the GPU path
-        // fills the whole buffer and ignores the offsets).
-        let dest_w = (view_w.min(source_w as f64) * zoom).round() as i32;
-        let dest_h = (view_h.min(source_h as f64) * zoom).round() as i32;
-        let off_x = ((self.width as i32 - dest_w) / 2).max(0);
-        let off_y = ((self.height as i32 - dest_h) / 2).max(0);
-
         // Compute the magnified cursor position in logical screen coordinates:
         // the spot where the content currently under the pointer lands in the
-        // viewport. Fractional pointer input keeps it gliding smoothly.
-        let cursor_logical = if self.pointer_seen && self.magnified_cursor.is_some() {
-            Some((
-                (self.pointer_position_f.0 * scale_x - src_x) * zoom + off_x as f64,
-                (self.pointer_position_f.1 * scale_y - src_y) * zoom + off_y as f64,
-            ))
-        } else {
-            None
-        };
+        // viewport. Fractional pointer input keeps it gliding smoothly. While
+        // hold-to-zoom is active the sprite is drawn at the center of the
+        // viewport (the landing of the view-center content), so it stays glued
+        // to the pixels under it through any zoom change.
+        let cursor_logical =
+            if self.pointer_seen && self.state.cursor_visible && self.magnified_cursor.is_some() {
+                if self.hold_to_zoom_active {
+                    Some((
+                        (center_x - src_x) * zoom + off_x as f64,
+                        (center_y - src_y) * zoom + off_y as f64,
+                    ))
+                } else {
+                    Some((
+                        (self.pointer_position_f.0 * scale_x - src_x) * zoom + off_x as f64,
+                        (self.pointer_position_f.1 * scale_y - src_y) * zoom + off_y as f64,
+                    ))
+                }
+            } else {
+                None
+            };
+
+        // The OSD ring marks the magnified cursor (which sits at the viewport
+        // center during hold-to-zoom); fall back to the hand position when no
+        // magnified cursor is drawn.
+        let osd_ring = cursor_logical
+            .map(|(cx, cy)| (cx as i32, cy as i32))
+            .unwrap_or(self.state.pointer_position);
+
+        // Beyond-the-capture fill while hold-to-zoom is active in `Extend`
+        // edge mode (black by default; edge-stretched pixels when `Stretch`).
+        let oob_black = self.state.config.htz_edge_fill == crate::config::HtzEdgeFill::Black;
 
         if let Some(gpu) = &mut self.gpu {
             let osd = if self.state.osd_visible {
                 crate::osd::build_osd_sprite(
                     &lines,
                     (
-                        self.state.pointer_position.0 * crate::gpu::RENDER_SCALE,
-                        self.state.pointer_position.1 * crate::gpu::RENDER_SCALE,
+                        osd_ring.0 * crate::gpu::RENDER_SCALE,
+                        osd_ring.1 * crate::gpu::RENDER_SCALE,
                     ),
                     self.width as i32 * crate::gpu::RENDER_SCALE,
                     self.height as i32 * crate::gpu::RENDER_SCALE,
@@ -1044,21 +1566,24 @@ impl MagnifierWindow {
                     (hx, hy),
                 )
             });
-            gpu.draw(Some(uv), osd.as_ref(), cursor.as_ref());
+            gpu.draw(Some(uv), osd.as_ref(), cursor.as_ref(), oob_black);
             if self.animating {
                 self.request_frame_callback(qh);
             }
             return;
         }
 
-        let scaled =
-            self.state
-                .renderer
-                .render_bilinear(&captured.buffer, (src_x, src_y), dest_w, dest_h);
+        let scaled = self.state.renderer.render_bilinear(
+            &captured.buffer,
+            (src_x, src_y),
+            dest_w,
+            dest_h,
+            self.state.config.htz_edge_fill,
+        );
 
         let show_osd = self.state.osd_visible;
         let osd_lines = self.osd_lines();
-        let osd_cursor = self.state.pointer_position; // Precompute the cursor sprite up front: the fill closure below cannot
+        let osd_cursor = osd_ring; // Precompute the cursor sprite up front: the fill closure below cannot
         // borrow `self` while `render_frame` holds `&mut self`.
         let cursor_buf = cursor_logical.map(|(cx, cy)| {
             let (buf, (hx, hy)) = self
@@ -1135,7 +1660,7 @@ impl MagnifierWindow {
 
     fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
         if let Some(gpu) = &mut self.gpu {
-            gpu.draw(None, None, None);
+            gpu.draw(None, None, None, false);
             return;
         }
         self.render_frame(qh, |canvas, _width, _height, _stride| {
@@ -1259,6 +1784,14 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         magnified_cursor: Some(crate::cursor::MagnifiedCursor::new(start_zoom)),
         blank_cursor_surface: None,
         cursor_pool: None,
+        config_cursor_surface: None,
+        config_cursor_pool: None,
+        config_cursor_hotspot: None,
+        config_window: None,
+        last_pointer_serial: None,
+        hold_to_zoom_active: false,
+        hold_zoom_last_y: 0.0,
+        hold_anchor: None,
     };
 
     tracing::info!(
@@ -1287,6 +1820,106 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keysym_to_string_maps_named_keys() {
+        use smithay_client_toolkit::seat::keyboard::Keysym as K;
+        assert_eq!(keysym_to_string(K::Tab), "Tab");
+        assert_eq!(keysym_to_string(K::space), "Space");
+        assert_eq!(keysym_to_string(K::Escape), "Escape");
+        assert_eq!(keysym_to_string(K::Super_L), "Super");
+        assert_eq!(keysym_to_string(K::Super_R), "Super");
+        assert_eq!(keysym_to_string(K::Control_L), "Control");
+        assert_eq!(keysym_to_string(K::c), "c");
+        assert_eq!(keysym_to_string(K::k), "k");
+    }
+
+    #[test]
+    fn cursor_toggle_flips_visibility() {
+        let mut state = MagnifierState::new(MagnifierConfig::default(), Some(3.0));
+        assert!(state.cursor_visible);
+        state.toggle_cursor();
+        assert!(!state.cursor_visible);
+        state.toggle_cursor();
+        assert!(state.cursor_visible);
+    }
+
+    #[test]
+    fn zoom_keys_are_percentages_of_max_zoom() {
+        let config = MagnifierConfig {
+            max_zoom: 18.0,
+            ..MagnifierConfig::default()
+        };
+        let mut state = MagnifierState::new(config, Some(3.0));
+        state.handle_zoom_key(9);
+        assert!(
+            (state.zoom - 18.0).abs() < 1e-9,
+            "key 9 = max, got {}",
+            state.zoom
+        );
+        state.handle_zoom_key(1);
+        assert!(
+            (state.zoom - 2.0).abs() < 1e-9,
+            "key 1 = max/9, got {}",
+            state.zoom
+        );
+        state.handle_zoom_key(5);
+        assert!(
+            (state.zoom - 10.0).abs() < 1e-9,
+            "key 5 = max*5/9, got {}",
+            state.zoom
+        );
+    }
+
+    #[test]
+    fn zoom_keys_never_go_below_1x() {
+        // With max_zoom < 9 the lowest keys would compute to sub-1x; they must
+        // be clamped to the 1x minimum instead.
+        let config = MagnifierConfig {
+            max_zoom: 4.0,
+            ..MagnifierConfig::default()
+        };
+        let mut state = MagnifierState::new(config, Some(3.0));
+        state.handle_zoom_key(1);
+        assert_eq!(
+            state.zoom, 1.0,
+            "key 1 must clamp to 1x, got {}",
+            state.zoom
+        );
+        state.handle_zoom_key(9);
+        assert_eq!(state.zoom, 4.0, "key 9 is the max, got {}", state.zoom);
+    }
+
+    #[test]
+    fn default_max_zoom_keeps_historical_levels() {
+        // With the default max zoom of 9, keys 1-9 map to 1x..9x exactly.
+        let config = MagnifierConfig::default();
+        let mut state = MagnifierState::new(config, Some(3.0));
+        for key in 1..=9u8 {
+            state.handle_zoom_key(key);
+            assert!(
+                (state.zoom - key as f64).abs() < 1e-9,
+                "key {key} should be {key}x, got {}",
+                state.zoom
+            );
+        }
+    }
+
+    #[test]
+    fn reset_zoom_returns_to_configured_default() {
+        let config = MagnifierConfig {
+            default_zoom: Some(4.0),
+            ..MagnifierConfig::default()
+        };
+        let mut state = MagnifierState::new(config, Some(7.0));
+        state.handle_zoom_key(9);
+        state.reset_zoom();
+        assert!(
+            (state.zoom - 4.0).abs() < 1e-9,
+            "reset to default, got {}",
+            state.zoom
+        );
+    }
 
     /// Regression test for the magnified-cursor blit: `draw_cursor_at` must
     /// draw the reticle (white ring + black center) at the requested position

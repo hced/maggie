@@ -84,6 +84,13 @@ impl MagnifiedCursor {
         (sprite, hotspot)
     }
 
+    /// The base cursor image at its native size (not zoomed), straight-alpha
+    /// RGBA, plus its hotspot in base-image coordinates. Used to build a real
+    /// cursor surface for the Configuration window.
+    pub fn base_image(&self) -> (RgbaBuffer, (f64, f64)) {
+        (self.base.clone(), self.hotspot)
+    }
+
     /// Convenience for tests: build a `MagnifiedCursor` from an explicit image
     /// (also used by the engine tests, hence `pub(crate)`).
     #[cfg(test)]

@@ -2,11 +2,12 @@
 
 const GLYPH_WIDTH: i32 = 5;
 const GLYPH_HEIGHT: usize = 7;
-const GLYPH_SCALE: i32 = 2;
+/// Pixel size of one glyph cell. Doubled for a larger, readable legend.
+const GLYPH_SCALE: i32 = 4;
 const GLYPH_ADVANCE: i32 = 6 * GLYPH_SCALE;
 const LINE_HEIGHT: i32 = (GLYPH_HEIGHT as i32 + 2) * GLYPH_SCALE;
-const BOX_PADDING: i32 = 16;
-const BOX_MARGIN: i32 = 14;
+const BOX_PADDING: i32 = 32;
+const BOX_MARGIN: i32 = 28;
 const BOX_ALPHA: u8 = 255;
 const TEXT_COLOR: [u8; 3] = [0xE6, 0xE6, 0xE6];
 
@@ -402,32 +403,36 @@ mod tests {
 
     #[test]
     fn draw_osd_picks_farthest_corner() {
+        // Canvas is large enough that the (now bigger) legend box always fits
+        // entirely in the chosen corner quadrant.
+        let size = 600;
+        let mid = (size / 2) as i32;
         let corners = [
-            ("top-left", (150, 150)),
-            ("top-right", (10, 150)),
-            ("bottom-left", (150, 10)),
-            ("bottom-right", (10, 10)),
+            ("top-left", (400, 400)),
+            ("top-right", (100, 400)),
+            ("bottom-left", (400, 100)),
+            ("bottom-right", (100, 100)),
         ];
         for (name, cursor) in corners {
-            let mut canvas = vec![0u8; 200 * 200 * 4];
+            let mut canvas = vec![0u8; (size * size * 4) as usize];
             let lines = vec!["zoom".to_string()];
-            draw_osd(&mut canvas, 200, 200, &lines, cursor);
+            draw_osd(&mut canvas, size, size, &lines, cursor);
             let pixels: Vec<[u8; 4]> = canvas
                 .chunks_exact(4)
                 .map(|p| [p[0], p[1], p[2], p[3]])
                 .collect();
-            let text_xs: Vec<i32> = (0..200)
+            let text_xs: Vec<i32> = (0..size)
                 .filter(|&x| {
-                    (0..200).any(|y| {
-                        let p = &pixels[(y * 200 + x) as usize];
+                    (0..size).any(|y| {
+                        let p = &pixels[(y * size + x) as usize];
                         p[3] == 255 && p[2] > 200
                     })
                 })
                 .collect();
-            let text_ys: Vec<i32> = (0..200)
+            let text_ys: Vec<i32> = (0..size)
                 .filter(|&y| {
-                    (0..200).any(|x| {
-                        let p = &pixels[(y * 200 + x) as usize];
+                    (0..size).any(|x| {
+                        let p = &pixels[(y * size + x) as usize];
                         p[3] == 255 && p[2] > 200
                     })
                 })
@@ -436,8 +441,8 @@ mod tests {
             let min_y = *text_ys.iter().min().unwrap();
             let expect_left = name == "top-left" || name == "bottom-left";
             let expect_top = name == "top-left" || name == "top-right";
-            assert_eq!(min_x < 100, expect_left, "wrong x placement for {name}");
-            assert_eq!(min_y < 100, expect_top, "wrong y placement for {name}");
+            assert_eq!(min_x < mid, expect_left, "wrong x placement for {name}");
+            assert_eq!(min_y < mid, expect_top, "wrong y placement for {name}");
         }
     }
 }

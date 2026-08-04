@@ -4,6 +4,7 @@ use tracing_subscriber::prelude::*;
 
 mod capture;
 mod config;
+mod config_window;
 mod cursor;
 mod engine;
 mod gpu;

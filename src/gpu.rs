@@ -61,12 +61,22 @@ void main() {
 }
 "#;
 
+/// Samples the texture, optionally painting texels outside the [0,1] UV
+/// square black (`u_oob_black`) instead of letting the sampler clamp them
+/// (edge-stretch). Used for the hold-to-zoom `Extend` edge mode: when the
+/// anchored view reaches past the frozen capture, the region beyond the frame
+/// is either black (this branch) or stretched edge pixels (CLAMP_TO_EDGE).
 const FRAGMENT_SHADER: &str = r#"
 precision mediump float;
 varying vec2 v_uv;
 uniform sampler2D u_tex;
+uniform float u_oob_black;
 void main() {
-    gl_FragColor = texture2D(u_tex, v_uv);
+    if (u_oob_black > 0.5 && (v_uv.x < 0.0 || v_uv.x > 1.0 || v_uv.y < 0.0 || v_uv.y > 1.0)) {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    } else {
+        gl_FragColor = texture2D(u_tex, v_uv);
+    }
 }
 "#;
 
@@ -84,6 +94,9 @@ pub const RENDER_SCALE: i32 = 2;
 /// draws the OSD as a second alpha-blended quad. All scaling, panning and
 /// easing happen on the GPU.
 pub struct GpuRenderer {
+    /// `glow` context over the same EGL/GLES2 function pointers, for the
+    /// egui-based Configuration window.
+    glow: std::sync::Arc<glow::Context>,
     egl: egl::DynamicInstance<egl::EGL1_4>,
     display: egl::Display,
     surface: egl::Surface,
@@ -99,6 +112,7 @@ pub struct GpuRenderer {
     a_pos_loc: GLint,
     u_src_loc: GLint,
     u_rect_loc: GLint,
+    u_oob_black_loc: GLint,
     width: i32,
     height: i32,
 }
@@ -177,6 +191,16 @@ impl GpuRenderer {
                 .unwrap_or(ptr::null())
         });
 
+        // A `glow` context bound to the same EGL/GLES2 function pointers,
+        // used by the egui-based Configuration window (egui-glow).
+        let glow = unsafe {
+            glow::Context::from_loader_function(|name: &str| {
+                egl.get_proc_address(name)
+                    .map(|f| f as *const c_void)
+                    .unwrap_or(ptr::null())
+            })
+        };
+
         let program = Self::build_program(VERTEX_SHADER)?;
         let u_src_loc = get_uniform_location(program, c"u_src".as_ptr());
         let a_pos_loc = get_attrib_location(program, c"a_pos".as_ptr());
@@ -190,6 +214,10 @@ impl GpuRenderer {
         let u_tex_loc = get_uniform_location(program, c"u_tex".as_ptr());
         if u_tex_loc < 0 {
             anyhow::bail!("Shader uniform u_tex not found");
+        }
+        let u_oob_black_loc = get_uniform_location(program, c"u_oob_black".as_ptr());
+        if u_oob_black_loc < 0 {
+            anyhow::bail!("Shader uniform u_oob_black not found");
         }
         let sprite_program = Self::build_program(SPRITE_VERTEX_SHADER)?;
         let u_rect_loc = get_uniform_location(sprite_program, c"u_rect".as_ptr());
@@ -298,6 +326,7 @@ impl GpuRenderer {
         }
 
         let renderer = GpuRenderer {
+            glow: std::sync::Arc::new(glow),
             egl,
             display,
             surface,
@@ -313,6 +342,7 @@ impl GpuRenderer {
             a_pos_loc,
             u_src_loc,
             u_rect_loc,
+            u_oob_black_loc,
             width: width * RENDER_SCALE,
             height: height * RENDER_SCALE,
         };
@@ -392,6 +422,18 @@ impl GpuRenderer {
         }
     }
 
+    /// The `glow` context used by the egui Configuration window.
+    pub fn glow(&self) -> std::sync::Arc<glow::Context> {
+        self.glow.clone()
+    }
+
+    /// Present the current framebuffer to the compositor. Used by the egui
+    /// Configuration window, which paints the UI directly into the same EGL
+    /// surface instead of going through [`Self::draw`].
+    pub fn swap_buffers(&self) {
+        self.egl.swap_buffers(self.display, self.surface).ok();
+    }
+
     pub fn resize(&mut self, width: i32, height: i32) {
         let width = width * RENDER_SCALE;
         let height = height * RENDER_SCALE;
@@ -428,18 +470,28 @@ impl GpuRenderer {
     /// Draw one frame: the magnified view (source rect in normalized texture
     /// coordinates) optionally overlaid with an OSD sprite, then present.
     ///
-    /// `src` is `(x, y, w, h)` in texture space (0.0..1.0).
+    /// `src` is `(x, y, w, h)` in texture space (0.0..1.0) — may extend
+    /// outside that square when the view reaches past the capture edge in
+    /// `Extend` mode. `oob_black` paints those out-of-bounds texels black
+    /// (edge-stretch otherwise, via the texture's CLAMP_TO_EDGE wrap).
     pub fn draw(
         &mut self,
         src: Option<(f64, f64, f64, f64)>,
         osd: Option<&OsdSprite>,
         cursor: Option<CursorSprite>,
+        oob_black: bool,
     ) {
         unsafe {
             gles2::Viewport(0, 0, self.width, self.height);
+            // The egui Configuration window (egui-glow) leaves SCISSOR_TEST
+            // enabled with a stale rect and its own VAO bound; re-establish a
+            // clean base state so the first frame after closing it renders
+            // unclipped. The VAO/VBO are re-bound below.
+            gles2::Disable(gles2::SCISSOR_TEST);
             gles2::ClearColor(0.0, 0.0, 0.0, 1.0);
             gles2::Clear(gles2::COLOR_BUFFER_BIT);
             gles2::UseProgram(self.program);
+            gles2::Uniform1f(self.u_oob_black_loc, if oob_black { 1.0 } else { 0.0 });
             gles2::BindVertexArrayOES(self.vao);
             gles2::BindBuffer(gles2::ARRAY_BUFFER, self.vbo);
             gles2::EnableVertexAttribArray(self.a_pos_loc as GLuint);

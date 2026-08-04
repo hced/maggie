@@ -20,6 +20,10 @@ chrono = { version = "0.4", features = ["clock"] }
 dirs = "5.0"
 memmap2 = "0.9"
 png = "0.18"
+egui = "0.35"
+egui_glow = "0.35"
+glow = "0.17"
+egui-file-dialog = "0.14.1"
 
 [build-dependencies]
 gl_generator = "0.14"

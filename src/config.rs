@@ -15,6 +15,19 @@ pub enum CursorFollow {
     Inertia,
 }
 
+/// How the area beyond the captured frame is filled while hold-to-zooming
+/// near the capture edge (the magnified cursor sits at the viewport center, so
+/// the view is allowed to extend past the frozen frame to keep it there).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HtzEdgeFill {
+    /// Repeat the edge pixel row/column (CLAMP_TO_EDGE sampling).
+    Stretch,
+    /// Solid black beyond the capture. (default)
+    #[default]
+    Black,
+}
+
 /// How the scroll wheel changes the zoom.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -27,15 +40,57 @@ pub enum ScrollZoomMode {
     Factor,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// Default maximum zoom when a config file has no `max_zoom` (keeps the
+/// historical 1–9 zoom-key behavior for unconfigured installs).
+fn default_max_zoom() -> f64 {
+    9.0
+}
+
+/// Default "reset zoom" keybinding for config files written before the key
+/// existed (serde fills it in when the field is missing).
+fn default_reset_zoom() -> String {
+    "r".to_string()
+}
+
+/// Default key that toggles the magnified cursor inside the viewport.
+fn default_toggle_cursor() -> String {
+    "c".to_string()
+}
+
+/// Default modifier key held to smooth-zoom with vertical mouse motion.
+/// (Changed from "Super" to "Space" at the user's request.)
+fn default_hold_to_zoom() -> String {
+    "Space".to_string()
+}
+
+/// Default zoom-per-pixel rate for hold-to-zoom vertical motion.
+fn default_hold_to_zoom_speed() -> f64 {
+    0.05
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct MagnifierConfig {
     pub default_zoom: Option<f64>,
+    /// The zoom-key levels (1–9) and the scroll-wheel levels span 1×..=this.
+    /// Each numeric key selects `max_zoom * key / 9`, so key 9 is the maximum.
+    #[serde(default = "default_max_zoom")]
+    pub max_zoom: f64,
+    /// How fast hold-to-zoom changes the zoom per pixel of vertical pointer
+    /// motion (default 0.05 → 5 % per pixel, i.e. the full 1×–9× range in
+    /// 160 px of movement).
+    #[serde(default = "default_hold_to_zoom_speed")]
+    pub hold_to_zoom_speed: f64,
     #[serde(default)]
     pub cursor_follow: CursorFollow,
     #[serde(default)]
     pub scroll_zoom_mode: ScrollZoomMode,
     #[serde(default)]
     pub invert_scroll_zoom: bool,
+    /// How the region beyond the capture is filled while hold-to-zooming near
+    /// the edge (the view always extends past the frozen frame during
+    /// hold-to-zoom so the cursor can stay at the viewport center).
+    #[serde(default)]
+    pub htz_edge_fill: HtzEdgeFill,
     pub keybindings: Keybindings,
     pub screenshot_path: String,
     pub screenshot_filename_pattern: String,
@@ -43,7 +98,7 @@ pub struct MagnifierConfig {
     pub show_osd: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Keybindings {
     pub toggle_osd: String,
     pub screenshot_manual: String,
@@ -54,25 +109,50 @@ pub struct Keybindings {
     pub mode_center_cursor: String,
     pub mode_edge_pan: String,
     pub mode_miniature: String,
+    /// Reset the zoom back to `default_zoom` (the middle mouse button does
+    /// the same). Defaults to "r" for config files written before it existed.
+    #[serde(default = "default_reset_zoom")]
+    pub reset_zoom: String,
+    /// Toggle the magnified cursor inside the viewport. Defaults to "c"
+    /// (config files written before it existed get "c" too, since C was
+    /// freed up when the config window moved to Tab).
+    #[serde(default = "default_toggle_cursor")]
+    pub toggle_cursor: String,
+    /// Modifier key held to smooth-zoom with vertical pointer motion. Defaults
+    /// to "Super" (the Super/Mod key, either side).
+    #[serde(default = "default_hold_to_zoom")]
+    pub hold_to_zoom: String,
+}
+
+impl Default for Keybindings {
+    fn default() -> Self {
+        MagnifierConfig::default().keybindings
+    }
 }
 
 impl Default for MagnifierConfig {
     fn default() -> Self {
         MagnifierConfig {
             default_zoom: Some(3.0),
+            max_zoom: 9.0,
+            hold_to_zoom_speed: 0.05,
             cursor_follow: CursorFollow::Snap,
             scroll_zoom_mode: ScrollZoomMode::Levels,
             invert_scroll_zoom: false,
+            htz_edge_fill: HtzEdgeFill::Black,
             keybindings: Keybindings {
                 toggle_osd: "k".to_string(),
                 screenshot_manual: "s".to_string(),
                 screenshot_window: "w".to_string(),
                 screenshot_fullscreen: "f".to_string(),
-                config_window: "c".to_string(),
+                config_window: "Tab".to_string(),
                 anti_aliasing: "a".to_string(),
                 mode_center_cursor: "Control-c".to_string(),
                 mode_edge_pan: "Control-e".to_string(),
                 mode_miniature: "Control-m".to_string(),
+                reset_zoom: "r".to_string(),
+                toggle_cursor: "c".to_string(),
+                hold_to_zoom: "Space".to_string(),
             },
             screenshot_path: "~/Pictures".to_string(),
             screenshot_filename_pattern: "maggie_%Y%m%d_%H%M%S.png".to_string(),
@@ -87,11 +167,132 @@ pub fn load_config() -> anyhow::Result<MagnifierConfig> {
         .join("maggie");
 
     let config_file = config_dir.join("config.ron");
-    if config_file.exists() {
+    let mut config = if config_file.exists() {
         let contents = std::fs::read_to_string(config_file)?;
-        ron::from_str(&contents).map_err(|e| anyhow::anyhow!("Config parse error: {}", e))
+        ron::from_str(&contents).map_err(|e| anyhow::anyhow!("Config parse error: {}", e))?
     } else {
-        Ok(MagnifierConfig::default())
+        MagnifierConfig::default()
+    };
+    normalize_config(&mut config);
+    Ok(config)
+}
+
+/// Clamp/normalize a loaded config so hand-edited or out-of-range values can't
+/// poison runtime behavior (NaN in an `f64` field would make the auto-save
+/// drift check — `NaN != NaN` is always true — rewrite the file every frame).
+/// Also runs the keybinding migrations for renamed defaults.
+pub(crate) fn normalize_config(config: &mut MagnifierConfig) {
+    const MIN_ZOOM: f64 = 1.0;
+    const MAX_ZOOM: f64 = 32.0;
+    config.max_zoom = if config.max_zoom.is_finite() {
+        config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+    } else {
+        9.0
+    };
+    config.hold_to_zoom_speed =
+        if config.hold_to_zoom_speed.is_finite() && config.hold_to_zoom_speed > 0.0 {
+            config.hold_to_zoom_speed.clamp(0.001, 1.0)
+        } else {
+            0.05
+        };
+    config.default_zoom = config
+        .default_zoom
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(MIN_ZOOM, config.max_zoom));
+    // Migration: the Configuration window's default key moved from `C` to
+    // `Tab`, and `C` became the magnified-cursor toggle. A config file written
+    // before `toggle_cursor` existed has `config_window: "c"` and gets
+    // `toggle_cursor` defaulted to "c" — which would collide (the config
+    // window is matched first, so the cursor toggle would be unreachable and
+    // Tab would do nothing). Detect that exact collision and move the config
+    // window to the new default.
+    if config.keybindings.config_window == "c" && config.keybindings.toggle_cursor == "c" {
+        config.keybindings.config_window = "Tab".to_string();
+    }
+    // Migration: the hold-to-zoom default moved from Super to Space. Config
+    // files saved before the change carry "Super"; migrate them to the new
+    // default the user asked for.
+    if config.keybindings.hold_to_zoom == "Super" {
+        config.keybindings.hold_to_zoom = "Space".to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_cursor_toggle_configs_migrate_config_window_to_tab() {
+        // A config as written before `toggle_cursor` existed: config window on
+        // "c", toggle_cursor serde-defaulted to "c". Must migrate so C is the
+        // cursor toggle and Tab opens the window.
+        let mut config = MagnifierConfig {
+            keybindings: Keybindings {
+                config_window: "c".to_string(),
+                toggle_cursor: "c".to_string(),
+                ..Keybindings::default()
+            },
+            ..MagnifierConfig::default()
+        };
+        normalize_config(&mut config);
+        assert_eq!(config.keybindings.config_window, "Tab");
+        assert_eq!(config.keybindings.toggle_cursor, "c");
+    }
+
+    #[test]
+    fn pre_space_configs_migrate_hold_to_zoom() {
+        // Configs saved while the hold-to-zoom default was Super migrate to
+        // the new Space default.
+        let mut config = MagnifierConfig {
+            keybindings: Keybindings {
+                hold_to_zoom: "Super".to_string(),
+                ..Keybindings::default()
+            },
+            ..MagnifierConfig::default()
+        };
+        normalize_config(&mut config);
+        assert_eq!(config.keybindings.hold_to_zoom, "Space");
+        // The new default also is Space.
+        assert_eq!(MagnifierConfig::default().keybindings.hold_to_zoom, "Space");
+    }
+
+    #[test]
+    fn normalize_config_clamps_zooms_and_speed() {
+        let mut config = MagnifierConfig {
+            default_zoom: Some(f64::NAN),
+            max_zoom: 99.0,
+            hold_to_zoom_speed: f64::NEG_INFINITY,
+            ..MagnifierConfig::default()
+        };
+        normalize_config(&mut config);
+        assert_eq!(config.max_zoom, 32.0);
+        assert_eq!(config.default_zoom, None); // NaN dropped
+        assert_eq!(config.hold_to_zoom_speed, 0.05);
+    }
+
+    #[test]
+    fn htz_edge_fill_defaults_and_roundtrip() {
+        // Old configs (no htz_edge_fill field) load with the default.
+        assert_eq!(MagnifierConfig::default().htz_edge_fill, HtzEdgeFill::Black);
+        // Custom values survive a save/load round-trip.
+        let mut config = MagnifierConfig::default();
+        config.htz_edge_fill = HtzEdgeFill::Stretch;
+        let encoded = ron::to_string(&config).expect("serialize");
+        let decoded: MagnifierConfig = ron::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.htz_edge_fill, HtzEdgeFill::Stretch);
+        // A config written while the old `htz_edge_behavior` option existed
+        // still loads (ron ignores unknown fields) and keeps the fill.
+        let legacy = ron::from_str::<MagnifierConfig>(
+            "(htz_edge_behavior: pin, htz_edge_fill: stretch, keybindings: (\n\
+             toggle_osd: \"k\", screenshot_manual: \"s\", screenshot_window: \"w\",\n\
+             screenshot_fullscreen: \"f\", config_window: \"Tab\", anti_aliasing: \"a\",\n\
+             mode_center_cursor: \"Control-c\", mode_edge_pan: \"Control-e\",\n\
+             mode_miniature: \"Control-m\", reset_zoom: \"r\", toggle_cursor: \"c\",\n\
+             hold_to_zoom: \"Space\"), screenshot_path: \"x\",\n\
+             screenshot_filename_pattern: \"maggie_%Y%m%d_%H%M%S.png\")",
+        )
+        .expect("legacy config with unknown field loads");
+        assert_eq!(legacy.htz_edge_fill, HtzEdgeFill::Stretch);
     }
 }
 
