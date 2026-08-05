@@ -375,27 +375,6 @@ fn config_section(
             ui.label("(1-9 keys and the wheel span 1x up to this; key 9 = max)");
             ui.end_row();
 
-            ui.label("Cursor follow");
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("cursor_follow")
-                    .selected_text(cursor_follow_name(config.cursor_follow))
-                    .show_ui(ui, |ui| {
-                        for mode in [
-                            crate::config::CursorFollow::Snap,
-                            crate::config::CursorFollow::Ease,
-                            crate::config::CursorFollow::Inertia,
-                        ] {
-                            ui.selectable_value(
-                                &mut config.cursor_follow,
-                                mode,
-                                cursor_follow_name(mode),
-                            );
-                        }
-                    });
-                ui.label("(snap = instant, ease = smoothed, inertia = momentum)");
-            });
-            ui.end_row();
-
             ui.label("Scroll zoom mode");
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("scroll_zoom_mode")
@@ -531,14 +510,6 @@ fn key_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.label(label);
     ui.add(egui::TextEdit::singleline(value).desired_width(140.0));
     ui.end_row();
-}
-
-fn cursor_follow_name(mode: crate::config::CursorFollow) -> &'static str {
-    match mode {
-        crate::config::CursorFollow::Snap => "snap",
-        crate::config::CursorFollow::Ease => "ease",
-        crate::config::CursorFollow::Inertia => "inertia",
-    }
 }
 
 fn scroll_zoom_name(mode: crate::config::ScrollZoomMode) -> &'static str {

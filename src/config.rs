@@ -2,19 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Motion style for following the cursor over the frozen frame.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum CursorFollow {
-    /// Instant linear motion — no easing, no delay (default).
-    #[default]
-    Snap,
-    /// Exponential smoothing toward the cursor (former default behavior).
-    Ease,
-    /// Ease while moving, then a damped momentum glide after the cursor stops.
-    Inertia,
-}
-
 /// How the scroll wheel changes the zoom.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -68,8 +55,6 @@ pub struct MagnifierConfig {
     #[serde(default = "default_hold_to_zoom_speed")]
     pub hold_to_zoom_speed: f64,
     #[serde(default)]
-    pub cursor_follow: CursorFollow,
-    #[serde(default)]
     pub scroll_zoom_mode: ScrollZoomMode,
     #[serde(default)]
     pub invert_scroll_zoom: bool,
@@ -118,7 +103,6 @@ impl Default for MagnifierConfig {
             default_zoom: Some(3.0),
             max_zoom: 9.0,
             hold_to_zoom_speed: 0.05,
-            cursor_follow: CursorFollow::Snap,
             scroll_zoom_mode: ScrollZoomMode::Levels,
             invert_scroll_zoom: false,
             keybindings: Keybindings {

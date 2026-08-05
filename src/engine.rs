@@ -54,16 +54,163 @@ use crate::render::RgbaBuffer;
 const MIN_ZOOM: f64 = 1.0;
 const MAX_ZOOM: f64 = 32.0;
 const WHEEL_ZOOM_STEP: f64 = 0.1;
+/// Time constant (s) for gently correcting the view-vs-hand offset after
+/// hold-to-zoom release. The correction is driven by real pointer motion
+/// only (never self-animated); when the pointer moves *toward* the hand
+/// content the correction is boosted to at least the hand's own travel, so
+/// a push to a far wall restores the reach en route (see
+/// [`offset_correction_step`]).
+const OFFSET_CORRECT_TAU: f64 = 0.8;
+/// Per-event cap on the correction time step, so a long pause before the
+/// first motion after release cannot dump the whole offset in one jump.
+const OFFSET_CORRECT_DT_CAP: f64 = 0.1;
+
+/// The fraction of the remaining view-vs-hand offset corrected by one
+/// pointer-motion event `dt` seconds after the previous one. Capped so a
+/// long pause never dumps the whole offset in a single step.
+fn offset_correction_factor(dt: f64) -> f64 {
+    (1.0 - (-dt.min(OFFSET_CORRECT_DT_CAP) / OFFSET_CORRECT_TAU).exp()).min(1.0)
+}
+
+/// Clamp a view-center coordinate (capture px) to the capture bounds. The
+/// magnified cursor sits at the viewport center, which *is* the view center:
+/// keeping the center inside the capture guarantees the cursor never enters
+/// the black beyond-capture fill, and that every captured pixel stays
+/// reachable — pushing against a screen edge always lands the view exactly
+/// on the capture edge.
+fn clamp_to_capture_bounds(pos: (f64, f64), bounds: (f64, f64)) -> (f64, f64) {
+    (pos.0.clamp(0.0, bounds.0), pos.1.clamp(0.0, bounds.1))
+}
+
+/// One correction step for the residual view-vs-hand offset (view minus
+/// hand content; hold-to-zoom, a pointer re-enter or a launch quirk can
+/// leave one). The correction is driven by real pointer motion only
+/// (never self-animated) and is bounded so a single event after a long
+/// pause can never lurch the view.
+///
+/// **Reach-restoring boost:** a residual always blocks the wall in the
+/// direction it points away from — pushing there stops short by the
+/// residual until it heals, which is why walls were unreachable after
+/// hold-to-zoom. So when the pointer moves *toward* the hand content (the
+/// reach-blocking direction, `offset × travel < 0` per axis), the view
+/// catches up at least as fast as the hand travels (capped at 2× the
+/// hand's speed): the residual is erased during the push, and the far wall
+/// is reached exactly, at any speed. Moving away heals gently (time-based)
+/// and never fights the user. Returns the remaining offset.
+fn offset_correction_step(
+    offset: (f64, f64),
+    dt: f64,
+    travel: (f64, f64),
+    scale: (f64, f64),
+) -> (f64, f64) {
+    let f = offset_correction_factor(dt);
+    let heal = |o: f64, t: f64, s: f64| {
+        // Time-based decay, bounded by the hand's own travel (×2) so a
+        // single event after a pause can never lurch the view.
+        let lim = t.abs() * s * 2.0;
+        let mut corr = (o * f).clamp(-lim, lim);
+        if o * t < 0.0 {
+            // Pushing toward the hand content: catch up at least as fast as
+            // the hand travels (still within the 2× cap), so the far wall
+            // stays reachable en route.
+            let catch = t.abs() * s;
+            corr = if corr >= 0.0 {
+                corr.max(catch)
+            } else {
+                corr.min(-catch)
+            };
+        }
+        // Never overshoot the hand content.
+        corr.clamp(o.min(0.0), o.max(0.0))
+    };
+    (
+        offset.0 - heal(offset.0, travel.0, scale.0),
+        offset.1 - heal(offset.1, travel.1, scale.1),
+    )
+}
+
+/// Apply one correction step toward the hand content (see the Motion
+/// handler): the corrected view position is `target` (`hand content +
+/// remaining offset`), but an axis whose view is already pinned against a
+/// capture edge is left untouched — the wall wins, so pushing against a
+/// screen edge always lands the view *exactly* on the edge, and gliding
+/// along an edge keeps the view on it, no matter how fast the pointer
+/// moves or how large the residual offset is. `view` must already be
+/// clamped to `bounds`; the result is re-clamped.
+fn correct_toward_hand(view: (f64, f64), target: (f64, f64), bounds: (f64, f64)) -> (f64, f64) {
+    let pinned_x = view.0 <= 0.0 || view.0 >= bounds.0;
+    let pinned_y = view.1 <= 0.0 || view.1 >= bounds.1;
+    let fx = if pinned_x { view.0 } else { target.0 };
+    let fy = if pinned_y { view.1 } else { target.1 };
+    clamp_to_capture_bounds((fx, fy), bounds)
+}
+
+/// Margin (logical px) from the surface edge within which a push toward
+/// that edge places the view exactly on the capture edge (see
+/// [`EdgeReach`]). Sized to cover the observed gap: the compositor's last
+/// delivered pointer position can lag the hand's true stop by up to
+/// ~10–20 logical px when the pointer is moved fast, which is what made the
+/// view stop short of the right/bottom walls (the high edges) while
+/// left/top (position 0) always worked. Kept as small as possible so the
+/// edge does not feel magnetic during normal panning.
+const EDGE_MARGIN_LOGICAL: f64 = 20.0;
+/// The view must already be within this distance (logical px) of the wall
+/// for the edge reach to fire, so any jump it makes stays small (the
+/// delivery gap, not a large hold-to-zoom residual that is still healing).
+const EDGE_VIEW_MARGIN_LOGICAL: f64 = 28.0;
+
+/// Per-axis geometry for the hand-edge reach: the surface (pointer
+/// coordinate range) size in logical px, the capture bound in px, and the
+/// capture-per-logical-pixel scale.
+#[derive(Clone, Copy)]
+struct EdgeReach {
+    surface: f64,
+    bounds: f64,
+    scale: f64,
+}
+
+impl EdgeReach {
+    fn new(surface: f64, bounds: f64, scale: f64) -> Self {
+        Self {
+            surface,
+            bounds,
+            scale,
+        }
+    }
+
+    /// Reach the exact capture edge when the user pushes into it. The view
+    /// pans with the hand's *movement*, so its reach is bounded by the
+    /// hand's delivered travel — and when the pointer is moved fast, the
+    /// last delivered position can stop short of the surface edge, leaving
+    /// the view short of the wall. This closes that gap: when the pointer
+    /// is pushing toward a wall this event and its delivered position is
+    /// within `EDGE_MARGIN_LOGICAL` of the surface edge (i.e. it has been
+    /// pushed as far as it can physically go), the view is placed
+    /// **exactly** on the wall — provided it is already within
+    /// `EDGE_VIEW_MARGIN_LOGICAL` of it, so it never teleports. Pushing
+    /// away, gliding (`delta_logical == 0`), or being away from the edge
+    /// never triggers it, and the result never leaves the capture. `view`
+    /// is in capture px; `pointer` is in logical px.
+    fn apply(self, view: f64, delta_logical: f64, pointer: f64) -> f64 {
+        let near_left = pointer <= EDGE_MARGIN_LOGICAL;
+        let near_right = pointer >= self.surface - EDGE_MARGIN_LOGICAL;
+        if delta_logical > 0.0
+            && near_right
+            && view >= self.bounds - EDGE_VIEW_MARGIN_LOGICAL * self.scale
+        {
+            self.bounds
+        } else if delta_logical < 0.0 && near_left && view <= EDGE_VIEW_MARGIN_LOGICAL * self.scale
+        {
+            0.0
+        } else {
+            view
+        }
+    }
+}
 /// Linux input event code for the right mouse button.
 const BTN_RIGHT: u32 = 0x111;
 /// Linux input event code for the middle mouse button (resets the zoom).
 const BTN_MIDDLE: u32 = 0x112;
-const EASE_TAU: f64 = 0.04;
-const EASE_EPSILON: f64 = 0.05;
-/// Momentum decay time constant for the `inertia` cursor-follow style.
-const INERTIA_TAU: f64 = 0.12;
-/// Velocity (source px/s) below which an inertia glide is considered settled.
-const INERTIA_EPS: f64 = 1.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum MagnifierMode {
@@ -178,10 +325,18 @@ pub struct MagnifierWindow {
     state: MagnifierState,
     exit: bool,
     first_configure: bool,
-    last_anim_tick: Option<std::time::Instant>,
+    /// The view center (capture px) was initialized on the launch pointer
+    /// position once; later pointer enters never re-center (which would jump).
+    launch_centered: bool,
+    /// The launch pointer position (logical px) recorded on the first enter,
+    /// applied with the real capture scale once the capture exists (the
+    /// enter can arrive before the screencopy completes).
+    launch_position: Option<(f64, f64)>,
     view_center: Option<(f64, f64)>,
-    view_velocity: (f64, f64),
-    last_target: Option<(f64, f64)>,
+    /// Wall-clock time of the last pointer-motion event, driving the offset
+    /// correction's time constant (only real motion corrects — never
+    /// self-animated).
+    last_motion_at: Option<std::time::Instant>,
     animating: bool,
     frame_callback: Option<wl_callback::WlCallback>,
     width: u32,
@@ -214,11 +369,6 @@ pub struct MagnifierWindow {
     /// Pointer Y (logical) of the previous motion event while hold-to-zoom is
     /// active; the per-event delta drives the zoom change.
     hold_zoom_last_y: f64,
-    /// Hold-to-zoom anchor, captured at press: `E` = the content (capture px)
-    /// under the magnified cursor. While the modifier is held the view stays
-    /// centered on `E` and the cursor is drawn at the viewport center, so it
-    /// cannot drift relative to the visuals no matter how the zoom changes.
-    hold_anchor: Option<(f64, f64)>,
 }
 
 struct ScreencastManagerData;
@@ -332,6 +482,10 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
                         gpu.upload_frame(&state.captured.as_ref().unwrap().buffer);
                     }
                     tracing::info!("Captured {}x{} frame", width, height);
+                    // If the pointer already entered (recording its launch
+                    // position) before this first capture completed, apply
+                    // the launch centering now with the real scale.
+                    state.apply_launch_centering();
                 }
                 state.draw_frame(qh);
             }
@@ -574,27 +728,54 @@ impl PointerHandler for MagnifierWindow {
                     self.pointer_position_f = position;
                     self.state.pointer_position = (position.0 as i32, position.1 as i32);
                     // The first capture already happened at first configure
-                    // (cursor-free via `overlay_cursor = 0`). This enter is
-                    // where the pointer was at launch, so `draw_frame` now
-                    // centers the view exactly on that position.
+                    // (cursor-free via `overlay_cursor = 0`). This first
+                    // enter is where the pointer was at launch, so center
+                    // the view exactly on that position (a draw before the
+                    // enter would otherwise have left it at the capture
+                    // center). Later enters never re-center — that would
+                    // jump the view. The enter can arrive before the
+                    // capture completes, so record the position and apply
+                    // it with the real scale when the capture exists.
+                    if !self.launch_centered {
+                        self.launch_position = Some(position);
+                        self.apply_launch_centering();
+                    }
                     self.draw_frame(qh);
                 }
                 PointerEventKind::Motion { .. } => {
                     let position = event.position;
                     if position != self.pointer_position_f {
+                        let now = std::time::Instant::now();
+                        let dt = self
+                            .last_motion_at
+                            .map_or(0.016, |t| now.duration_since(t).as_secs_f64());
+                        self.last_motion_at = Some(now);
+                        let dx = position.0 - self.pointer_position_f.0;
+                        let dy = position.1 - self.pointer_position_f.1;
                         self.pointer_position_f = position;
                         self.state.pointer_position = (position.0 as i32, position.1 as i32);
-                        // Hold-to-zoom: while the configured modifier is held,
-                        // vertical motion zooms continuously (position-based,
-                        // so it stays smooth at any event rate). Moving up
-                        // zooms in, moving down zooms out; horizontal motion
-                        // is untouched and the view follows it as usual.
+                        // The view pans with the hand's *movement* (relative
+                        // deltas), never by re-centering on the hand's
+                        // absolute position — the magnified cursor sits at
+                        // the dead center of the viewport, so releasing
+                        // hold-to-zoom (or any other state change) can never
+                        // make the view jump to the hand.
+                        let (sx, sy) = self.capture_scale();
+                        let bounds = match &self.captured {
+                            Some(c) => (c.buffer.width as f64, c.buffer.height as f64),
+                            None => (f64::MAX, f64::MAX),
+                        };
                         if self.hold_to_zoom_active {
-                            let dy = position.1 - self.hold_zoom_last_y;
+                            // Hold-to-zoom: vertical motion zooms continuously
+                            // (position-based, so it stays smooth at any event
+                            // rate; moving up zooms in, down zooms out) and
+                            // the view y stays locked to the anchor captured
+                            // at press. Only horizontal motion pans the view.
+                            let dy_zoom = position.1 - self.hold_zoom_last_y;
                             self.hold_zoom_last_y = position.1;
                             let max_zoom = self.state.config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
                             let new_zoom = (self.state.zoom
-                                - dy * self.state.config.hold_to_zoom_speed)
+                                - dy_zoom * self.state.config.hold_to_zoom_speed)
                                 .clamp(MIN_ZOOM, max_zoom);
                             if (new_zoom - self.state.zoom).abs() > 1e-9 {
                                 self.state.zoom = new_zoom;
@@ -603,8 +784,104 @@ impl PointerHandler for MagnifierWindow {
                                     cursor.update_zoom(new_zoom);
                                 }
                             }
+                            if let Some((cx, cy)) = self.view_center {
+                                let nx = self.clamp_to_capture((cx + dx * sx, cy)).0;
+                                let reach = EdgeReach::new(self.width as f64, bounds.0, sx);
+                                self.view_center =
+                                    Some((reach.apply(nx, dx, self.pointer_position_f.0), cy));
+                            }
+                        } else if let Some((cx, cy)) = self.view_center {
+                            // The view pans with the hand's *movement*
+                            // (relative deltas) and is hard-clamped to the
+                            // capture: the magnified cursor sits at the
+                            // viewport center, so pushing against a screen
+                            // edge always lands the view *exactly* on the
+                            // capture edge (never in the black beyond-capture
+                            // fill), and every captured pixel stays reachable.
+                            let (nx, ny) = self.clamp_to_capture((cx + dx * sx, cy + dy * sy));
+                            // The view-vs-hand offset (view minus hand
+                            // content; hold-to-zoom locks the view y while the
+                            // hand travels to zoom, and a launch quirk or
+                            // resize can leave a residual). Left alone it
+                            // shifts the reachable pan range and creates
+                            // invisible limits, so it is corrected by real
+                            // pointer motion only, every event: each motion
+                            // pulls the view a small fraction of the remaining
+                            // offset toward the hand content, so navigation is
+                            // always fully restored without any jump or
+                            // self-animation. The correction never fights a
+                            // wall: an axis already pinned to a capture edge is
+                            // left untouched, so the view always reaches — and
+                            // glides along — the exact edges, regardless of
+                            // pointer speed. In steady state the offset is zero
+                            // (the view pans 1:1 with the hand), so this is
+                            // dormant.
+                            let hand = (
+                                self.pointer_position_f.0 * sx,
+                                self.pointer_position_f.1 * sy,
+                            );
+                            let offset = (nx - hand.0, ny - hand.1);
+                            let (fx, fy) = if offset.0.hypot(offset.1) > 0.5 {
+                                let (rox, roy) =
+                                    offset_correction_step(offset, dt, (dx, dy), (sx, sy));
+                                correct_toward_hand((nx, ny), (hand.0 + rox, hand.1 + roy), bounds)
+                            } else {
+                                (nx, ny)
+                            };
+                            // Reach the exact edge when the hand reaches the
+                            // physical edge: the compositor's last delivered
+                            // pointer position can lag the hand's true stop
+                            // by several logical px when it is moved fast,
+                            // which made the view stop short of the
+                            // right/bottom walls while left/top always
+                            // worked. When the hand is pushed into an edge
+                            // (its delivered position is within
+                            // EDGE_MARGIN_LOGICAL of the surface edge) and
+                            // the view is already near the wall, the view is
+                            // placed exactly on it (see [`reach_wall_edge`]).
+                            // The correction above can never fight this, and
+                            // the view never leaves the capture.
+                            let reach_x = EdgeReach::new(self.width as f64, bounds.0, sx);
+                            let reach_y = EdgeReach::new(self.height as f64, bounds.1, sy);
+                            self.view_center = Some((
+                                reach_x.apply(fx, dx, self.pointer_position_f.0),
+                                reach_y.apply(fy, dy, self.pointer_position_f.1),
+                            ));
                         }
-                        self.animating = true;
+                        // Diagnostic: near the surface edges, log the raw
+                        // geometry so the wall-reach behavior can be verified
+                        // against the compositor's delivered pointer
+                        // positions (run with `RUST_LOG=maggie=debug`). The
+                        // residual (view minus hand content, capture px) is
+                        // what discriminates a delivery-gap shortfall (view
+                        // tracks the hand, residual ~0, pointer short of the
+                        // surface edge) from a residual shortfall (view lags
+                        // the hand content).
+                        if tracing::enabled!(tracing::Level::DEBUG)
+                            && (self.pointer_position_f.0 < 40.0
+                                || self.pointer_position_f.0 > self.width as f64 - 40.0
+                                || self.pointer_position_f.1 < 40.0
+                                || self.pointer_position_f.1 > self.height as f64 - 40.0)
+                        {
+                            let hand_content = (
+                                self.pointer_position_f.0 * sx,
+                                self.pointer_position_f.1 * sy,
+                            );
+                            let residual = match self.view_center {
+                                Some((vx, vy)) => (vx - hand_content.0, vy - hand_content.1),
+                                None => (0.0, 0.0),
+                            };
+                            tracing::debug!(
+                                pointer = ?self.pointer_position_f,
+                                surface = ?(self.width, self.height),
+                                view = ?self.view_center,
+                                hand_content = ?hand_content,
+                                residual = ?residual,
+                                delta = ?(dx, dy),
+                                zoom = self.state.zoom,
+                                "near-edge motion"
+                            );
+                        }
                         self.draw_frame(qh);
                     }
                 }
@@ -613,16 +890,13 @@ impl PointerHandler for MagnifierWindow {
                     if button == BTN_RIGHT {
                         self.exit = true;
                     }
-                    // Middle mouse button resets the zoom to the default.
+                    // Middle mouse button resets the zoom to the default;
+                    // the view stays put (zoom scales around the center).
                     if button == BTN_MIDDLE {
                         self.state.reset_zoom();
                         if let Some(cursor) = &mut self.magnified_cursor {
                             cursor.update_zoom(self.state.zoom);
                         }
-                        self.view_center = None;
-                        self.view_velocity = (0.0, 0.0);
-                        self.last_target = None;
-                        self.animating = false;
                         self.draw_frame(qh);
                     }
                 }
@@ -683,10 +957,6 @@ impl PointerHandler for MagnifierWindow {
                             if let Some(cursor) = &mut self.magnified_cursor {
                                 cursor.update_zoom(new_zoom);
                             }
-                            self.view_center = None;
-                            self.view_velocity = (0.0, 0.0);
-                            self.last_target = None;
-                            self.animating = false;
                             tracing::info!("Wheel zoom set to {}", self.state.zoom);
                             self.draw_frame(qh);
                         }
@@ -752,27 +1022,21 @@ impl KeyboardHandler for MagnifierWindow {
 
         // Hold-to-zoom: pressing the configured modifier arms smooth zooming.
         // The baseline is the current pointer Y, so the zoom does not jump on
-        // the first motion event. The anchor `E` = the content under the
-        // magnified cursor (capture px) is captured here; while held, the view
-        // stays centered on `E` and the cursor is drawn at the viewport
-        // center. The view is settled onto `E` immediately so hold-zooming
-        // starts centered even when ease/inertia were lagging.
+        // the first motion event. While held, the motion handler zooms on
+        // vertical motion and only pans horizontally, so the view y naturally
+        // stays locked to the content under the centered cursor.
         if keysym_str == self.state.config.keybindings.hold_to_zoom {
             self.hold_to_zoom_active = true;
             self.hold_zoom_last_y = self.pointer_position_f.1;
-            self.hold_anchor = None;
-            if let Some(captured) = self.captured.as_ref() {
-                let scale_x = captured.buffer.width as f64 / self.width as f64;
-                let scale_y = captured.buffer.height as f64 / self.height as f64;
-                let e = (
-                    self.pointer_position_f.0 * scale_x,
-                    self.pointer_position_f.1 * scale_y,
-                );
-                self.hold_anchor = Some(e);
-                // Settle the view onto the anchor instantly (in snap mode
-                // this is a no-op; in ease/inertia it removes the lag with a
-                // one-time settle, which is the point of holding the key).
-                self.settle_view((e.0, e.1));
+            // Ensure the view center is initialized so the vertical lock
+            // engages immediately (in case no motion/draw happened before
+            // the press).
+            if self.view_center.is_none() {
+                let (sx, sy) = self.capture_scale();
+                self.view_center = Some(self.clamp_to_capture((
+                    self.pointer_position_f.0 * sx,
+                    self.pointer_position_f.1 * sy,
+                )));
             }
         }
 
@@ -792,10 +1056,6 @@ impl KeyboardHandler for MagnifierWindow {
             if let Some(cursor) = &mut self.magnified_cursor {
                 cursor.update_zoom(self.state.zoom);
             }
-            self.view_center = None;
-            self.view_velocity = (0.0, 0.0);
-            self.last_target = None;
-            self.animating = false;
             self.draw_frame(qh);
         }
 
@@ -832,10 +1092,6 @@ impl KeyboardHandler for MagnifierWindow {
             if let Some(cursor) = &mut self.magnified_cursor {
                 cursor.update_zoom(self.state.zoom);
             }
-            self.view_center = None;
-            self.view_velocity = (0.0, 0.0);
-            self.last_target = None;
-            self.animating = false;
             self.draw_frame(qh);
         }
 
@@ -875,33 +1131,19 @@ impl KeyboardHandler for MagnifierWindow {
             cw.key(key, false, false);
             self.draw_frame(qh);
         }
-        // Releasing the hold-to-zoom modifier stops smooth zooming. The
-        // invisible hardware pointer is repositioned so `pointer * scale`
-        // equals the content currently at the viewport center (the content
-        // the magnified cursor points at during hold-to-zoom) — the follow
-        // behavior then keeps the view exactly where it is, so nothing jumps
-        // and no catch-up animation is needed. (Wayland cannot warp the
-        // physical cursor, so the first real mouse motion afterwards
-        // re-centers on the hand as usual.)
+        // Releasing the hold-to-zoom modifier stops smooth zooming. The view
+        // stays exactly where it is (no jump, no self-animation). Because the
+        // view y was locked while the hand travelled to zoom, the view now
+        // sits offset from the hand's content; the Motion handler corrects
+        // that offset with real pointer motion, restoring the full pan range.
         if keysym_to_string(event.keysym) == self.state.config.keybindings.hold_to_zoom {
             let was_active = self.hold_to_zoom_active;
-            if was_active
-                && self.pointer_seen
-                && let Some((vcx, vcy)) = self.view_center
-                && let Some(captured) = self.captured.as_ref()
-            {
-                let scale_x = captured.buffer.width as f64 / self.width as f64;
-                let scale_y = captured.buffer.height as f64 / self.height as f64;
-                // Reposition the internal pointer so `pointer * scale`
-                // equals the content currently at the viewport center — the
-                // follow behavior then keeps the view exactly where it is.
-                self.pointer_position_f = (vcx / scale_x, vcy / scale_y);
-                self.state.pointer_position = ((vcx / scale_x) as i32, (vcy / scale_y) as i32);
-                self.settle_view((vcx, vcy));
-            }
             self.hold_to_zoom_active = false;
-            self.hold_anchor = None;
             if was_active {
+                // Fresh baseline so the first correction step after the
+                // release never dumps the whole offset (a pause before the
+                // next motion would otherwise make dt huge).
+                self.last_motion_at = Some(std::time::Instant::now());
                 self.draw_frame(qh);
             }
         }
@@ -1075,21 +1317,53 @@ impl MagnifierWindow {
         true
     }
 
-    /// Instantly settle the cursor-follow state onto `target` — no easing,
-    /// no momentum, no self-animated motion (used at hold-to-zoom press and
-    /// release so nothing lags or jumps).
-    fn settle_view(&mut self, target: (f64, f64)) {
-        self.view_center = Some(target);
-        self.view_velocity = (0.0, 0.0);
-        self.last_target = Some(target);
-        self.last_anim_tick = None;
-        self.animating = false;
+    /// The per-logical-pixel capture scale (`capture / logical`), used to
+    /// convert pointer-motion deltas into capture-px view panning. Falls back
+    /// to 1.0 before the first capture arrives.
+    fn capture_scale(&self) -> (f64, f64) {
+        match &self.captured {
+            Some(c) => (
+                c.buffer.width as f64 / self.width as f64,
+                c.buffer.height as f64 / self.height as f64,
+            ),
+            None => (1.0, 1.0),
+        }
+    }
+
+    /// Clamp a view-center coordinate to the frozen capture's bounds
+    /// (capture px). The magnified cursor sits at the viewport center, which
+    /// *is* the view center: keeping the center inside the capture guarantees
+    /// the cursor never enters the black beyond-capture fill, and that every
+    /// captured pixel stays reachable — pushing against a screen edge always
+    /// lands the view exactly on the capture edge. No-op before the first
+    /// capture arrives.
+    fn clamp_to_capture(&self, pos: (f64, f64)) -> (f64, f64) {
+        match &self.captured {
+            Some(c) => {
+                clamp_to_capture_bounds(pos, (c.buffer.width as f64, c.buffer.height as f64))
+            }
+            None => pos,
+        }
+    }
+
+    /// Center the view on the launch pointer's content once, using the real
+    /// capture scale. Requires both the launch position (first enter) and the
+    /// capture; the enter can arrive before the screencopy completes.
+    fn apply_launch_centering(&mut self) {
+        if self.launch_centered || self.captured.is_none() {
+            return;
+        }
+        if let Some(position) = self.launch_position.take() {
+            let (sx, sy) = self.capture_scale();
+            self.view_center = Some(self.clamp_to_capture((position.0 * sx, position.1 * sy)));
+            self.launch_centered = true;
+        }
     }
 
     fn osd_lines(&self) -> Vec<String> {
         let config_key = &self.state.config.keybindings;
         vec![
-            format!("maggie  zoom {}x", self.state.zoom),
+            format!("maggie  zoom {:.2}x", self.state.zoom),
             "1-9  zoom level".to_string(),
             format!("{}  toggle OSD", config_key.toggle_osd),
             format!(
@@ -1402,88 +1676,30 @@ impl MagnifierWindow {
             (source_w as f64 / 2.0, source_h as f64 / 2.0)
         };
 
-        // Hold-to-zoom keeps the magnified cursor at the center of the
-        // viewport: at press we capture `E` = the content (capture px) under
-        // the cursor. While the modifier is held the view is centered on `E`
-        // vertically, so zooming scales around the exact content under the
-        // cursor — the same guarantee a wheel zoom gives (the content under
-        // the cursor stays under it for the whole motion, at any zoom). The
-        // x axis is untouched: the view keeps following the hand (normal
-        // panning), and the cursor stays centered over whatever content the
-        // hand pans to. Easing is bypassed while held.
-        let (center_x, center_y, animating) = if self.hold_to_zoom_active && self.pointer_seen {
-            let e = self.hold_anchor.unwrap_or(target);
-            let (cx, cy) = (target.0, e.1);
-            self.view_center = Some((cx, cy));
-            self.last_anim_tick = None;
-            (cx, cy, false)
-        } else {
-            match self.view_center {
-                Some((cx, cy)) => {
-                    let dt = self
-                        .last_anim_tick
-                        .map_or(0.016, |t| t.elapsed().as_secs_f64());
-                    self.last_anim_tick = Some(std::time::Instant::now());
-                    match self.state.config.cursor_follow {
-                        crate::config::CursorFollow::Snap => {
-                            self.view_center = Some(target);
-                            self.animating = false;
-                            (target.0, target.1, false)
-                        }
-                        crate::config::CursorFollow::Ease => {
-                            let dist = ((cx - target.0).powi(2) + (cy - target.1).powi(2)).sqrt();
-                            if dist < EASE_EPSILON {
-                                self.view_center = Some(target);
-                                self.animating = false;
-                                (target.0, target.1, false)
-                            } else {
-                                let k = 1.0 - (-dt / EASE_TAU).exp();
-                                let nx = cx + (target.0 - cx) * k;
-                                let ny = cy + (target.1 - cy) * k;
-                                self.view_center = Some((nx, ny));
-                                (nx, ny, true)
-                            }
-                        }
-                        crate::config::CursorFollow::Inertia => {
-                            let cursor_moved = self.last_target != Some(target);
-                            let (mut vx, mut vy) = self.view_velocity;
-                            if cursor_moved {
-                                vx += (target.0 - cx) * (dt / EASE_TAU);
-                                vy += (target.1 - cy) * (dt / EASE_TAU);
-                            } else {
-                                let decay = (-dt / INERTIA_TAU).exp();
-                                vx *= decay;
-                                vy *= decay;
-                            }
-                            let nx = cx + vx * dt;
-                            let ny = cy + vy * dt;
-                            self.view_velocity = (vx, vy);
-                            self.view_center = Some((nx, ny));
-                            let settled = !cursor_moved && vx.hypot(vy) < INERTIA_EPS;
-                            if settled {
-                                self.animating = false;
-                                self.view_center = Some(target);
-                                (target.0, target.1, false)
-                            } else {
-                                (nx, ny, true)
-                            }
-                        }
-                    }
-                }
-                None => {
-                    self.view_center = Some(target);
-                    (target.0, target.1, false)
-                }
+        // The view center is maintained by the pointer-motion handler, which
+        // pans it by the hand's *movement* (relative deltas). The magnified
+        // cursor always sits at the dead center of the viewport, and only the
+        // magnified screen moves — so no state change (releasing hold-to-zoom
+        // included) can ever make the view jump to the hand. The center is
+        // only initialized from the pointer content once, before the first
+        // motion event (e.g. at launch).
+        let (center_x, center_y, animating) = match self.view_center {
+            Some((cx, cy)) => (cx, cy, false),
+            None => {
+                self.view_center = Some(target);
+                (target.0, target.1, false)
             }
         };
-        self.last_target = Some(target);
         self.animating = animating;
 
-        // The view never clamps to the capture: the magnified cursor always
-        // sits at the dead center of the viewport, so near the screen edges
-        // the view samples past the frozen frame — that region is painted
-        // black. Only the magnified screen moves when the mouse moves; the
-        // cursor sprite stays still in the exact center.
+        // Hard invariant: the view center (which is where the magnified
+        // cursor sits — the dead center of the viewport) never leaves the
+        // captured screen. The magnified *view* may still sample past the
+        // frozen frame near the edges (that region is painted black), but the
+        // cursor itself can never enter that black zone, and every captured
+        // pixel stays reachable. Only the magnified screen moves when the
+        // mouse moves; the cursor sprite stays still in the exact center.
+        let (center_x, center_y) = self.clamp_to_capture((center_x, center_y));
         let src_x = center_x - view_w / 2.0;
         let src_y = center_y - view_h / 2.0;
 
@@ -1746,10 +1962,10 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         state,
         exit: false,
         first_configure: true,
-        last_anim_tick: None,
+        launch_centered: false,
+        launch_position: None,
         view_center: None,
-        view_velocity: (0.0, 0.0),
-        last_target: None,
+        last_motion_at: None,
         animating: false,
         frame_callback: None,
         width: 1920,
@@ -1769,7 +1985,6 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         last_pointer_serial: None,
         hold_to_zoom_active: false,
         hold_zoom_last_y: 0.0,
-        hold_anchor: None,
     };
 
     tracing::info!(
@@ -1820,6 +2035,337 @@ mod tests {
         assert!(!state.cursor_visible);
         state.toggle_cursor();
         assert!(state.cursor_visible);
+    }
+
+    #[test]
+    fn clamp_keeps_view_center_inside_capture() {
+        let bounds = (3200.0, 2000.0);
+        assert_eq!(clamp_to_capture_bounds((-10.0, 5.0), bounds), (0.0, 5.0));
+        assert_eq!(
+            clamp_to_capture_bounds((3300.0, -3.0), bounds),
+            (3200.0, 0.0)
+        );
+        assert_eq!(clamp_to_capture_bounds((10.0, 20.0), bounds), (10.0, 20.0));
+        // Pushing against a wall lands exactly on the capture edge.
+        assert_eq!(clamp_to_capture_bounds((3200.0, 2000.0), bounds), bounds);
+        assert_eq!(clamp_to_capture_bounds((1e9, 1e9), bounds), bounds);
+    }
+
+    #[test]
+    fn view_round_trips_reach_both_edges_exactly_with_residual_offset() {
+        // Simulate the motion handler (pan + hard clamp + wall-aware offset
+        // correction + hand-edge reach) with a leftover view-vs-hand offset
+        // AND a pointer whose delivered position stops short of the surface
+        // edge (edge clamping / fast-stop lag). Repeated full left-right
+        // panning must always land the view *exactly* on both edges — the
+        // wall wins — and the offset must decay away during free motion.
+        let scale = 1.5;
+        let capture = 3000.0;
+        let surface = capture / scale; // the hand's logical coordinate range
+        // The hand's delivered travel stops 3 capture px short of the right
+        // edge, which used to make the view stop short of the wall.
+        let (hand_min, hand_max) = (0.0, (capture - 3.0) / scale);
+        // Residual offset: view 300 capture px ahead of the hand.
+        let mut view: f64 = 300.0;
+        let mut seen_left_edge = false;
+        let mut seen_right_edge = false;
+        for _ in 0..30 {
+            // Pan left to the wall, then right to the wall, several times.
+            for (dir, target_hand) in [(-1.0, hand_min), (1.0, hand_max)] {
+                let mut hand: f64 = if dir < 0.0 { hand_max } else { hand_min };
+                while hand != target_hand {
+                    let step = (target_hand - hand).abs().min(16.0) * dir;
+                    hand += step;
+                    // Pan + hard clamp: the wall wins, exactly as in the
+                    // motion handler.
+                    let nx = (view + step * scale).clamp(0.0, capture);
+                    let hand_content = hand * scale;
+                    let offset = nx - hand_content;
+                    let corrected = if offset.abs() > 0.5 {
+                        let (rox, _) = offset_correction_step(
+                            (offset, 0.0),
+                            0.016,
+                            (step, 0.0),
+                            (scale, scale),
+                        );
+                        // Wall-aware correction: a pinned axis never moves.
+                        let pinned = nx <= 0.0 || nx >= capture;
+                        if pinned {
+                            nx
+                        } else {
+                            (hand_content + rox).clamp(0.0, capture)
+                        }
+                    } else {
+                        nx
+                    };
+                    let reach = EdgeReach::new(surface, capture, scale);
+                    view = reach.apply(corrected, step, hand);
+                }
+                if view == 0.0 {
+                    seen_left_edge = true;
+                }
+                if view == capture {
+                    seen_right_edge = true;
+                }
+            }
+        }
+        assert!(seen_left_edge, "view must reach the exact left edge");
+        assert!(seen_right_edge, "view must reach the exact right edge");
+    }
+
+    #[test]
+    fn reach_wall_edge_lands_on_the_wall_when_the_hand_reaches_the_edge() {
+        let scale = 1.5;
+        let surface = 2133.0;
+        let bounds = 3200.0;
+        let reach = EdgeReach::new(surface, bounds, scale);
+        // The exact failure the user reported: the pointer's delivered
+        // position stops short of the surface edge when moved fast, so the
+        // view settles short of the wall. The hand being pushed into the
+        // edge (delivered position within EDGE_MARGIN of the surface edge)
+        // must land the view exactly on the wall.
+        assert_eq!(reach.apply(3180.0, 5.0, 2120.0), bounds);
+        // Pushing left into the left edge lands on 0.
+        assert_eq!(reach.apply(20.0, -5.0, 10.0), 0.0);
+        // Pushing away from an edge never triggers.
+        assert_eq!(reach.apply(3180.0, -5.0, 2120.0), 3180.0);
+        // Hand mid-screen never triggers.
+        assert_eq!(reach.apply(3180.0, 5.0, 1000.0), 3180.0);
+        // A view too far from the wall never triggers (no teleports).
+        assert_eq!(reach.apply(2800.0, 5.0, 2120.0), 2800.0);
+        // Gliding (no movement this event) never triggers.
+        assert_eq!(reach.apply(3180.0, 0.0, 2120.0), 3180.0);
+    }
+
+    #[test]
+    fn reach_wall_edge_is_speed_and_direction_safe() {
+        let scale = 1.5;
+        let surface = 2133.0;
+        let bounds = 3200.0;
+        let reach = EdgeReach::new(surface, bounds, scale);
+        // Even a tiny push while the hand is jammed at the edge lands on the
+        // wall (this is what slow crawling needed before).
+        assert_eq!(reach.apply(3199.0, 0.1, 2130.0), bounds);
+        // The hand within the margin but not pushing: untouched.
+        assert_eq!(reach.apply(3190.0, 0.0, 2120.0), 3190.0);
+        // Pushing toward the edge with the hand just outside the margin:
+        // untouched (the margin bounds the magnetic feel).
+        assert_eq!(reach.apply(3190.0, 5.0, 2100.0), 3190.0);
+    }
+
+    #[test]
+    fn correct_toward_hand_moves_free_view_toward_target() {
+        let bounds = (3200.0, 2000.0);
+        // Free view: the corrected position is the target (hand + remaining
+        // offset), clamped to the capture.
+        assert_eq!(
+            correct_toward_hand((1000.0, 500.0), (980.0, 520.0), bounds),
+            (980.0, 520.0)
+        );
+        // An out-of-bounds target is clamped back inside.
+        assert_eq!(
+            correct_toward_hand((1000.0, 500.0), (-5.0, 2100.0), bounds),
+            (0.0, 2000.0)
+        );
+    }
+
+    #[test]
+    fn correct_toward_hand_never_pulls_a_view_off_a_wall() {
+        let bounds = (3200.0, 2000.0);
+        // View pinned on the right wall (the wall won the clamp), hand still
+        // behind it: the correction must NOT drag the view off the wall —
+        // this is what made fast pushes stop short of the exact border.
+        let pinned = (3200.0, 1000.0);
+        let target = (3100.0, 1100.0);
+        assert_eq!(
+            correct_toward_hand(pinned, target, bounds),
+            (3200.0, 1100.0)
+        );
+        // Same on the left wall.
+        let pinned = (0.0, 1000.0);
+        assert_eq!(
+            correct_toward_hand(pinned, (100.0, 900.0), bounds),
+            (0.0, 900.0)
+        );
+        // Pinned on both axes: nothing moves.
+        let corner = (0.0, 2000.0);
+        assert_eq!(correct_toward_hand(corner, (500.0, 1500.0), bounds), corner);
+    }
+
+    #[test]
+    fn correct_toward_hand_glides_along_pinned_edge() {
+        let bounds = (3200.0, 2000.0);
+        // View at the right wall, gliding vertically: the x stays pinned to
+        // the exact edge while the free y axis is corrected.
+        let view = (3200.0, 1000.0);
+        let target = (3190.0, 1010.0);
+        assert_eq!(correct_toward_hand(view, target, bounds), (3200.0, 1010.0));
+        // Gliding along the bottom edge keeps the y pinned.
+        let view = (1600.0, 2000.0);
+        let target = (1620.0, 1980.0);
+        assert_eq!(correct_toward_hand(view, target, bounds), (1620.0, 2000.0));
+    }
+
+    #[test]
+    fn offset_correction_factor_is_bounded_and_capped() {
+        // No time elapsed -> no correction.
+        assert_eq!(offset_correction_factor(0.0), 0.0);
+        // A normal inter-event gap corrects a small fraction.
+        let f = offset_correction_factor(0.016);
+        assert!(f > 0.0 && f < 0.1, "f = {f}");
+        // Monotonic in dt.
+        assert!(offset_correction_factor(0.05) > offset_correction_factor(0.01));
+        // A huge pause is capped: it must never dump the whole offset at once.
+        let f_big = offset_correction_factor(10.0);
+        assert!(
+            f_big <= 1.0 - (-OFFSET_CORRECT_DT_CAP / OFFSET_CORRECT_TAU).exp() + 1e-9,
+            "f_big = {f_big}"
+        );
+        assert!(f_big > 0.0 && f_big < 0.3);
+    }
+
+    #[test]
+    fn offset_correction_converges_to_zero_over_motion() {
+        // Repeated motion-driven steps (16 ms apart) must erase a large
+        // residual offset (the kind hold-to-zoom accumulates) without ever
+        // overshooting past zero.
+        let mut o: (f64, f64) = (930.0, -240.0);
+        let mut steps = 0;
+        while o.0.hypot(o.1) >= 0.5 && steps < 100_000 {
+            let f = offset_correction_factor(0.016);
+            o = (o.0 - o.0 * f, o.1 - o.1 * f);
+            steps += 1;
+        }
+        assert!(o.0.hypot(o.1) < 0.5, "offset {o:?} after {steps} steps");
+        assert!(steps < 100_000);
+        // The view-side correction subtracts the offset, so it moves toward
+        // the hand content and never flips sign.
+        assert!(o.0.abs() < 0.5 && o.1.abs() < 0.5);
+    }
+
+    #[test]
+    fn offset_correction_step_after_pause_does_not_lurch() {
+        // A huge dt after a pause (capped internally) with the hand barely
+        // moved: the per-event correction must be bounded by the hand's own
+        // travel, not by the time — no visible jump on the first motion
+        // after releasing hold-to-zoom.
+        let o: (f64, f64) = (930.0, -240.0);
+        let travel = (2.0, -1.0);
+        let scale = (1.5, 1.5);
+        let after = offset_correction_step(o, 10.0, travel, scale);
+        // Corrected at most 2x the hand's travel in each axis.
+        assert!(o.0 - after.0 <= travel.0.abs() * scale.0 * 2.0 + 1e-9);
+        assert!(o.1 - after.1 <= travel.1.abs() * scale.1 * 2.0 + 1e-9);
+        // And it never overshoots past zero.
+        assert!(after.0 >= 0.0 && after.1 <= 0.0);
+        // Continuous motion still converges.
+        let mut o2 = o;
+        for _ in 0..100_000 {
+            o2 = offset_correction_step(o2, 0.016, (20.0, -20.0), scale);
+            if o2.0.hypot(o2.1) < 0.5 {
+                break;
+            }
+        }
+        assert!(o2.0.hypot(o2.1) < 0.5, "offset {o2:?}");
+    }
+
+    #[test]
+    fn offset_correction_boost_heals_fast_toward_hand_but_never_overshoots() {
+        // Pushing toward the blocked wall (= toward the hand content) the
+        // view catches up fast, but the correction never passes the hand.
+        // o = +5 (view below the hand), t = -100 (pushing up toward it).
+        let after = offset_correction_step((5.0, 0.0), 0.016, (-100.0, 0.0), (1.5, 1.5));
+        assert_eq!(after, (0.0, 0.0), "fully healed in one push, no overshoot");
+        // Moving away from the hand content heals gently (time-based only),
+        // so the correction never fights or lurches the user.
+        let away = offset_correction_step((300.0, 0.0), 0.016, (100.0, 0.0), (1.5, 1.5));
+        assert!(
+            away.0 > 290.0,
+            "away-motion heals gently (time-based), got {}",
+            away.0
+        );
+        // The boosted correction is still bounded by 2x the hand's travel.
+        let big = offset_correction_step((5000.0, 0.0), 0.016, (10.0, 0.0), (1.5, 1.5));
+        assert!(
+            5000.0 - big.0 <= 10.0 * 1.5 * 2.0 + 1e-9,
+            "bounded by 2x travel"
+        );
+    }
+
+    #[test]
+    fn boost_restores_far_wall_reach_after_hold_to_zoom() {
+        // The exact failure the user reported: after a hold-to-zoom zoom-out
+        // the view is left above the hand content (negative y offset), so
+        // pushing down to the bottom wall used to stop short by the residual
+        // (arbitrary distance, worse when moving fast). With the boost the
+        // residual is erased en route and the wall is reached exactly.
+        let scale = 1.5;
+        let capture = 3000.0;
+        let surface = capture / scale;
+        // View 300 capture px above the hand content (zoom-out residual).
+        let mut view: f64 = 1200.0;
+        let mut hand: f64 = 1000.0;
+        let mut reached_wall = false;
+        // Push down toward the bottom wall in 16-logical-px hand steps.
+        while hand < surface {
+            let step = 16.0;
+            hand += step;
+            let nx = (view + step * scale).clamp(0.0, capture);
+            let hand_content = hand * scale;
+            let offset = nx - hand_content;
+            let corrected = if offset.abs() > 0.5 {
+                let (rox, _) =
+                    offset_correction_step((offset, 0.0), 0.016, (step, 0.0), (scale, scale));
+                // Wall-aware correction: a pinned axis never moves.
+                let pinned = nx <= 0.0 || nx >= capture;
+                if pinned {
+                    nx
+                } else {
+                    (hand_content + rox).clamp(0.0, capture)
+                }
+            } else {
+                nx
+            };
+            let reach = EdgeReach::new(surface, capture, scale);
+            view = reach.apply(corrected, step, hand);
+            if view == capture {
+                reached_wall = true;
+                break;
+            }
+        }
+        assert!(
+            reached_wall,
+            "view must reach the exact bottom wall, got {view}"
+        );
+        // Without the boost (old time-only correction) the same push stops
+        // short of the wall by most of the residual.
+        let mut old_view: f64 = 1200.0;
+        let mut hand2: f64 = 1000.0;
+        let mut old_reached = false;
+        while hand2 < 2000.0 {
+            let step = 16.0;
+            hand2 += step;
+            let nx = (old_view + step * scale).clamp(0.0, capture);
+            let offset = nx - hand2 * scale;
+            let corrected = if offset.abs() > 0.5 {
+                // Time-only healing, no travel boost.
+                let f = offset_correction_factor(0.016);
+                let lim = step * scale * 2.0;
+                let corr = (offset * f).clamp(-lim, lim);
+                (hand2 * scale + (offset - corr)).clamp(0.0, capture)
+            } else {
+                nx
+            };
+            old_view = corrected;
+            if old_view == capture {
+                old_reached = true;
+                break;
+            }
+        }
+        assert!(
+            !old_reached && old_view < capture,
+            "old behavior stopped short (view was {old_view})"
+        );
     }
 
     #[test]
