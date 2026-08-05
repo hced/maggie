@@ -25,17 +25,26 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.debug {
-        tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer())
-            .with(tracing_subscriber::EnvFilter::new("maggie=debug"))
-            .init();
+    // The log filter honours `RUST_LOG` (e.g. `RUST_LOG=maggie=debug maggie`),
+    // falling back to `maggie=info` when it is unset/empty/invalid — note
+    // that `try_from_default_env()` returns an *empty* (all-silent) filter for
+    // an unset variable, so the environment must be checked explicitly.
+    // `--debug` forces debug output regardless of the environment.
+    let filter = if args.debug {
+        tracing_subscriber::EnvFilter::new("maggie=debug")
+    } else if std::env::var("RUST_LOG")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("maggie=info"))
     } else {
-        tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer())
-            .with(tracing_subscriber::EnvFilter::new("maggie=info"))
-            .init();
-    }
+        tracing_subscriber::EnvFilter::new("maggie=info")
+    };
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
+        .init();
 
     tracing::info!("Starting maggie");
 

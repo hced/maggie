@@ -21,5 +21,6 @@ The primary agent must actively delegate tasks based on the following triggers:
 
 ## Standard Workflow & Rules
 - **Display Server:** Strictly Wayland-only (as mandated in `SPEC.md`).
+- **Release Build Mandate:** After **every** change or implementation iteration (fix, feature, tuning, revert, or documentation that affects code), the responsible agent **must** build the release target using the justfile recipe (`just build` — the `build` recipe in the project root `justfile`, which runs `cargo build --release`) and confirm it succeeds before reporting completion. Never finish a task with a stale or unbuilt `target/release/maggie`.
 - **Commit Mandate:** James is responsible for committing changes after every successful feature or milestone with a descriptive, concise commit message.
 - **Agent Roles:** Follow the individual agent parameters defined in `.opencode/agents/`.
