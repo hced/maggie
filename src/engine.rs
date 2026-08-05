@@ -188,6 +188,28 @@ const REACH_HISTORY_LEN: usize = 4;
 /// and frame callbacks proved unreliable as a repeat clock on niri.
 const NUDGE_REPEAT_DELAY_MS: u64 = 400;
 const NUDGE_REPEAT_INTERVAL_MS: u64 = 33;
+/// Minimum interval between redraws caused by pointer motion (8.33 ms ≈
+/// 120 Hz). Pointer events arrive at the libinput sample rate — up to
+/// ~1000 Hz for high-polling mice — and redrawing + presenting a full-screen
+/// frame for each one floods the compositor with commits. When other
+/// surfaces underneath also repaint (a web browser with hover effects,
+/// animations or video), the compositor's frame scheduling starves and the
+/// magnifier's panning visibly lags, whereas over an idle surface (e.g.
+/// Blender's viewport) there is no competition and it feels snappy. The
+/// display presents at 60–144 Hz anyway, so capping the redraw rate at a
+/// fraction of the event rate keeps panning just as smooth while cutting
+/// compositor load by an order of magnitude.
+const MOTION_REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_micros(8333);
+/// Whether a motion-driven redraw is due: always for the first draw (no
+/// previous draw), otherwise once [`MOTION_REDRAW_INTERVAL`] has elapsed
+/// since `last_draw_at`.
+fn motion_redraw_due(last_draw_at: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last_draw_at {
+        None => true,
+        Some(last) => now.duration_since(last) >= MOTION_REDRAW_INTERVAL,
+    }
+}
+
 /// The reach margin (logical px) for one axis, sized from the pointer's
 /// recent peak travel: `peak × REACH_DELTA_FACTOR + REACH_FLOOR_LOGICAL`,
 /// capped at [`REACH_MAX_LOGICAL`].
@@ -894,6 +916,12 @@ pub struct MagnifierWindow {
     /// correction's time constant (only real motion corrects — never
     /// self-animated).
     last_motion_at: Option<std::time::Instant>,
+    /// A motion-driven redraw was throttled and is waiting for the next
+    /// [`MOTION_REDRAW_INTERVAL`] deadline (see [`MagnifierWindow::request_motion_redraw`]).
+    redraw_pending: bool,
+    /// When the last motion-driven redraw happened; used to cap the redraw
+    /// rate so high-frequency pointer events cannot flood the compositor.
+    last_draw_at: Option<std::time::Instant>,
     animating: bool,
     frame_callback: Option<wl_callback::WlCallback>,
     width: u32,
@@ -1494,7 +1522,7 @@ impl PointerHandler for MagnifierWindow {
                             // direction.
                             self.view_center = Some((fx, fy));
                         }
-                        self.draw_frame(qh);
+                        self.request_motion_redraw(qh);
                     }
                 }
                 PointerEventKind::Press { button, .. } => {
@@ -2240,6 +2268,60 @@ impl MagnifierWindow {
         }
     }
 
+    /// Redraw in response to pointer motion, capped at
+    /// [`MOTION_REDRAW_INTERVAL`]: the first event of a burst draws
+    /// immediately (lowest latency), and any motion arriving within the
+    /// interval is coalesced into a single scheduled draw (fired by
+    /// [`MagnifierWindow::draw_frame_if_motion_pending`] when the loop wakes
+    /// on the deadline). State updates in the motion handler stay per-event
+    /// (cheap); only the full-frame draw + present is throttled.
+    fn request_motion_redraw(&mut self, qh: &QueueHandle<Self>) {
+        let now = std::time::Instant::now();
+        if motion_redraw_due(self.last_draw_at, now) {
+            self.redraw_pending = false;
+            self.last_draw_at = Some(now);
+            self.draw_frame(qh);
+        } else {
+            self.redraw_pending = true;
+        }
+    }
+
+    /// After a timed wait, redraw if a motion redraw was throttled while the
+    /// loop was blocked with no events to wake the normal dispatch path.
+    fn draw_frame_if_motion_pending(&mut self, qh: &QueueHandle<Self>) {
+        if !self.redraw_pending {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if motion_redraw_due(self.last_draw_at, now) {
+            self.redraw_pending = false;
+            self.last_draw_at = Some(now);
+            self.draw_frame(qh);
+        }
+    }
+
+    /// The poll bound for the event loop: the earliest of the nudge-repeat
+    /// deadline and the pending motion-redraw deadline. Returns `None` when
+    /// neither is pending, so the loop blocks indefinitely (idle behaviour
+    /// is unchanged).
+    fn poll_timeout(&self) -> Option<std::time::Duration> {
+        let mut best = self.repeat_poll_timeout();
+        if self.redraw_pending {
+            let wait = match self.last_draw_at {
+                None => std::time::Duration::ZERO,
+                Some(last) => {
+                    let elapsed = std::time::Instant::now().duration_since(last);
+                    MOTION_REDRAW_INTERVAL.saturating_sub(elapsed)
+                }
+            };
+            best = Some(match best {
+                None => wait,
+                Some(b) => b.min(wait),
+            });
+        }
+        best
+    }
+
     /// Nudge the selection border closest to the magnified cursor by 1 real
     /// capture pixel in the WASD direction. In Screenshot Mode the cursor
     /// sprite follows the live pointer (the view stays put), so the anchor is
@@ -2362,7 +2444,7 @@ impl MagnifierWindow {
                     let cur = self.screenshot_capture_position();
                     self.screenshot_rect = Some(normalize_screenshot_rect(start, cur, bounds));
                 }
-                self.draw_frame(qh);
+                self.request_motion_redraw(qh);
             }
             PointerEventKind::Press { button, .. } => {
                 if button == BTN_LEFT {
@@ -3368,6 +3450,8 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         launch_position: None,
         view_center: None,
         last_motion_at: None,
+        redraw_pending: false,
+        last_draw_at: None,
         animating: false,
         frame_callback: None,
         width: 1920,
@@ -3420,11 +3504,15 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         // next held-key nudge repeat is due (`None` blocks indefinitely, so
         // idle behaviour is unchanged). The first capture was already
         // requested at first configure, so the frame appears with no delay.
-        let timeout = window.repeat_poll_timeout();
+        let timeout = window.poll_timeout();
         dispatch_with_timeout(&conn, &mut event_queue, &mut window, timeout)?;
         // A nudge repeat may have come due while the loop was blocked with no
         // events to wake it — fire it now (compositor-independent repeat).
         window.draw_frame_if_repeat_due(&qh);
+        // Likewise, a throttled motion redraw may have come due: fire it now
+        // so panning stays smooth at a capped rate without flooding the
+        // compositor with per-event commits.
+        window.draw_frame_if_motion_pending(&qh);
     }
 
     Ok(())
@@ -3492,6 +3580,24 @@ fn dispatch_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn motion_redraw_due_caps_the_cadence() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        // First motion after any draw is always due (lowest latency).
+        assert!(motion_redraw_due(None, t0));
+        // Motion right after a draw is throttled (coalesced).
+        assert!(!motion_redraw_due(Some(t0), t0 + Duration::from_millis(1)));
+        // Just before the interval it is still throttled...
+        assert!(!motion_redraw_due(
+            Some(t0),
+            t0 + MOTION_REDRAW_INTERVAL - Duration::from_micros(1)
+        ));
+        // ...and at the interval boundary it is due again.
+        assert!(motion_redraw_due(Some(t0), t0 + MOTION_REDRAW_INTERVAL));
+        assert!(motion_redraw_due(Some(t0), t0 + Duration::from_millis(50)));
+    }
 
     #[test]
     fn keysym_to_string_maps_named_keys() {
