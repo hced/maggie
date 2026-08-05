@@ -182,6 +182,88 @@ fn reach_margin(peak: f64) -> f64 {
     (peak * REACH_DELTA_FACTOR + REACH_FLOOR_LOGICAL).min(REACH_MAX_LOGICAL)
 }
 
+/// Next zoom for the scroll wheel in `Levels` mode. Walks the same discrete
+/// levels as the `1`–`9` keys (level *i* = `max × i/9`), extended with a
+/// **level 0 at the runtime minimum** (1×, or the fully-zoomed-out view when
+/// `min_zoom` allows), so the most zoomed-out level is always reachable with
+/// the wheel — the bare key levels miss it whenever `max/9 > min` (e.g. max
+/// 12 with a 1× minimum used to bottom out at 1.33×). On a level it steps to
+/// the neighbour; off a level it snaps to the next level in the wheel
+/// direction. `steps` is the already direction-corrected wheel delta:
+/// positive zooms in, negative zooms out. The result never leaves
+/// `min_zoom..=max_zoom`.
+fn wheel_levels_next(zoom: f64, min_zoom: f64, max_zoom: f64, steps: f64) -> f64 {
+    // Below the wheel's floor (only reachable via the `0` key when 0 % zoom
+    // is not allowed): zooming out stays put (the view is already fully
+    // zoomed out) instead of snapping back up, and zooming in returns to the
+    // floor — no direction-reversed jump.
+    if zoom < min_zoom {
+        return if steps < 0.0 { zoom } else { min_zoom };
+    }
+    const LEVELS: f64 = 9.0;
+    // Index of the current zoom in the level space: at/below the midpoint
+    // between the minimum and level 1 it counts as level 0; otherwise it
+    // rounds into 1..=LEVELS (clamped so a zoom beyond the current max snaps
+    // to the top level instead of walking backwards through the wheel).
+    let level_1 = max_zoom / LEVELS;
+    let idx_f = if zoom <= (min_zoom + level_1) / 2.0 {
+        0.0
+    } else {
+        ((zoom / max_zoom) * LEVELS).clamp(1.0, LEVELS)
+    };
+    let idx = idx_f.round();
+    let on_level = (idx_f - idx).abs() < 1e-6;
+    let next = if on_level {
+        // Exactly on a level: step to the neighbour in the wheel direction.
+        if steps > 0.0 {
+            (idx + 1.0).min(LEVELS)
+        } else {
+            (idx - 1.0).max(0.0)
+        }
+    } else if steps > 0.0 {
+        // Between levels: snap to the next level in the wheel direction.
+        idx_f.ceil().min(LEVELS)
+    } else {
+        idx_f.floor().max(0.0)
+    };
+    if next == 0.0 {
+        min_zoom
+    } else {
+        (max_zoom * next / LEVELS).max(min_zoom)
+    }
+}
+
+/// The zoom at which the **whole captured screen exactly fills the viewport**
+/// — the "fully zoomed out" / "0 %" view (the `0` key and, when
+/// `allow_zero_zoom` is on, the wheel/keys/hold-to-zoom all end here). It is
+/// `1 / max(capture-per-viewport-pixel scale)` per axis, so the limiting axis
+/// shows the entire capture edge-to-edge and no axis leaves black bars, and
+/// it never exceeds 1× (zooming out past it would make the screen smaller
+/// than the viewport — the broken look the user reported).
+fn fit_zoom(capture: (f64, f64), viewport: (f64, f64)) -> f64 {
+    let sx = capture.0 / viewport.0.max(1.0);
+    let sy = capture.1 / viewport.1.max(1.0);
+    (1.0 / sx.max(sy)).min(1.0)
+}
+
+/// The zoom readout shown in the OSD: **`0x`** at the fully-zoomed-out view
+/// (the whole captured screen filling the viewport — the state the `0` key,
+/// and with `allow_zero_zoom` the wheel/keys/hold-to-zoom, end at), otherwise
+/// the plain factor (e.g. `3.00x`). The minimum reads as `0x` so the most-
+/// zoomed-out state is unambiguous: the user asked for the zoom to be able to
+/// *reach 0*, and it should read as such. (`0%` was tried first, but the
+/// built-in bitmap font's `%` glyph was illegible — it read like a `2`.) Only
+/// shown when the fit zoom is genuinely below 1× (real zoom-out headroom
+/// exists) — on a setup where the whole screen already fills the viewport at
+/// 1× (`fit == 1`) the `1` key would otherwise read as "0x".
+fn zoom_readout(zoom: f64, fit: f64) -> String {
+    if fit < 1.0 && (zoom - fit).abs() < 1e-9 {
+        "0x".to_string()
+    } else {
+        format!("{zoom:.2}x")
+    }
+}
+
 /// Rolling window of the most recent per-axis pointer travels (logical px
 /// per event), used to size the edge-reach margin. The compositor's last
 /// delivered pointer position can lag the hand's true stop by up to a few
@@ -305,9 +387,10 @@ pub struct MagnifierState {
 impl MagnifierState {
     pub fn new(config: MagnifierConfig, initial_zoom: Option<f64>) -> Self {
         let max_zoom = config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        let min_zoom = config.min_zoom();
         let zoom = initial_zoom
             .unwrap_or_else(|| config.default_zoom.unwrap_or(3.0))
-            .clamp(MIN_ZOOM, max_zoom);
+            .clamp(min_zoom, max_zoom);
         let renderer = Renderer::new(zoom);
 
         let osd_visible = config.show_osd;
@@ -325,30 +408,48 @@ impl MagnifierState {
 
     /// The zoom level the key `1`–`9` selects: each key is a fraction of the
     /// configured max zoom, so key 9 always means `max_zoom`. Clamped to at
-    /// least 1× (with `max_zoom < 9` the lower keys would otherwise go
-    /// sub-1×, e.g. 0.44× at `max_zoom = 4`).
+    /// least the configured minimum (1× by default; with `max_zoom < 9` the
+    /// lower keys would otherwise go sub-1×, e.g. 0.44× at `max_zoom = 4`;
+    /// with `allow_zero_zoom` enabled they may go below 1×, down to the
+    /// minimum).
     fn zoom_for_level(&self, key: u8) -> f64 {
         let max_zoom = self.config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-        (max_zoom * (key as f64) / 9.0).clamp(MIN_ZOOM, max_zoom)
+        (max_zoom * (key as f64) / 9.0).clamp(self.config.min_zoom(), max_zoom)
     }
 
+    /// State-level core for the numeric zoom keys (also the unit-test target;
+    /// the runtime path in `MagnifierWindow::press_key` applies the
+    /// fully-zoomed-out fit on top via [`MagnifierWindow::set_zoom`], so this
+    /// clamps only to the config minimum, not the capture-dependent fit).
     pub fn handle_zoom_key(&mut self, key: u8) {
-        if (1..=9).contains(&key) {
+        if key == 0 {
+            // State-level: the `0` key selects the minimum (0), which the
+            // engine maps at runtime to the fully-zoomed-out view (the whole
+            // captured screen filling the viewport) — always available,
+            // regardless of the allow-zero setting.
+            self.zoom = 0.0;
+            self.renderer.update_scale_factor(0.0);
+            tracing::info!("Zoom set to {}", self.zoom);
+        } else if (1..=9).contains(&key) {
             self.zoom = self.zoom_for_level(key);
             self.renderer.update_scale_factor(self.zoom);
             tracing::info!("Zoom set to {}", self.zoom);
         }
     }
 
-    /// Reset the zoom back to the configured default (used by the middle mouse
-    /// button and the `reset_zoom` keybinding).
+    /// State-level core for reset-to-default (also the unit-test target; the
+    /// runtime path applies the fully-zoomed-out fit on top via
+    /// [`MagnifierWindow::set_zoom`], so a default of 0 % lands on the whole-
+    /// screen view). Used by the middle mouse button and the `reset_zoom`
+    /// keybinding.
     pub fn reset_zoom(&mut self) {
         let max_zoom = self.config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        let min_zoom = self.config.min_zoom();
         let default_zoom = self
             .config
             .default_zoom
             .unwrap_or(3.0)
-            .clamp(MIN_ZOOM, max_zoom);
+            .clamp(min_zoom, max_zoom);
         self.zoom = default_zoom;
         self.renderer.update_scale_factor(default_zoom);
         tracing::info!("Zoom reset to {}", self.zoom);
@@ -562,6 +663,14 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
                         gpu.upload_frame(&state.captured.as_ref().unwrap().buffer);
                     }
                     tracing::info!("Captured {}x{} frame", width, height);
+                    // The capture's dimensions define the fully-zoomed-out
+                    // view: clamp the current zoom up to the runtime minimum
+                    // (e.g. a default zoom of 0 % launches at the whole-screen
+                    // view, never below it).
+                    let min_zoom = state.runtime_min_zoom();
+                    if state.state.zoom < min_zoom {
+                        state.set_zoom(state.state.zoom, min_zoom);
+                    }
                     // If the pointer already entered (recording its launch
                     // position) before this first capture completed, apply
                     // the launch centering now with the real scale.
@@ -870,15 +979,17 @@ impl PointerHandler for MagnifierWindow {
                             let dy_zoom = position.1 - self.hold_zoom_last_y;
                             self.hold_zoom_last_y = position.1;
                             let max_zoom = self.state.config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-                            let new_zoom = (self.state.zoom
-                                - dy_zoom * self.state.config.hold_to_zoom_speed)
-                                .clamp(MIN_ZOOM, max_zoom);
+                            let min_zoom = self.runtime_min_zoom();
+                            let new_zoom = if self.state.zoom < min_zoom && dy_zoom > 0.0 {
+                                // Below the floor (the 0 key with 0 % not
+                                // allowed): zooming out stays put.
+                                self.state.zoom
+                            } else {
+                                (self.state.zoom - dy_zoom * self.state.config.hold_to_zoom_speed)
+                                    .clamp(min_zoom, max_zoom)
+                            };
                             if (new_zoom - self.state.zoom).abs() > 1e-9 {
-                                self.state.zoom = new_zoom;
-                                self.state.renderer.update_scale_factor(new_zoom);
-                                if let Some(cursor) = &mut self.magnified_cursor {
-                                    cursor.update_zoom(new_zoom);
-                                }
+                                self.set_zoom(new_zoom, min_zoom);
                             }
                             if let Some((cx, cy)) = self.view_center {
                                 let nx = self.clamp_to_capture((cx + dx * sx, cy)).0;
@@ -953,12 +1064,12 @@ impl PointerHandler for MagnifierWindow {
                         self.exit = true;
                     }
                     // Middle mouse button resets the zoom to the default;
-                    // the view stays put (zoom scales around the center).
+                    // the view stays put (zoom scales around the center). The
+                    // runtime minimum applies, so a default of 0 % lands on
+                    // the fully-zoomed-out view.
                     if button == BTN_MIDDLE {
-                        self.state.reset_zoom();
-                        if let Some(cursor) = &mut self.magnified_cursor {
-                            cursor.update_zoom(self.state.zoom);
-                        }
+                        let default_zoom = self.state.config.default_zoom.unwrap_or(3.0);
+                        self.set_zoom(default_zoom, self.runtime_min_zoom());
                         self.draw_frame(qh);
                     }
                 }
@@ -979,46 +1090,28 @@ impl PointerHandler for MagnifierWindow {
                             steps = -steps;
                         }
                         let max_zoom = self.state.config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+                        let min_zoom = self.runtime_min_zoom();
                         let new_zoom = match self.state.config.scroll_zoom_mode {
                             crate::config::ScrollZoomMode::Levels => {
-                                // The wheel walks the same discrete levels as
-                                // the 1-9 keys: level i = max_zoom * i / 9.
-                                // On a level, step to the neighbour; off a
-                                // level, snap to the next one in the wheel
-                                // direction (mirrors the old ceil/floor
-                                // behaviour, extended to any max zoom).
-                                const LEVELS: f64 = 9.0;
-                                // Clamp the level index so a zoom beyond the
-                                // current max (e.g. max lowered mid-session)
-                                // snaps to the top level instead of walking
-                                // backwards through the wheel.
-                                let idx_f =
-                                    ((self.state.zoom / max_zoom) * LEVELS).clamp(1.0, LEVELS);
-                                let idx = idx_f.round();
-                                let on_level = (idx_f - idx).abs() < 1e-6;
-                                let next = if on_level {
-                                    if steps > 0.0 {
-                                        (idx + 1.0).min(LEVELS)
-                                    } else {
-                                        (idx - 1.0).max(1.0)
-                                    }
-                                } else if steps > 0.0 {
-                                    idx.ceil().min(LEVELS)
-                                } else {
-                                    idx.floor().max(1.0)
-                                };
-                                (max_zoom * next / LEVELS).max(MIN_ZOOM)
+                                // The wheel walks the key levels extended with
+                                // a level 0 at the runtime minimum (see
+                                // [`wheel_levels_next`]): the most zoomed-out
+                                // level is always reachable with the wheel.
+                                wheel_levels_next(self.state.zoom, min_zoom, max_zoom, steps)
                             }
-                            crate::config::ScrollZoomMode::Factor => (self.state.zoom
-                                * (1.0 + steps * WHEEL_ZOOM_STEP))
-                                .clamp(MIN_ZOOM, max_zoom),
+                            crate::config::ScrollZoomMode::Factor => {
+                                if self.state.zoom < min_zoom && steps < 0.0 {
+                                    // Below the floor (the 0 key with 0 % not
+                                    // allowed): zooming out stays put.
+                                    self.state.zoom
+                                } else {
+                                    (self.state.zoom * (1.0 + steps * WHEEL_ZOOM_STEP))
+                                        .clamp(min_zoom, max_zoom)
+                                }
+                            }
                         };
                         if (new_zoom - self.state.zoom).abs() > 1e-9 {
-                            self.state.zoom = new_zoom;
-                            self.state.renderer.update_scale_factor(new_zoom);
-                            if let Some(cursor) = &mut self.magnified_cursor {
-                                cursor.update_zoom(new_zoom);
-                            }
+                            self.set_zoom(new_zoom, min_zoom);
                             tracing::info!("Wheel zoom set to {}", self.state.zoom);
                             self.draw_frame(qh);
                         }
@@ -1104,6 +1197,7 @@ impl KeyboardHandler for MagnifierWindow {
         }
 
         if let Some(zoom_level) = match keysym_str.as_str() {
+            "0" => Some(0),
             "1" => Some(1),
             "2" => Some(2),
             "3" => Some(3),
@@ -1115,9 +1209,18 @@ impl KeyboardHandler for MagnifierWindow {
             "9" => Some(9),
             _ => None,
         } {
-            self.state.handle_zoom_key(zoom_level);
-            if let Some(cursor) = &mut self.magnified_cursor {
-                cursor.update_zoom(self.state.zoom);
+            if zoom_level == 0 {
+                // 0 = fully zoomed out: the whole captured screen fills the
+                // viewport. Always available, regardless of the allow-zero
+                // setting. min 0.0 = no lower clamp: fit_zoom is always > 0.
+                self.set_zoom(self.fit_zoom(), 0.0);
+            } else {
+                // Keys 1-9 are percentages of the max zoom, clamped to the
+                // runtime minimum (fully zoomed out when allowed, else 1x).
+                self.set_zoom(
+                    self.state.zoom_for_level(zoom_level),
+                    self.runtime_min_zoom(),
+                );
             }
             self.draw_frame(qh);
         }
@@ -1151,10 +1254,8 @@ impl KeyboardHandler for MagnifierWindow {
             self.draw_frame(qh);
             tracing::info!("Magnified cursor visible: {}", self.state.cursor_visible);
         } else if keysym_str == config_key.reset_zoom {
-            self.state.reset_zoom();
-            if let Some(cursor) = &mut self.magnified_cursor {
-                cursor.update_zoom(self.state.zoom);
-            }
+            let default_zoom = self.state.config.default_zoom.unwrap_or(3.0);
+            self.set_zoom(default_zoom, self.runtime_min_zoom());
             self.draw_frame(qh);
         }
 
@@ -1385,6 +1486,44 @@ impl MagnifierWindow {
         true
     }
 
+    /// The zoom at which the whole frozen capture fills the viewport — the
+    /// "0 %" / fully-zoomed-out view. Falls back to 1× before the capture
+    /// arrives.
+    fn fit_zoom(&self) -> f64 {
+        match &self.captured {
+            Some(c) => fit_zoom(
+                (c.buffer.width as f64, c.buffer.height as f64),
+                (self.width as f64, self.height as f64),
+            ),
+            None => 1.0,
+        }
+    }
+
+    /// The runtime minimum zoom for the wheel, hold-to-zoom, the `1`–`9` keys
+    /// and the reset-to-default: the fully-zoomed-out view when
+    /// `allow_zero_zoom` is on, otherwise 1×. (The `0` key always reaches the
+    /// fully-zoomed-out view regardless of the setting.)
+    fn runtime_min_zoom(&self) -> f64 {
+        if self.state.config.min_zoom() == 0.0 {
+            self.fit_zoom()
+        } else {
+            1.0
+        }
+    }
+
+    /// Set the zoom, clamped to `min..=max`, and push it to the renderer and
+    /// the magnified cursor. Every zoom operation funnels through this so the
+    /// runtime minimum (fit / 1×) is applied consistently.
+    fn set_zoom(&mut self, zoom: f64, min: f64) {
+        let max = self.state.config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        let z = zoom.clamp(min, max);
+        self.state.zoom = z;
+        self.state.renderer.update_scale_factor(z);
+        if let Some(cursor) = &mut self.magnified_cursor {
+            cursor.update_zoom(z);
+        }
+    }
+
     /// The per-logical-pixel capture scale (`capture / logical`), used to
     /// convert pointer-motion deltas into capture-px view panning. Falls back
     /// to 1.0 before the first capture arrives.
@@ -1531,8 +1670,16 @@ impl MagnifierWindow {
     fn osd_lines(&self) -> Vec<String> {
         let config_key = &self.state.config.keybindings;
         vec![
-            format!("maggie  zoom {:.2}x", self.state.zoom),
-            "1-9  zoom level".to_string(),
+            // At the fully-zoomed-out view the readout shows "0 %" (see
+            // [`zoom_readout`]); otherwise the zoom factor.
+            format!(
+                "maggie  zoom {}",
+                zoom_readout(self.state.zoom, self.fit_zoom())
+            ),
+            // Plain "0-9 zoom level": the built-in bitmap font has no glyphs
+            // for parentheses, so a fancier "(0 = 0%)" suffix used to render
+            // as garbage on screen.
+            "0-9  zoom level".to_string(),
             format!("{}  toggle OSD", config_key.toggle_osd),
             format!(
                 "{}  screenshot fullscreen",
@@ -1883,16 +2030,20 @@ impl MagnifierWindow {
 
         // The magnified cursor is always drawn at the exact center of the
         // viewport (the center of the magnified quad; the quad fills the
-        // screen at zoom >= 1).
-        let cursor_logical =
-            if self.pointer_seen && self.state.cursor_visible && self.magnified_cursor.is_some() {
-                Some((
-                    off_x as f64 + dest_w as f64 / 2.0,
-                    off_y as f64 + dest_h as f64 / 2.0,
-                ))
-            } else {
-                None
-            };
+        // screen at zoom >= 1). At 0 % zoom the sprite would be a degenerate
+        // 0x0 texture (and invisible anyway), so it is skipped entirely.
+        let cursor_logical = if self.pointer_seen
+            && zoom > 0.0
+            && self.state.cursor_visible
+            && self.magnified_cursor.is_some()
+        {
+            Some((
+                off_x as f64 + dest_w as f64 / 2.0,
+                off_y as f64 + dest_h as f64 / 2.0,
+            ))
+        } else {
+            None
+        };
 
         // The OSD ring marks the magnified cursor (always at the viewport
         // center); fall back to the hand position when no magnified cursor is
@@ -1915,12 +2066,6 @@ impl MagnifierWindow {
             } else {
                 None
             };
-            let uv = (
-                src_x / source_w as f64,
-                src_y / source_h as f64,
-                view_w.min(source_w as f64) / source_w as f64,
-                view_h.min(source_h as f64) / source_h as f64,
-            );
             // The GPU buffer is RENDER_SCALE x the logical size, so both the
             // cursor sprite, its hotspot and its position must be scaled to
             // match.
@@ -1939,7 +2084,21 @@ impl MagnifierWindow {
                     (hx, hy),
                 )
             });
-            gpu.draw(Some(uv), osd.as_ref(), cursor.as_ref());
+            if zoom > 0.0 {
+                let uv = (
+                    src_x / source_w as f64,
+                    src_y / source_h as f64,
+                    view_w.min(source_w as f64) / source_w as f64,
+                    view_h.min(source_h as f64) / source_h as f64,
+                );
+                gpu.draw(Some(uv), osd.as_ref(), cursor.as_ref());
+            } else {
+                // 0 % zoom: the magnified view collapses to nothing — draw a
+                // plain black view (src = None clears the buffer) while the
+                // magnified cursor and OSD legend stay visible so the user
+                // can still navigate back in.
+                gpu.draw(None, osd.as_ref(), cursor.as_ref());
+            }
             if self.animating {
                 self.request_frame_callback(qh);
             }
@@ -2817,6 +2976,142 @@ mod tests {
             "reset to default, got {}",
             state.zoom
         );
+    }
+
+    #[test]
+    fn wheel_levels_reach_the_configured_minimum() {
+        // The regression the user reported: max zoom 12 with a 1x minimum —
+        // the wheel used to bottom out at max/9 = 1.33x and could never
+        // reach the 1x minimum. Walking down repeatedly must land exactly on
+        // 1x (level 0).
+        let mut z = 12.0;
+        for _ in 0..20 {
+            let next = wheel_levels_next(z, 1.0, 12.0, -1.0);
+            if next >= z {
+                break;
+            }
+            z = next;
+        }
+        assert_eq!(z, 1.0, "wheel must reach the 1x minimum, got {z}");
+        // And it stays there (never goes below the minimum).
+        assert_eq!(wheel_levels_next(z, 1.0, 12.0, -1.0), 1.0);
+        // Zooming back in from the minimum steps onto the first key level.
+        assert_eq!(wheel_levels_next(1.0, 1.0, 12.0, 1.0), 12.0 / 9.0);
+        // The key levels themselves are unchanged (level 9 = max).
+        assert_eq!(wheel_levels_next(12.0, 1.0, 12.0, -1.0), 12.0 * 8.0 / 9.0);
+    }
+
+    #[test]
+    fn wheel_levels_reach_zero_when_allowed() {
+        // With 0 % zoom allowed the wheel walks all the way down to 0.
+        let mut z = 12.0;
+        for _ in 0..20 {
+            let next = wheel_levels_next(z, 0.0, 12.0, -1.0);
+            if next >= z {
+                break;
+            }
+            z = next;
+        }
+        assert_eq!(z, 0.0, "wheel must reach 0% when allowed, got {z}");
+        // Zooming in from 0 steps onto the first key level.
+        assert_eq!(wheel_levels_next(0.0, 0.0, 12.0, 1.0), 12.0 / 9.0);
+    }
+
+    #[test]
+    fn wheel_levels_below_min_zoom_out_stays_put() {
+        // The 0 key can put the zoom below the wheel's floor when 0 % is not
+        // allowed (e.g. fit 0.667 with a 1x wheel minimum). Scrolling out
+        // from there must stay put — not snap back up to 1x (which would
+        // make scroll-out zoom in); scrolling in returns to the floor.
+        let below = 0.667;
+        assert_eq!(wheel_levels_next(below, 1.0, 12.0, -1.0), below);
+        assert_eq!(wheel_levels_next(below, 1.0, 12.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn wheel_levels_never_below_min_and_never_above_max() {
+        // Off a level with the wheel, snapping is bounded by the level range.
+        assert_eq!(wheel_levels_next(11.0, 1.0, 12.0, 1.0), 12.0); // snaps up to max
+        assert_eq!(wheel_levels_next(1.2, 1.0, 12.0, -1.0), 1.0); // snaps down to min
+        // A zoom beyond the current max snaps to the top level, not backwards.
+        assert_eq!(wheel_levels_next(13.0, 1.0, 12.0, -1.0), 12.0 * 8.0 / 9.0);
+    }
+
+    #[test]
+    fn fit_zoom_fills_the_viewport_with_the_whole_capture() {
+        // A clean 2x scale: the whole screen fits the viewport at 1/2.
+        let fit = fit_zoom((3200.0, 2000.0), (1600.0, 1000.0));
+        assert!((fit - 0.5).abs() < 1e-9, "fit = {fit}");
+        // Never above 1x (a capture smaller than the viewport still fits at
+        // 1x — the screen is never shown smaller than the viewport).
+        assert_eq!(fit_zoom((50.0, 50.0), (100.0, 100.0)), 1.0);
+        // A mismatched aspect ratio: the limiting axis decides, so the whole
+        // capture is visible edge-to-edge on that axis.
+        let mixed = fit_zoom((3000.0, 1000.0), (2000.0, 1000.0));
+        assert!((mixed - 2.0 / 3.0).abs() < 1e-9, "mixed = {mixed}");
+    }
+
+    #[test]
+    fn zoom_readout_shows_0x_at_fit_and_factor_otherwise() {
+        let fit = 2.0 / 3.0;
+        // Exactly at the fully-zoomed-out view: reads as 0x.
+        assert_eq!(zoom_readout(fit, fit), "0x");
+        // A hair above fit still reads as the factor (no premature 0x).
+        assert_eq!(zoom_readout(fit + 0.01, fit), "0.68x");
+        // Normal magnified zooms read as the factor.
+        assert_eq!(zoom_readout(3.0, fit), "3.00x");
+        assert_eq!(zoom_readout(1.0, fit), "1.00x");
+        // When the whole screen already fills the viewport at 1x (fit == 1),
+        // there is no real zoom-out headroom: 1x reads as the factor, not 0x.
+        assert_eq!(zoom_readout(1.0, 1.0), "1.00x");
+    }
+
+    #[test]
+    fn zero_key_always_selects_zero_zoom() {
+        // State-level: the 0 key selects the minimum (0, which the engine
+        // maps to the fully-zoomed-out view at runtime) regardless of the
+        // allow-zero setting.
+        let config = MagnifierConfig {
+            allow_zero_zoom: false,
+            ..MagnifierConfig::default()
+        };
+        let mut state = MagnifierState::new(config, Some(3.0));
+        state.handle_zoom_key(0);
+        assert_eq!(state.zoom, 0.0, "key 0 must always select the minimum");
+    }
+
+    #[test]
+    fn allow_zero_lets_key_levels_go_below_1x() {
+        // With 0 % zoom allowed the 1-9 keys may go sub-1x (each key is a
+        // fraction of max), instead of being clamped to 1x.
+        let config = MagnifierConfig {
+            max_zoom: 4.0,
+            allow_zero_zoom: true,
+            ..MagnifierConfig::default()
+        };
+        let mut state = MagnifierState::new(config, Some(3.0));
+        state.handle_zoom_key(1);
+        assert!(
+            (state.zoom - 4.0 / 9.0).abs() < 1e-9,
+            "key 1 = max/9 below 1x when allowed, got {}",
+            state.zoom
+        );
+        state.handle_zoom_key(9);
+        assert_eq!(state.zoom, 4.0);
+    }
+
+    #[test]
+    fn state_launches_at_zero_default_when_allowed() {
+        // A default zoom of 0 % (with the allow-zero setting enabled by the
+        // config normalization) starts the state at 0; once the capture
+        // arrives the engine clamps it up to the fully-zoomed-out view.
+        let config = MagnifierConfig {
+            default_zoom: Some(0.0),
+            allow_zero_zoom: true,
+            ..MagnifierConfig::default()
+        };
+        let state = MagnifierState::new(config, None);
+        assert_eq!(state.zoom, 0.0);
     }
 
     /// Regression test for the magnified-cursor blit: `draw_cursor_at` must

@@ -83,16 +83,18 @@ void main() {
 /// The GPU path renders its buffers at this multiple of the layer's logical
 /// size and advertises the same value via `wl_surface.set_buffer_scale`, so the
 /// compositor's fractional-scale resampling doesn't soften the magnified
-/// pixels. With `GL_NEAREST` sampling this yields the crisp, pixelated
-/// magnifier look.
+/// pixels. With `GL_NEAREST` magnification this yields the crisp, pixelated
+/// magnifier look when zooming in; the min filter is `GL_LINEAR` so zooming out
+/// below 1x downscales the frozen frame smoothly instead of aliasing.
 pub const RENDER_SCALE: i32 = 2;
 
 /// GPU-accelerated renderer backed by EGL + OpenGL ES 2.
 ///
-/// Renders the captured frame as a textured quad (nearest-neighbor sampling
-/// into a 2x buffer-scale surface for a crisp, pixelated magnifier look) and
-/// draws the OSD as a second alpha-blended quad. All scaling, panning and
-/// easing happen on the GPU.
+/// Renders the captured frame as a textured quad (nearest-neighbor
+/// magnification into a 2x buffer-scale surface for a crisp, pixelated
+/// magnifier look when zooming in; a `GL_LINEAR` min filter smooths the
+/// downscaled view when zooming out below 1x) and draws the OSD as a second
+/// alpha-blended quad. All scaling, panning and easing happen on the GPU.
 pub struct GpuRenderer {
     /// `glow` context over the same EGL/GLES2 function pointers, for the
     /// egui-based Configuration window.
@@ -253,10 +255,15 @@ impl GpuRenderer {
             gles2::PixelStorei(gles2::PACK_ALIGNMENT, 4);
             gles2::GenTextures(1, &mut frame_tex);
             gles2::BindTexture(gles2::TEXTURE_2D, frame_tex);
+            // Min filter is LINEAR so zooming *out* below 1x (e.g. the
+            // fully-zoomed-out 0.67x view) downscales smoothly instead of
+            // aliasing (NEAREST made text look degraded at small zooms); the
+            // mag filter stays NEAREST so zooming *in* keeps the crisp,
+            // pixelated magnifier look.
             gles2::TexParameteri(
                 gles2::TEXTURE_2D,
                 gles2::TEXTURE_MIN_FILTER,
-                gles2::NEAREST as GLint,
+                gles2::LINEAR as GLint,
             );
             gles2::TexParameteri(
                 gles2::TEXTURE_2D,

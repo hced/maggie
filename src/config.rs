@@ -58,11 +58,36 @@ pub struct MagnifierConfig {
     pub scroll_zoom_mode: ScrollZoomMode,
     #[serde(default)]
     pub invert_scroll_zoom: bool,
+    /// Whether all zoom operations (scroll wheel, hold-to-zoom and the `1`–`9`
+    /// preset keys) may zoom out below 1×, down to the **fully-zoomed-out
+    /// view** — the whole captured screen filling the viewport, referred to in
+    /// the UI as "0 %". When disabled the minimum zoom is 1×. Forced on while
+    /// `default_zoom` is exactly 0 (see [`MagnifierConfig::min_zoom`]). The
+    /// `0` key always reaches the fully-zoomed-out view regardless of this
+    /// setting.
+    #[serde(default)]
+    pub allow_zero_zoom: bool,
     pub keybindings: Keybindings,
     pub screenshot_path: String,
     pub screenshot_filename_pattern: String,
     #[serde(default)]
     pub show_osd: bool,
+}
+
+impl MagnifierConfig {
+    /// The effective minimum zoom for all zoom operations, as a factor:
+    /// **0** when 0 % zoom is allowed (`allow_zero_zoom`) — or forced by a
+    /// default zoom of exactly 0 — otherwise **1×**. The engine maps the 0 to
+    /// the fully-zoomed-out view (the whole captured screen filling the
+    /// viewport) at runtime; the `0` key always reaches that view regardless
+    /// of this, per the spec.
+    pub fn min_zoom(&self) -> f64 {
+        if self.allow_zero_zoom || self.default_zoom == Some(0.0) {
+            0.0
+        } else {
+            1.0
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -105,6 +130,7 @@ impl Default for MagnifierConfig {
             hold_to_zoom_speed: 0.05,
             scroll_zoom_mode: ScrollZoomMode::Levels,
             invert_scroll_zoom: false,
+            allow_zero_zoom: false,
             keybindings: Keybindings {
                 toggle_osd: "k".to_string(),
                 screenshot_manual: "s".to_string(),
@@ -160,10 +186,17 @@ pub(crate) fn normalize_config(config: &mut MagnifierConfig) {
         } else {
             0.05
         };
+    // A default zoom of exactly 0 % requires 0 % zoom to be reachable, so the
+    // allow-zero setting is forced on while it stays at 0 (the Configuration
+    // window mirrors this and locks the checkbox).
+    if config.default_zoom == Some(0.0) {
+        config.allow_zero_zoom = true;
+    }
+    let min_zoom = config.min_zoom();
     config.default_zoom = config
         .default_zoom
         .filter(|v| v.is_finite())
-        .map(|v| v.clamp(MIN_ZOOM, config.max_zoom));
+        .map(|v| v.clamp(min_zoom, config.max_zoom));
     // Migration: the Configuration window's default key moved from `C` to
     // `Tab`, and `C` became the magnified-cursor toggle. A config file written
     // before `toggle_cursor` existed has `config_window: "c"` and gets
@@ -233,6 +266,47 @@ mod tests {
         assert_eq!(config.max_zoom, 32.0);
         assert_eq!(config.default_zoom, None); // NaN dropped
         assert_eq!(config.hold_to_zoom_speed, 0.05);
+    }
+
+    #[test]
+    fn default_zoom_zero_forces_allow_zero_zoom() {
+        // A default zoom of 0 % forces the allow-zero setting on, so the app
+        // can actually launch at the configured 0 % zoom.
+        let mut config = MagnifierConfig {
+            default_zoom: Some(0.0),
+            ..MagnifierConfig::default()
+        };
+        normalize_config(&mut config);
+        assert!(config.allow_zero_zoom);
+        assert_eq!(config.min_zoom(), 0.0);
+        assert_eq!(config.default_zoom, Some(0.0));
+    }
+
+    #[test]
+    fn default_zoom_above_zero_leaves_allow_zero_free() {
+        // With a default zoom above 0 the setting stays exactly as written.
+        let mut config = MagnifierConfig {
+            default_zoom: Some(3.0),
+            allow_zero_zoom: false,
+            ..MagnifierConfig::default()
+        };
+        normalize_config(&mut config);
+        assert!(!config.allow_zero_zoom);
+        assert_eq!(config.min_zoom(), 1.0);
+    }
+
+    #[test]
+    fn default_zoom_with_allow_zero_enabled_can_go_below_1x() {
+        // When 0 % zoom is allowed, a sub-1x default (e.g. 0.5) is kept
+        // instead of being clamped to 1x.
+        let mut config = MagnifierConfig {
+            default_zoom: Some(0.5),
+            allow_zero_zoom: true,
+            ..MagnifierConfig::default()
+        };
+        normalize_config(&mut config);
+        assert_eq!(config.default_zoom, Some(0.5));
+        assert_eq!(config.min_zoom(), 0.0);
     }
 
     #[test]

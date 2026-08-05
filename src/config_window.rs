@@ -278,15 +278,23 @@ impl ConfigWindow {
                         action = UiResult::Close;
                     }
                 });
+
+            // The native folder picker must be added **inside the same egui
+            // pass** as the rest of the UI. egui resolves widget interactions
+            // (hit-testing, clicks) against the pass's input state; the
+            // dialog used to be updated *after* the pass ended, so its
+            // window was rendered a frame late and its widgets' clicks were
+            // evaluated against stale input — only scroll and keyboard (which
+            // bypass widget-level hit tests) reached it. Inside the pass it
+            // behaves exactly like the rest of the Configuration UI.
+            file_dialog.update(ctx);
         });
 
         if let Some(s) = new_status {
             self.status = Some(s);
         }
-        // Run the native folder picker (no-op unless it is open) and apply a
-        // picked directory to the screenshot path, so the auto-save below
-        // persists it on this very frame.
-        self.file_dialog.update(&self.ctx);
+        // Apply a picked directory to the screenshot path, so the auto-save
+        // below persists it on this very frame.
         if let Some(path) = self.file_dialog.take_picked() {
             config.screenshot_path = path.to_string_lossy().into_owned();
         }
@@ -359,21 +367,55 @@ fn config_section(
             ui.label("Default zoom");
             // `get_or_insert` edits the real stored value (the previous
             // `unwrap_or` edited a temporary, so the setting never changed).
+            // The range starts at 0: dragging it to exactly 0 % auto-enables
+            // the "Allow 0% zoom" option below (and locks it while it stays
+            // at 0).
             ui.add(
                 egui::DragValue::new(config.default_zoom.get_or_insert(3.0))
-                    .range(1.0..=32.0)
+                    .range(0.0..=32.0)
                     .speed(0.1),
             );
             ui.end_row();
 
             ui.label("Max zoom");
-            ui.add(
-                egui::DragValue::new(&mut config.max_zoom)
-                    .range(1.0..=32.0)
-                    .speed(0.1),
-            );
-            ui.label("(1-9 keys and the wheel span 1x up to this; key 9 = max)");
+            // The parenthetical lives in the same second-column cell as the
+            // widget (wrapped in a horizontal) so it lines up with the other
+            // parentheticals instead of spilling onto a stray row.
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut config.max_zoom)
+                        .range(1.0..=32.0)
+                        .speed(0.1),
+                );
+                ui.label("(0-9 keys and the wheel span up to this; key 9 = max)");
+            });
             ui.end_row();
+
+            ui.label("Allow 0% zoom");
+            // While the default zoom is exactly 0 %, 0 % zoom is required (the
+            // app would otherwise be unable to launch at the configured
+            // default) — the option is forced on and cannot be disabled. The
+            // warning disappears as soon as the default zoom is above 0.
+            let zero_forced = config.default_zoom == Some(0.0);
+            if zero_forced {
+                config.allow_zero_zoom = true;
+            }
+            let mut allow_zero = config.allow_zero_zoom;
+            ui.horizontal(|ui| {
+                ui.add_enabled(!zero_forced, egui::Checkbox::new(&mut allow_zero, ""));
+                if zero_forced {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xe0, 0xb0, 0x50),
+                        "locked: default zoom is 0% (0% zoom is required while it stays at 0)",
+                    );
+                } else {
+                    ui.label("(enables wheel and hold-to-zoom to reach 0%; the 0 key always zooms to 0%)");
+                }
+            });
+            ui.end_row();
+            if allow_zero != config.allow_zero_zoom {
+                config.allow_zero_zoom = allow_zero;
+            }
 
             ui.label("Scroll zoom mode");
             ui.horizontal(|ui| {
@@ -404,12 +446,14 @@ fn config_section(
             ui.end_row();
 
             ui.label("Hold-to-zoom speed");
-            ui.add(
-                egui::DragValue::new(&mut config.hold_to_zoom_speed)
-                    .range(0.001..=1.0)
-                    .speed(0.005),
-            );
-            ui.label("(zoom change per pixel of vertical motion)");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut config.hold_to_zoom_speed)
+                        .range(0.001..=1.0)
+                        .speed(0.005),
+                );
+                ui.label("(zoom change per pixel of vertical motion)");
+            });
             ui.end_row();
 
             ui.label("Screenshot path");
@@ -431,9 +475,17 @@ fn config_section(
             ui.end_row();
         });
 
-    // The default zoom may never exceed the max zoom.
+    // The default zoom may never exceed the max zoom, and never sit below the
+    // configured minimum (1x) unless 0 % zoom is allowed — except that a
+    // default of exactly 0 % auto-enables the allow-zero option (handled
+    // above) so it is always reachable.
     if let Some(dz) = config.default_zoom.as_mut() {
-        *dz = (*dz).min(config.max_zoom);
+        let min_dz = if config.allow_zero_zoom || *dz == 0.0 {
+            0.0
+        } else {
+            1.0
+        };
+        *dz = (*dz).clamp(min_dz, config.max_zoom);
     }
 
     ui.add_space(10.0);
@@ -498,8 +550,9 @@ fn config_section(
 
     ui.add_space(6.0);
     ui.small(
-        "Close this window with the Close button or Escape; the magnifier's keys (zoom 1-9, MMB reset, OSD, screenshots) resume immediately. Runtime changes apply live and are auto-saved on change.",
+        "Close this window with the Close button or Escape; the magnifier's keys (zoom 0-9, MMB reset, OSD, screenshots) resume immediately. Runtime changes apply live and are auto-saved on change.",
     );
+    ui.small("Numeric keys 0-9 set zoom levels: 0 = 0%, keys 1-9 are percentages of the max zoom.");
     ui.small("Q / Esc / RMB quit Maggie when the Configuration window is closed.");
     ui.small("Middle mouse button (MMB) resets the zoom to the default.");
     ui.small("Hold-to-zoom: hold the modifier (default Super) and move the mouse up/down to zoom smoothly; left/right motion still pans normally.");
