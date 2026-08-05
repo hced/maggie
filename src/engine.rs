@@ -145,19 +145,28 @@ fn correct_toward_hand(view: (f64, f64), target: (f64, f64), bounds: (f64, f64))
     clamp_to_capture_bounds((fx, fy), bounds)
 }
 
-/// Margin (logical px) from the surface edge within which a push toward
-/// that edge places the view exactly on the capture edge (see
-/// [`EdgeReach`]). Sized to cover the observed gap: the compositor's last
-/// delivered pointer position can lag the hand's true stop by up to
-/// ~10–20 logical px when the pointer is moved fast, which is what made the
-/// view stop short of the right/bottom walls (the high edges) while
-/// left/top (position 0) always worked. Kept as small as possible so the
-/// edge does not feel magnetic during normal panning.
-const EDGE_MARGIN_LOGICAL: f64 = 20.0;
-/// The view must already be within this distance (logical px) of the wall
-/// for the edge reach to fire, so any jump it makes stays small (the
-/// delivery gap, not a large hold-to-zoom residual that is still healing).
-const EDGE_VIEW_MARGIN_LOGICAL: f64 = 28.0;
+/// The edge-reach margin scales with the pointer's per-event travel (see
+/// [`EdgeReach`]): when the pointer is moved fast, its delivered position
+/// can stop short of the physical edge (the last sample before the hand
+/// stops), so the view settles short of the wall by an amount proportional
+/// to speed — which is why slow pushes always reached the exact wall while
+/// fast flicks stopped “arbitrarily” short. The margin is `|delta| ×
+/// REACH_DELTA_FACTOR + REACH_FLOOR_LOGICAL`: small when moving slowly (no
+/// magnetic wall — parking stays precise) and large exactly when the
+/// delivery gap is large (the wall is always reachable, at any speed).
+/// Capped so a single absurd event can never magnetize a large area.
+const REACH_DELTA_FACTOR: f64 = 1.5;
+/// Floor (logical px): even a sub-pixel crawl to the edge lands the view
+/// exactly on the wall, so the exact border is always reachable.
+const REACH_FLOOR_LOGICAL: f64 = 8.0;
+/// Cap (logical px) on the reach margin: bounds the magnetic zone even for
+/// a single huge motion event.
+const REACH_MAX_LOGICAL: f64 = 120.0;
+/// Extra view-side slack (logical px) beyond the reach margin: the view may
+/// still sit slightly short of the wall from a still-healing residual; the
+/// slack lets the reach close that too without teleporting across a large
+/// residual.
+const REACH_VIEW_SLACK_LOGICAL: f64 = 8.0;
 
 /// Per-axis geometry for the hand-edge reach: the surface (pointer
 /// coordinate range) size in logical px, the capture bound in px, and the
@@ -182,25 +191,27 @@ impl EdgeReach {
     /// pans with the hand's *movement*, so its reach is bounded by the
     /// hand's delivered travel — and when the pointer is moved fast, the
     /// last delivered position can stop short of the surface edge, leaving
-    /// the view short of the wall. This closes that gap: when the pointer
-    /// is pushing toward a wall this event and its delivered position is
-    /// within `EDGE_MARGIN_LOGICAL` of the surface edge (i.e. it has been
-    /// pushed as far as it can physically go), the view is placed
-    /// **exactly** on the wall — provided it is already within
-    /// `EDGE_VIEW_MARGIN_LOGICAL` of it, so it never teleports. Pushing
-    /// away, gliding (`delta_logical == 0`), or being away from the edge
-    /// never triggers it, and the result never leaves the capture. `view`
-    /// is in capture px; `pointer` is in logical px.
+    /// the view short of the wall. This closes that gap: the reach margin
+    /// scales with this event's own travel (`|delta|`), because the delivery
+    /// gap is at most one event's travel. So a slow push near the edge keeps
+    /// a small margin (no magnetic wall — you can park anywhere), while a
+    /// fast flick toward the edge gets a margin large enough to bridge the
+    /// gap and land the view **exactly** on the wall, at any speed. The
+    /// view must already be within the (scaled) margin of the wall so it
+    /// never teleports across a large still-healing residual. Pushing away,
+    /// gliding (`delta_logical == 0`), or being away from the edge never
+    /// triggers it, and the result never leaves the capture. `view` is in
+    /// capture px; `pointer` is in logical px.
     fn apply(self, view: f64, delta_logical: f64, pointer: f64) -> f64 {
-        let near_left = pointer <= EDGE_MARGIN_LOGICAL;
-        let near_right = pointer >= self.surface - EDGE_MARGIN_LOGICAL;
+        let margin =
+            (delta_logical.abs() * REACH_DELTA_FACTOR + REACH_FLOOR_LOGICAL).min(REACH_MAX_LOGICAL);
+        let view_margin = (margin + REACH_VIEW_SLACK_LOGICAL) * self.scale;
         if delta_logical > 0.0
-            && near_right
-            && view >= self.bounds - EDGE_VIEW_MARGIN_LOGICAL * self.scale
+            && pointer >= self.surface - margin
+            && view >= self.bounds - view_margin
         {
             self.bounds
-        } else if delta_logical < 0.0 && near_left && view <= EDGE_VIEW_MARGIN_LOGICAL * self.scale
-        {
+        } else if delta_logical < 0.0 && pointer <= margin && view <= view_margin {
             0.0
         } else {
             view
@@ -831,16 +842,16 @@ impl PointerHandler for MagnifierWindow {
                             // Reach the exact edge when the hand reaches the
                             // physical edge: the compositor's last delivered
                             // pointer position can lag the hand's true stop
-                            // by several logical px when it is moved fast,
-                            // which made the view stop short of the
-                            // right/bottom walls while left/top always
-                            // worked. When the hand is pushed into an edge
-                            // (its delivered position is within
-                            // EDGE_MARGIN_LOGICAL of the surface edge) and
-                            // the view is already near the wall, the view is
-                            // placed exactly on it (see [`reach_wall_edge`]).
-                            // The correction above can never fight this, and
-                            // the view never leaves the capture.
+                            // by up to one event's travel when it is moved
+                            // fast (the delivered position is sampled before
+                            // the hand actually stops), which made the view
+                            // stop short of the walls at speed while slow
+                            // motion always reached. The reach margin scales
+                            // with this event's own travel so it always
+                            // bridges the gap at any speed (see
+                            // [`EdgeReach::apply`]). The correction above can
+                            // never fight this, and the view never leaves the
+                            // capture.
                             let reach_x = EdgeReach::new(self.width as f64, bounds.0, sx);
                             let reach_y = EdgeReach::new(self.height as f64, bounds.1, sy);
                             self.view_center = Some((
@@ -878,6 +889,11 @@ impl PointerHandler for MagnifierWindow {
                                 hand_content = ?hand_content,
                                 residual = ?residual,
                                 delta = ?(dx, dy),
+                                reach_margin = {
+                                    let m = (dx.abs() * REACH_DELTA_FACTOR + REACH_FLOOR_LOGICAL)
+                                        .min(REACH_MAX_LOGICAL);
+                                    format!("{:.1}", m)
+                                },
                                 zoom = self.state.zoom,
                                 "near-edge motion"
                             );
@@ -2111,6 +2127,42 @@ mod tests {
         }
         assert!(seen_left_edge, "view must reach the exact left edge");
         assert!(seen_right_edge, "view must reach the exact right edge");
+    }
+
+    #[test]
+    fn reach_margin_scales_with_event_travel() {
+        // The reach margin is proportional to the pointer's per-event travel:
+        // a fast flick whose delivered position stops well short of the
+        // surface edge (up to one event's travel) still lands the view
+        // exactly on the wall, while a slow push keeps a small margin so the
+        // edge is never magnetic.
+        let scale = 1.5;
+        let surface = 2133.0;
+        let bounds = 3200.0;
+        let reach = EdgeReach::new(surface, bounds, scale);
+        // Fast flick: 60 logical px short of the edge, event travel 40 px
+        // (margin = 68 px) -> the gap is bridged, view lands on the wall.
+        assert_eq!(reach.apply(3150.0, 40.0, surface - 60.0), bounds);
+        // The same shortfall at slow speed (travel 1 px, margin ~9.5 px)
+        // does not bridge it: the view stays put (no magnetic wall).
+        assert_eq!(reach.apply(3150.0, 1.0, surface - 60.0), 3150.0);
+        // Pushing away from the edge never triggers, however large the
+        // travel (here: pushing left while the pointer sits near the right
+        // edge).
+        assert_eq!(reach.apply(3150.0, -40.0, surface - 10.0), 3150.0);
+        // A view far from the wall never triggers (no teleports).
+        assert_eq!(reach.apply(2500.0, 40.0, surface - 60.0), 2500.0);
+    }
+
+    #[test]
+    fn reach_margin_is_capped() {
+        // The margin is capped (REACH_MAX_LOGICAL) so a single absurd event
+        // cannot create a huge magnetic zone: a pointer 150 logical px short
+        // of the edge never triggers even with extreme travel.
+        let reach = EdgeReach::new(2133.0, 3200.0, 1.5);
+        assert_eq!(reach.apply(3100.0, 500.0, 2133.0 - 150.0), 3100.0);
+        // A 1000 px travel still fires within the cap (margin = 120 px).
+        assert_eq!(reach.apply(3150.0, 1000.0, 2133.0 - 100.0), 3200.0);
     }
 
     #[test]
