@@ -37,6 +37,12 @@ fn default_hold_to_zoom() -> String {
     "Space".to_string()
 }
 
+/// Default key that toggles the effective screenshot scale (real size vs
+/// magnified) while in Screenshot Mode.
+fn default_screenshot_scale_toggle() -> String {
+    "v".to_string()
+}
+
 /// Default zoom-per-pixel rate for hold-to-zoom vertical motion.
 fn default_hold_to_zoom_speed() -> f64 {
     0.05
@@ -70,8 +76,46 @@ pub struct MagnifierConfig {
     pub keybindings: Keybindings,
     pub screenshot_path: String,
     pub screenshot_filename_pattern: String,
+    /// RGB color of the selection rectangle border shown in Screenshot Mode
+    /// (manual/fullscreen selection). Default: orange.
+    #[serde(default = "default_screenshot_selection_color")]
+    pub screenshot_selection_color: [u8; 3],
+    /// Whether saved screenshots are the real pixels of the selection or the
+    /// selection magnified to the current zoom level.
+    #[serde(default)]
+    pub screenshot_scale: ScreenshotScale,
     #[serde(default)]
     pub show_osd: bool,
+}
+
+/// What the saved screenshot represents: the real pixels of the selected
+/// region, or the same region scaled up to the current magnifier zoom.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenshotScale {
+    /// Real size: 1 saved pixel = 1 captured pixel (default).
+    #[default]
+    Real,
+    /// The selected region magnified to the current zoom level (nearest
+    /// neighbor, matching the crisp magnifier look). At zoom below 1×
+    /// (the fully-zoomed-out view) the saved image is clamped to real size.
+    Magnified,
+}
+
+impl ScreenshotScale {
+    /// Human-readable label, shared by the Configuration dropdown and the
+    /// Screenshot-Mode Key Legend.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ScreenshotScale::Real => "real size",
+            ScreenshotScale::Magnified => "magnified",
+        }
+    }
+}
+
+/// Default screenshot selection border color (orange).
+fn default_screenshot_selection_color() -> [u8; 3] {
+    [255, 153, 0]
 }
 
 impl MagnifierConfig {
@@ -114,6 +158,10 @@ pub struct Keybindings {
     /// to "Super" (the Super/Mod key, either side).
     #[serde(default = "default_hold_to_zoom")]
     pub hold_to_zoom: String,
+    /// Toggle the effective screenshot scale (real vs magnified) while in
+    /// Screenshot Mode. Defaults to "v".
+    #[serde(default = "default_screenshot_scale_toggle")]
+    pub screenshot_scale_toggle: String,
 }
 
 impl Default for Keybindings {
@@ -133,7 +181,7 @@ impl Default for MagnifierConfig {
             allow_zero_zoom: false,
             keybindings: Keybindings {
                 toggle_osd: "k".to_string(),
-                screenshot_manual: "s".to_string(),
+                screenshot_manual: "g".to_string(),
                 screenshot_window: "w".to_string(),
                 screenshot_fullscreen: "f".to_string(),
                 config_window: "Tab".to_string(),
@@ -144,9 +192,12 @@ impl Default for MagnifierConfig {
                 reset_zoom: "r".to_string(),
                 toggle_cursor: "c".to_string(),
                 hold_to_zoom: "Space".to_string(),
+                screenshot_scale_toggle: "v".to_string(),
             },
+            screenshot_scale: ScreenshotScale::Real,
             screenshot_path: "~/Pictures".to_string(),
             screenshot_filename_pattern: "maggie_%Y%m%d_%H%M%S.png".to_string(),
+            screenshot_selection_color: [255, 153, 0],
             show_osd: true,
         }
     }
@@ -212,6 +263,13 @@ pub(crate) fn normalize_config(config: &mut MagnifierConfig) {
     // default the user asked for.
     if config.keybindings.hold_to_zoom == "Super" {
         config.keybindings.hold_to_zoom = "Space".to_string();
+    }
+    // Migration: the manual-screenshot (Screenshot Mode) key moved from `S`
+    // to `G` so the WASD keys are owned by selection-border nudging (S
+    // collided with the nudge-down key). Config files carrying the old
+    // default migrate; other explicit bindings are left alone.
+    if config.keybindings.screenshot_manual == "s" {
+        config.keybindings.screenshot_manual = "g".to_string();
     }
 }
 
@@ -310,6 +368,38 @@ mod tests {
     }
 
     #[test]
+    fn old_s_manual_screenshot_key_migrates_to_g() {
+        // The manual-screenshot key moved from S to G (so the WASD keys are
+        // owned by border nudging in Screenshot Mode); configs carrying the
+        // old default migrate on load, while a different explicit binding is
+        // left alone.
+        let mut old = MagnifierConfig {
+            keybindings: Keybindings {
+                screenshot_manual: "s".to_string(),
+                ..Keybindings::default()
+            },
+            ..MagnifierConfig::default()
+        };
+        normalize_config(&mut old);
+        assert_eq!(old.keybindings.screenshot_manual, "g");
+
+        let mut custom = MagnifierConfig {
+            keybindings: Keybindings {
+                screenshot_manual: "x".to_string(),
+                ..Keybindings::default()
+            },
+            ..MagnifierConfig::default()
+        };
+        normalize_config(&mut custom);
+        assert_eq!(custom.keybindings.screenshot_manual, "x");
+        // And the new default is G.
+        assert_eq!(
+            MagnifierConfig::default().keybindings.screenshot_manual,
+            "g"
+        );
+    }
+
+    #[test]
     fn config_with_removed_edge_fill_field_still_loads() {
         // Configs written while the `htz_edge_behavior` / `htz_edge_fill`
         // options existed still load (ron ignores unknown fields).
@@ -327,6 +417,8 @@ mod tests {
         assert_eq!(legacy.keybindings.hold_to_zoom, "Space");
         assert_eq!(legacy.keybindings.config_window, "Tab");
         assert_eq!(legacy.screenshot_path, "x");
+        // Newer keybindings added since this config was written get defaults.
+        assert_eq!(legacy.keybindings.screenshot_scale_toggle, "v");
     }
 }
 

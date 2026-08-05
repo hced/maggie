@@ -344,6 +344,55 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_legend_renders_distinct_lines() {
+        // Regression: the Screenshot-Mode legend must render as one distinct
+        // text band per line (one item per line, like the normal legend), not
+        // crammed into a single merged row.
+        let lines = vec![
+            "maggie  screenshot mode".to_string(),
+            "drag  select".to_string(),
+            "f  fullscreen".to_string(),
+            "Return  save".to_string(),
+            "Esc  cancel".to_string(),
+            "WASD  nudge border".to_string(),
+            "v  scale: real size".to_string(),
+        ];
+        let sprite = build_osd_sprite(&lines, (16, 16), 800, 600).unwrap();
+        // Count distinct horizontal bands that contain text pixels.
+        let mut bands = Vec::new();
+        let mut current: Option<(i32, i32)> = None;
+        for y in 0..sprite.height {
+            // Text pixels are light gray (R > 200); the box is opaque black.
+            let has_text = (0..sprite.width).any(|x| {
+                let i = ((y as usize) * (sprite.width as usize) + x as usize) * 4;
+                sprite.buffer.data[i] > 200
+            });
+            match (has_text, &mut current) {
+                (true, None) => current = Some((y, y)),
+                (true, Some((_, end))) => *end = y,
+                (false, Some(_)) => bands.push(current.take().unwrap()),
+                (false, None) => {}
+            }
+        }
+        if let Some(b) = current {
+            bands.push(b);
+        }
+        assert_eq!(
+            bands.len(),
+            lines.len(),
+            "expected {} text bands, got {bands:?}",
+            lines.len()
+        );
+        // Bands are stacked with a gap (newline) between them.
+        for pair in bands.windows(2) {
+            assert!(
+                pair[1].0 - pair[0].1 > 1,
+                "no newline gap between bands {pair:?}"
+            );
+        }
+    }
+
+    #[test]
     fn draw_osd_places_box_and_text() {
         let mut canvas = vec![0u8; 200 * 200 * 4];
         let lines = vec![

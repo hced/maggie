@@ -111,6 +111,7 @@ pub struct GpuRenderer {
     frame_tex: GLuint,
     osd_tex: GLuint,
     cursor_tex: GLuint,
+    overlay_tex: GLuint,
     a_pos_loc: GLint,
     u_src_loc: GLint,
     u_rect_loc: GLint,
@@ -237,6 +238,7 @@ impl GpuRenderer {
         let mut frame_tex = 0;
         let mut osd_tex = 0;
         let mut cursor_tex = 0;
+        let mut overlay_tex = 0;
         unsafe {
             gles2::GenVertexArraysOES(1, &mut vao);
             gles2::BindVertexArrayOES(vao);
@@ -324,6 +326,30 @@ impl GpuRenderer {
                 gles2::TEXTURE_WRAP_T,
                 gles2::CLAMP_TO_EDGE as GLint,
             );
+            // Screenshot-mode overlay texture (selection scrim + border),
+            // uploaded per frame only while Screenshot Mode is active.
+            gles2::GenTextures(1, &mut overlay_tex);
+            gles2::BindTexture(gles2::TEXTURE_2D, overlay_tex);
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_MIN_FILTER,
+                gles2::NEAREST as GLint,
+            );
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_MAG_FILTER,
+                gles2::NEAREST as GLint,
+            );
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_WRAP_S,
+                gles2::CLAMP_TO_EDGE as GLint,
+            );
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_WRAP_T,
+                gles2::CLAMP_TO_EDGE as GLint,
+            );
             gles2::UseProgram(program);
             gles2::Uniform1i(u_tex_loc, 0);
             gles2::UseProgram(sprite_program);
@@ -346,6 +372,7 @@ impl GpuRenderer {
             frame_tex,
             osd_tex,
             cursor_tex,
+            overlay_tex,
             a_pos_loc,
             u_src_loc,
             u_rect_loc,
@@ -475,18 +502,28 @@ impl GpuRenderer {
     }
 
     /// Draw one frame: the magnified view (source rect in normalized texture
-    /// coordinates) optionally overlaid with an OSD sprite, then present.
+    /// coordinates) optionally overlaid with the screenshot selection overlay
+    /// (a fullscreen scrim + border sprite), an OSD sprite and the magnified
+    /// cursor, then present.
     ///
     /// `src` is `(x, y, w, h)` in texture space (0.0..1.0) — it may extend
     /// outside that square when the view reaches past the capture edge (the
     /// magnified cursor always sits at the viewport center, so near the
     /// screen edges the view samples past the frozen frame; those texels are
-    /// painted black by the shader).
+    /// painted black by the shader). `overlay` is a full-buffer RGBA sprite
+    /// drawn (blended) over the frame and under the cursor/OSD; only used in
+    /// Screenshot Mode. `upload_overlay` controls whether the overlay pixels
+    /// are re-uploaded to the texture this frame: the engine only rebuilds
+    /// the overlay when the selection changed and passes `false` otherwise,
+    /// so plain pointer motion in Screenshot Mode never re-uploads the
+    /// full-screen buffer (which made the mouse laggy).
     pub fn draw(
         &mut self,
         src: Option<(f64, f64, f64, f64)>,
         osd: Option<&OsdSprite>,
         cursor: Option<CursorSprite>,
+        overlay: Option<&RgbaBuffer>,
+        upload_overlay: bool,
     ) {
         unsafe {
             gles2::Viewport(0, 0, self.width, self.height);
@@ -529,6 +566,42 @@ impl GpuRenderer {
                     w as GLfloat,
                     h as GLfloat,
                 );
+                gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
+            }
+
+            // Screenshot-mode overlay: a fullscreen sprite with the selection
+            // scrim + colored border, alpha-blended over the frame (below the
+            // cursor and OSD legend). The texture is re-uploaded only when
+            // the overlay content changed (`upload_overlay`); otherwise the
+            // previous upload is reused — cheap per-frame pointer motion.
+            if let Some(overlay) = overlay {
+                gles2::Enable(gles2::BLEND);
+                gles2::BlendFunc(gles2::SRC_ALPHA, gles2::ONE_MINUS_SRC_ALPHA);
+                gles2::ActiveTexture(gles2::TEXTURE0);
+                gles2::BindTexture(gles2::TEXTURE_2D, self.overlay_tex);
+                gles2::UseProgram(self.sprite_program);
+                if upload_overlay {
+                    gles2::TexImage2D(
+                        gles2::TEXTURE_2D,
+                        0,
+                        gles2::RGBA as GLint,
+                        overlay.width,
+                        overlay.height,
+                        0,
+                        gles2::RGBA,
+                        gles2::UNSIGNED_BYTE,
+                        overlay.data.as_ptr() as *const GLvoid,
+                    );
+                }
+                let verts: [GLfloat; 12] =
+                    [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+                gles2::BufferData(
+                    gles2::ARRAY_BUFFER,
+                    size_of_val(&verts) as GLsizeiptr,
+                    verts.as_ptr() as *const GLvoid,
+                    gles2::STREAM_DRAW,
+                );
+                gles2::Uniform4f(self.u_rect_loc, 0.0, 0.0, 1.0, 1.0);
                 gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
             }
 

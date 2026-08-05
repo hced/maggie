@@ -473,6 +473,33 @@ fn config_section(
                     .desired_width(320.0),
             );
             ui.end_row();
+
+            ui.label("Screenshot selection color");
+            ui.horizontal(|ui| {
+                ui.color_edit_button_srgb(&mut config.screenshot_selection_color);
+                ui.label("(border color of the selection rectangle in screenshot mode)");
+            });
+            ui.end_row();
+
+            ui.label("Default screenshot scale");
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("screenshot_scale")
+                    .selected_text(config.screenshot_scale.name())
+                    .show_ui(ui, |ui| {
+                        for mode in [
+                            crate::config::ScreenshotScale::Real,
+                            crate::config::ScreenshotScale::Magnified,
+                        ] {
+                            ui.selectable_value(
+                                &mut config.screenshot_scale,
+                                mode,
+                                mode.name(),
+                            );
+                        }
+                    });
+                ui.label("(real = saved pixels, magnified = scaled to current zoom)");
+            });
+            ui.end_row();
         });
 
     // The default zoom may never exceed the max zoom, and never sit below the
@@ -513,6 +540,11 @@ fn config_section(
                 ui,
                 "Screenshot window",
                 &mut config.keybindings.screenshot_window,
+            );
+            key_row(
+                ui,
+                "Toggle screenshot scale",
+                &mut config.keybindings.screenshot_scale_toggle,
             );
             key_row(
                 ui,

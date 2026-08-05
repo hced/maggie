@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 
 use smithay_client_toolkit::compositor::CompositorHandler;
 use smithay_client_toolkit::compositor::CompositorState;
@@ -44,6 +45,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 };
 
 use crate::capture::CaptureManager;
+use crate::capture::ScreenshotRegion;
 use crate::config::MagnifierConfig;
 use crate::config_window::ConfigWindow;
 use crate::config_window::UiResult;
@@ -175,6 +177,17 @@ const REACH_VIEW_SLACK_LOGICAL: f64 = 8.0;
 /// a delivery staleness of a few frames, short enough that a slow crawl
 /// right after a fast phase loses the inflated margin within a few events.
 const REACH_HISTORY_LEN: usize = 4;
+
+/// App-side key repeat for held Screenshot-Mode nudge keys: the delay before
+/// the first repeat fires, then the interval between repeats (~30 Hz). The
+/// repeat is driven by the **event loop itself** (a bounded poll timeout in
+/// `dispatch_with_timeout`, plus `fire_repeat_nudges` in `draw_frame`)
+/// because the compositor (niri et al.) may not send `wl_keyboard`
+/// repeated-key events to clients using a manual event loop (sctk 0.21's
+/// repeat engine needs a calloop `LoopHandle`, which this app does not run),
+/// and frame callbacks proved unreliable as a repeat clock on niri.
+const NUDGE_REPEAT_DELAY_MS: u64 = 400;
+const NUDGE_REPEAT_INTERVAL_MS: u64 = 33;
 /// The reach margin (logical px) for one axis, sized from the pointer's
 /// recent peak travel: `peak × REACH_DELTA_FACTOR + REACH_FLOOR_LOGICAL`,
 /// capped at [`REACH_MAX_LOGICAL`].
@@ -261,6 +274,374 @@ fn zoom_readout(zoom: f64, fit: f64) -> String {
         "0x".to_string()
     } else {
         format!("{zoom:.2}x")
+    }
+}
+
+/// Normalize a screenshot drag (anchor, live pointer) into an axis-aligned
+/// selection rectangle in capture px, clamped to the capture bounds with a
+/// minimum size of 1 px per axis (a plain click without drag still yields a
+/// valid, nudgeable rectangle).
+fn normalize_screenshot_rect(
+    p0: (f64, f64),
+    p1: (f64, f64),
+    bounds: (f64, f64),
+) -> (f64, f64, f64, f64) {
+    // The bounds are the capture size (always >= 1 px), but guard the clamps
+    // anyway so degenerate bounds can never panic `f64::clamp`.
+    let bx = bounds.0.max(1.0);
+    let by = bounds.1.max(1.0);
+    let x0 = p0.0.min(p1.0).clamp(0.0, bx - 1.0);
+    let y0 = p0.1.min(p1.1).clamp(0.0, by - 1.0);
+    let x1 = p0.0.max(p1.0).clamp(1.0, bx).max(x0 + 1.0).min(bx);
+    let y1 = p0.1.max(p1.1).clamp(1.0, by).max(y0 + 1.0).min(by);
+    (x0, y0, x1, y1)
+}
+
+/// One edge of the screenshot selection rectangle. The border under the
+/// magnified cursor (its 'click anchor' — the viewport center, which is where
+/// the cursor sprite sits) is the one WASD nudges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenshotBorder {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// The screenshot-mode overlay cache key: whether the mode is active, the
+/// selection rect (capture px) the overlay was filled for, and the active
+/// border highlighted at that time. Rebuilding on rect *or* active-border
+/// change keeps the highlight honest while plain pointer motion (which
+/// rarely flips the active border) stays smooth.
+type ScreenshotOverlayState = (bool, Option<(f64, f64, f64, f64)>, Option<ScreenshotBorder>);
+
+/// Distance from `(px, py)` to the line segment `(ax, ay)`–`(bx, by)`.
+/// Used for border detection so the *visible* drawn edge (a finite segment)
+/// is what counts, not an infinite line through it.
+fn dist_point_to_segment(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 {
+        (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let cx = ax + t * dx;
+    let cy = ay + t * dy;
+    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
+}
+
+/// The selection edge closest to `point` (capture px). Distances are measured
+/// to the **visible border segments** (the four drawn edges of the rectangle,
+/// each a finite line between two corners) — not to infinite lines through
+/// the edges — so for a wide rectangle a cursor far to the right selects the
+/// short right edge, not the long top/bottom edges. Ties are broken
+/// deterministically in the order left < right < top < bottom.
+fn active_screenshot_border(rect: (f64, f64, f64, f64), point: (f64, f64)) -> ScreenshotBorder {
+    let (x0, y0, x1, y1) = rect;
+    let (px, py) = point;
+    let dl = dist_point_to_segment(px, py, x0, y0, x0, y1); // left edge
+    let dr = dist_point_to_segment(px, py, x1, y0, x1, y1); // right edge
+    let dt = dist_point_to_segment(px, py, x0, y0, x1, y0); // top edge
+    let db = dist_point_to_segment(px, py, x0, y1, x1, y1); // bottom edge
+    let mut best = ScreenshotBorder::Left;
+    let mut best_d = dl;
+    if dr < best_d {
+        best = ScreenshotBorder::Right;
+        best_d = dr;
+    }
+    if dt < best_d {
+        best = ScreenshotBorder::Top;
+        best_d = dt;
+    }
+    if db < best_d {
+        best = ScreenshotBorder::Bottom;
+    }
+    best
+}
+
+/// Nudge the selection by 1 capture px. The **active border** (always the one
+/// closest to the cursor — no proximity requirement) is moveable in all four
+/// WASD directions: on its own axis the key moves the border (W/S move
+/// horizontal top/bottom edges up/down, A/D move vertical left/right edges
+/// left/right), and **off-axis the whole rectangle translates** along the
+/// key's direction (A/D on a horizontal border move the whole rect
+/// horizontally, W/S on a vertical border move it vertically). The rectangle
+/// never collapses below 1 px per axis, never leaves the capture bounds, and
+/// a translate never shrinks it (it simply doesn't move at the edge).
+fn nudge_screenshot_border(
+    rect: (f64, f64, f64, f64),
+    border: ScreenshotBorder,
+    key: char,
+    bounds: (f64, f64),
+) -> (f64, f64, f64, f64) {
+    let (mut x0, mut y0, mut x1, mut y1) = rect;
+    match (border, key) {
+        // On-axis: move the border itself.
+        (ScreenshotBorder::Top, 'w') => y0 = (y0 - 1.0).max(0.0),
+        (ScreenshotBorder::Top, 's') => y0 = (y0 + 1.0).min(y1 - 1.0),
+        (ScreenshotBorder::Bottom, 'w') => y1 = (y1 - 1.0).max(y0 + 1.0),
+        (ScreenshotBorder::Bottom, 's') => y1 = (y1 + 1.0).min(bounds.1),
+        (ScreenshotBorder::Left, 'a') => x0 = (x0 - 1.0).max(0.0),
+        (ScreenshotBorder::Left, 'd') => x0 = (x0 + 1.0).min(x1 - 1.0),
+        (ScreenshotBorder::Right, 'a') => x1 = (x1 - 1.0).max(x0 + 1.0),
+        (ScreenshotBorder::Right, 'd') => x1 = (x1 + 1.0).min(bounds.0),
+        // Off-axis: translate the whole rectangle along the key's direction
+        // (only when it stays fully inside the capture, so it never shrinks).
+        (ScreenshotBorder::Top | ScreenshotBorder::Bottom, 'a') if x0 - 1.0 >= 0.0 => {
+            x0 -= 1.0;
+            x1 -= 1.0;
+        }
+        (ScreenshotBorder::Top | ScreenshotBorder::Bottom, 'd') if x1 + 1.0 <= bounds.0 => {
+            x0 += 1.0;
+            x1 += 1.0;
+        }
+        (ScreenshotBorder::Left | ScreenshotBorder::Right, 'w') if y0 - 1.0 >= 0.0 => {
+            y0 -= 1.0;
+            y1 -= 1.0;
+        }
+        (ScreenshotBorder::Left | ScreenshotBorder::Right, 's') if y1 + 1.0 <= bounds.1 => {
+            y0 += 1.0;
+            y1 += 1.0;
+        }
+        _ => {}
+    }
+    (x0, y0, x1, y1)
+}
+
+/// Fill one solid rectangle of pixels (RGBA `px`) in an overlay/canvas.
+/// Clamped to the buffer; empty when `x1 <= x0` or `y1 <= y0`.
+#[allow(clippy::too_many_arguments)]
+fn fill_px(
+    ov: &mut [u8],
+    width: i32,
+    height: i32,
+    x0: i32,
+    x1: i32,
+    y0: i32,
+    y1: i32,
+    px: [u8; 4],
+) {
+    let x0 = x0.clamp(0, width);
+    let x1 = x1.clamp(0, width);
+    let y0 = y0.clamp(0, height);
+    let y1 = y1.clamp(0, height);
+    // A degenerate or inverted range (e.g. a selection narrower than its own
+    // border) is a no-op — never a `ov[start..end]` panic.
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for y in y0..y1 {
+        let row = (y as usize) * (width as usize) * 4;
+        let start = row + (x0 as usize) * 4;
+        let end = row + (x1 as usize) * 4;
+        for chunk in ov[start..end].chunks_exact_mut(4) {
+            chunk.copy_from_slice(&px);
+        }
+    }
+}
+
+/// Fill a screenshot-mode overlay buffer (RGBA, tightly packed `width*4` rows)
+/// with the selection scrim + border: pixels inside the selection are
+/// transparent, the `border_px`-thick edge frame is the selection color, and
+/// everything outside is a dim translucent black so the selection pops. The
+/// **active border** (the one WASD nudges — always the edge closest to the
+/// cursor, no proximity requirement) is drawn thicker and lightened so it is
+/// obvious which edge will move. With no rectangle yet (`rect == None`) a
+/// light full-screen scrim signals the mode. `rect` is in the overlay's own
+/// pixel coordinates (logical px on the CPU path, RENDER_SCALE-scaled on the
+/// GPU path). Filled with row segments (not per-pixel branches) so rebuilding
+/// the overlay after a nudge or drag is cheap.
+/// Flip the effective screenshot scale (real size <-> magnified).
+fn toggle_screenshot_scale(mode: crate::config::ScreenshotScale) -> crate::config::ScreenshotScale {
+    match mode {
+        crate::config::ScreenshotScale::Real => crate::config::ScreenshotScale::Magnified,
+        crate::config::ScreenshotScale::Magnified => crate::config::ScreenshotScale::Real,
+    }
+}
+
+/// Advance a repeat deadline past `now` by whole `interval` steps (drift-free
+/// cadence): repeats land on a steady grid even when frames arrive late, and
+/// a burst of late frames can never fire more than one repeat per interval.
+fn advance_repeat_deadline(
+    now: std::time::Instant,
+    next_at: std::time::Instant,
+    interval: std::time::Duration,
+) -> std::time::Instant {
+    let mut deadline = next_at;
+    while now >= deadline {
+        deadline += interval;
+    }
+    deadline
+}
+
+fn fill_screenshot_overlay(
+    overlay: &mut [u8],
+    width: i32,
+    height: i32,
+    rect: Option<(f64, f64, f64, f64)>,
+    color: [u8; 3],
+    border_px: i32,
+    active_border: Option<ScreenshotBorder>,
+) {
+    let b = border_px.max(1);
+    if rect.is_none() {
+        // No selection yet: nothing to draw — the magnified screen must look
+        // exactly as it did in the magnifier (opaque, undimmed). Still clear
+        // the whole buffer so no stale pixels from an earlier selection
+        // survive (the buffer is reused across rebuilds).
+        fill_px(overlay, width, height, 0, width, 0, height, [0, 0, 0, 0x00]);
+        return;
+    }
+    let (rx0, ry0, rx1, ry1) = rect.unwrap();
+    let (rx0, ry0, rx1, ry1) = (
+        rx0.round() as i32,
+        ry0.round() as i32,
+        rx1.round() as i32,
+        ry1.round() as i32,
+    );
+    // Fully transparent scrim: the magnified screen stays opaque and
+    // undimmed everywhere — only the opaque border ring marks the selection.
+    // The full-buffer transparent reset doubles as the "transparent interior"
+    // (the rect area is never touched again except by border bands).
+    let scrim = [0u8, 0, 0, 0x00];
+    let border = [color[0], color[1], color[2], 0xFF];
+    // The active border is thicker and lightened 60 % toward white.
+    let active = [
+        (color[0] as u16 + (255 - color[0] as u16) * 3 / 5) as u8,
+        (color[1] as u16 + (255 - color[1] as u16) * 3 / 5) as u8,
+        (color[2] as u16 + (255 - color[2] as u16) * 3 / 5) as u8,
+        0xFF,
+    ];
+    let ab = b * 2;
+    let (top_w, bot_w, left_w, right_w) = (
+        if active_border == Some(ScreenshotBorder::Top) {
+            ab
+        } else {
+            b
+        },
+        if active_border == Some(ScreenshotBorder::Bottom) {
+            ab
+        } else {
+            b
+        },
+        if active_border == Some(ScreenshotBorder::Left) {
+            ab
+        } else {
+            b
+        },
+        if active_border == Some(ScreenshotBorder::Right) {
+            ab
+        } else {
+            b
+        },
+    );
+    // Fill order: a full-screen scrim, then the transparent interior, then
+    // the border ring around the rect. Every band is bounded by the rect's
+    // own edges (`rx0..rx1`, `ry0..ry1`) — never full-width strips — so a
+    // tiny selection (e.g. the 1px rect a click produces) renders as a small
+    // outlined box instead of lines spanning the whole screen, and the
+    // interior fill can never invert (crash) when the rect is narrower than
+    // its border.
+    // 1. Reset the whole buffer (transparent) — this is also the selection's
+    //    transparent interior.
+    fill_px(overlay, width, height, 0, width, 0, height, scrim);
+    // 2. Border ring: top / bottom / left / right bands, active edge thicker
+    // and lightened toward white. The bands of the **active** edge are drawn
+    // last so they win the corner pixels where two bands meet.
+    let (top_px, bot_px, left_px, right_px) = (
+        if active_border == Some(ScreenshotBorder::Top) {
+            active
+        } else {
+            border
+        },
+        if active_border == Some(ScreenshotBorder::Bottom) {
+            active
+        } else {
+            border
+        },
+        if active_border == Some(ScreenshotBorder::Left) {
+            active
+        } else {
+            border
+        },
+        if active_border == Some(ScreenshotBorder::Right) {
+            active
+        } else {
+            border
+        },
+    );
+    // Horizontal (top/bottom) bands first, vertical (left/right) after — so a
+    // vertical active edge wins its corners; then, when the active edge is
+    // horizontal, redraw the horizontal bands so they win theirs.
+    fill_px(overlay, width, height, rx0, rx1, ry0, ry0 + top_w, top_px);
+    fill_px(overlay, width, height, rx0, rx1, ry1 - bot_w, ry1, bot_px);
+    fill_px(overlay, width, height, rx0, rx0 + left_w, ry0, ry1, left_px);
+    fill_px(
+        overlay,
+        width,
+        height,
+        rx1 - right_w,
+        rx1,
+        ry0,
+        ry1,
+        right_px,
+    );
+    match active_border {
+        Some(ScreenshotBorder::Top) => {
+            fill_px(overlay, width, height, rx0, rx1, ry0, ry0 + top_w, top_px);
+        }
+        Some(ScreenshotBorder::Bottom) => {
+            fill_px(overlay, width, height, rx0, rx1, ry1 - bot_w, ry1, bot_px);
+        }
+        _ => {}
+    }
+}
+
+/// Nearest-neighbor upscale a tightly packed RGBA buffer by `scale` (>= 1).
+/// Returns `(data, new_width, new_height)`. Used to save a magnified
+/// screenshot: the selected region scaled to the current zoom, matching the
+/// crisp pixelated look of the magnifier.
+fn upscale_nearest(src: &[u8], w: u32, h: u32, scale: f64) -> (Vec<u8>, u32, u32) {
+    let nw = ((w as f64) * scale).round().max(1.0) as u32;
+    let nh = ((h as f64) * scale).round().max(1.0) as u32;
+    let mut out = vec![0u8; (nw as usize) * (nh as usize) * 4];
+    for y in 0..nh {
+        let sy = ((y as f64) / scale) as usize;
+        for x in 0..nw {
+            let sx = ((x as f64) / scale) as usize;
+            let si = (sy * w as usize + sx) * 4;
+            let di = (y as usize * nw as usize + x as usize) * 4;
+            out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
+    (out, nw, nh)
+}
+
+/// Alpha-blend a screenshot overlay buffer (tightly packed `width*4` rows)
+/// into an RGBA canvas in place (the CPU fallback path; on the GPU path the
+/// overlay is uploaded as a texture and the sprite shader blends it).
+fn blend_overlay_into(canvas: &mut [u8], stride: i32, overlay: &[u8], width: i32, height: i32) {
+    for y in 0..height {
+        for x in 0..width {
+            let di = (y as usize * stride as usize + x as usize) * 4;
+            let si = (y as usize * width as usize + x as usize) * 4;
+            let a = overlay[si + 3] as f32 / 255.0;
+            if a <= 0.0 {
+                continue;
+            }
+            if a >= 1.0 {
+                canvas[di..di + 4].copy_from_slice(&overlay[si..si + 4]);
+            } else {
+                for c in 0..3 {
+                    canvas[di + c] = (overlay[si + c] as f32 * a
+                        + canvas[di + c] as f32 * (1.0 - a))
+                        .round() as u8;
+                }
+                canvas[di + 3] = 255;
+            }
+        }
     }
 }
 
@@ -359,6 +740,11 @@ impl EdgeReach {
         }
     }
 }
+/// Linux input event code for the left mouse button (draws the screenshot
+/// selection rectangle in Screenshot Mode).
+const BTN_LEFT: u32 = 0x110;
+/// How long the "Saved …" screenshot heads-up stays in the OSD legend.
+const SCREENSHOT_NOTICE_SECS: u64 = 4;
 /// Linux input event code for the right mouse button.
 const BTN_RIGHT: u32 = 0x111;
 /// Linux input event code for the middle mouse button (resets the zoom).
@@ -526,6 +912,52 @@ pub struct MagnifierWindow {
     config_cursor_surface: Option<wl_surface::WlSurface>,
     config_cursor_pool: Option<SlotPool>,
     config_cursor_hotspot: Option<(i32, i32)>,
+    /// Whether Screenshot Mode is active (entered with the `screenshot_manual`
+    /// key, default `S`; `F` enters it with the whole screen pre-selected).
+    /// While active the user drags a selection rectangle over the frozen
+    /// frame (LMB), nudges its nearest border with WASD, selects the whole
+    /// screen with `F`, saves with Return and cancels with Esc/Q/RMB.
+    screenshot_active: bool,
+    /// Whether the left mouse button is currently held to draw the selection.
+    screenshot_dragging: bool,
+    /// The drag anchor in capture px (where the LMB was pressed); the
+    /// selection rectangle spans from here to the live pointer position.
+    screenshot_drag_start: Option<(f64, f64)>,
+    /// The settled selection rectangle in capture px, normalized
+    /// `(x0, y0, x1, y1)` with `x0 <= x1` and `y0 <= y1`, clamped to the
+    /// frozen capture. `None` while in Screenshot Mode with nothing selected.
+    screenshot_rect: Option<(f64, f64, f64, f64)>,
+    /// The screenshot save scale toggled while in Screenshot Mode (`None` =
+    /// the configured `screenshot_scale` default). The toggle key flips it
+    /// between real size and magnified; reset on every mode entry.
+    effective_screenshot_scale: Option<crate::config::ScreenshotScale>,
+    /// App-side key repeat for a held WASD nudge key in Screenshot Mode:
+    /// `(key, next_deadline)`. While set, the event loop's `dispatch_with_timeout`
+    /// wakes on the deadline and `draw_frame` fires repeat nudges on the
+    /// cadence (no reliance on compositor repeat events or frame callbacks).
+    /// Cleared on key release and on leaving the mode. Tracks only the most
+    /// recent held nudge key (pressing a second key replaces the first;
+    /// releasing any nudge key clears the hold) — one direction at a time,
+    /// which is all nudging needs.
+    nudge_hold: Option<(char, std::time::Instant)>,
+    /// The magnified-cursor position offset (logical px) captured when
+    /// Screenshot Mode is entered: the difference between the viewport center
+    /// (where the cursor sprite sits) and the live pointer. The sprite then
+    /// follows the pointer *plus* this offset, so pressing the screenshot key
+    /// never jumps the cursor — it stays exactly where it was, and only
+    /// relative pointer movement moves it.
+    screenshot_cursor_offset: Option<(f64, f64)>,
+    /// Transient OSD message (e.g. "Saved ~/Pictures/...") with the time it
+    /// was set; shown in the legend for a few seconds.
+    screenshot_notice: Option<(String, std::time::Instant)>,
+    /// Cached screenshot-mode overlay buffer (dim + selection border). Only
+    /// rebuilt when the screenshot-mode state changes (mode on/off or the
+    /// selection rectangle) — plain pointer motion must NOT refill or
+    /// re-upload it, or the mouse feels laggy in Screenshot Mode.
+    screenshot_overlay: Option<RgbaBuffer>,
+    /// The screenshot-mode state `(active, selection rect)` the cached overlay
+    /// buffer was filled for; the overlay is rebuilt only when this changes.
+    screenshot_overlay_state: Option<ScreenshotOverlayState>,
     /// The egui Configuration window; present while it is open. While it is
     /// open the whole surface shows the UI and pointer/keyboard input is
     /// forwarded to it instead of driving the magnifier.
@@ -911,6 +1343,13 @@ impl PointerHandler for MagnifierWindow {
                 self.forward_pointer_to_config(event);
                 continue;
             }
+            // Screenshot Mode: pointer input draws the selection rectangle
+            // (LMB drag), cancels on RMB, and never pans the view (the
+            // selection is in capture px; the view stays put).
+            if self.screenshot_active {
+                self.handle_screenshot_pointer(event, qh);
+                continue;
+            }
             match event.kind {
                 PointerEventKind::Enter { .. } => {
                     let position = event.position;
@@ -1176,6 +1615,25 @@ impl KeyboardHandler for MagnifierWindow {
 
         let keysym_str = keysym_to_string(event.keysym);
 
+        // Screenshot Mode: `F` selects the whole screen, Return saves, Esc/Q
+        // cancel, WASD nudges the border under the cursor, and all other
+        // magnifier keys are suspended. The config-window key cancels the
+        // selection and falls through so the window still opens.
+        if self.screenshot_active {
+            if keysym_str == self.state.config.keybindings.config_window {
+                self.exit_screenshot_mode();
+            } else if keysym_str == self.state.config.keybindings.toggle_osd {
+                // The Key Legend stays toggleable in Screenshot Mode.
+                self.state.toggle_osd();
+                self.draw_frame(qh);
+                return;
+            } else {
+                self.handle_screenshot_key(event.keysym, &keysym_str);
+                self.draw_frame(qh);
+                return;
+            }
+        }
+
         // Hold-to-zoom: pressing the configured modifier arms smooth zooming.
         // The baseline is the current pointer Y, so the zoom does not jump on
         // the first motion event. While held, the motion handler zooms on
@@ -1232,13 +1690,16 @@ impl KeyboardHandler for MagnifierWindow {
             self.draw_frame(qh);
             tracing::info!("OSD toggled: {}", self.state.osd_visible);
         } else if keysym_str == config_key.screenshot_manual {
-            tracing::info!("Manual screenshot mode - not yet implemented");
+            // S: enter Screenshot Mode (drag a manual selection rectangle).
+            self.enter_screenshot_mode(false);
+            self.draw_frame(qh);
         } else if keysym_str == config_key.screenshot_window {
             tracing::info!("Window screenshot mode - not yet implemented");
         } else if keysym_str == config_key.screenshot_fullscreen {
-            if let Err(e) = self.save_screenshot() {
-                tracing::error!("Failed to save screenshot: {:#}", e);
-            }
+            // F: enter Screenshot Mode with the whole frozen frame selected
+            // (Return saves it).
+            self.enter_screenshot_mode(true);
+            self.draw_frame(qh);
         } else if keysym_str == config_key.config_window {
             self.open_config(qh);
         } else if keysym_str == config_key.anti_aliasing {
@@ -1272,7 +1733,28 @@ impl KeyboardHandler for MagnifierWindow {
         _: u32,
         event: KeyEvent,
     ) {
-        tracing::debug!("Key repeat: {:?}", event);
+        if self.screenshot_active {
+            // Screenshot Mode and the Configuration window are mutually
+            // exclusive (opening the window exits the mode, and keys are
+            // forwarded to egui before the screenshot branch runs), so the
+            // egui forwarding below is unreachable while this branch is on.
+            // Held WASD nudges repeat through the app-side timer (see
+            // `fire_repeat_nudges`), so compositor-sent repeats are only used
+            // as a fallback on compositors that deliver them — never doubled
+            // with the timer (`nudge_hold` is armed by every WASD press).
+            if self.nudge_hold.is_none() {
+                let keysym_str = keysym_to_string(event.keysym);
+                if matches!(
+                    keysym_str.as_str(),
+                    "w" | "W" | "a" | "A" | "s" | "S" | "d" | "D"
+                ) && let Some(key) = keysym_str.to_ascii_lowercase().chars().next()
+                {
+                    self.nudge_screenshot(key);
+                    self.draw_frame(qh);
+                }
+            }
+            return;
+        }
         if let Some(cw) = &mut self.config_window
             && let Some(key) = crate::config_window::keysym_to_egui_key(event.keysym)
         {
@@ -1289,6 +1771,16 @@ impl KeyboardHandler for MagnifierWindow {
         _: u32,
         event: KeyEvent,
     ) {
+        // Releasing a WASD nudge key stops its repeat (app-side repeat).
+        if self.screenshot_active && self.nudge_hold.is_some() {
+            let keysym_str = keysym_to_string(event.keysym);
+            if matches!(
+                keysym_str.as_str(),
+                "w" | "W" | "a" | "A" | "s" | "S" | "d" | "D"
+            ) {
+                self.nudge_hold = None;
+            }
+        }
         if let Some(cw) = &mut self.config_window
             && let Some(key) = crate::config_window::keysym_to_egui_key(event.keysym)
         {
@@ -1537,6 +2029,366 @@ impl MagnifierWindow {
         }
     }
 
+    /// Map a logical (viewport) position to capture px through the current
+    /// view, accounting for the letterbox when zoomed out below the
+    /// screen-filling zoom. Clamped to the capture; before the first capture
+    /// arrives it returns the input unchanged.
+    /// The center of the magnified quad in logical (viewport) px — where the
+    /// magnified cursor sprite sits in normal mode. Used to anchor the sprite
+    /// position when entering Screenshot Mode so the cursor does not jump.
+    fn viewport_center(&self) -> Option<(f64, f64)> {
+        let c = self.captured.as_ref()?;
+        let zoom = self.state.zoom.max(1e-3);
+        let view_w = self.width as f64 / zoom;
+        let view_h = self.height as f64 / zoom;
+        let dest_w = (view_w.min(c.buffer.width as f64) * zoom).round();
+        let dest_h = (view_h.min(c.buffer.height as f64) * zoom).round();
+        if dest_w <= 0.0 || dest_h <= 0.0 {
+            return None;
+        }
+        let off_x = ((self.width as f64 - dest_w) / 2.0).max(0.0);
+        let off_y = ((self.height as f64 - dest_h) / 2.0).max(0.0);
+        Some((off_x + dest_w / 2.0, off_y + dest_h / 2.0))
+    }
+
+    /// The magnified cursor's logical (viewport) position in Screenshot Mode:
+    /// the live pointer plus the mode-entry offset, clamped to the magnified
+    /// quad so it never floats in the letterbox black bars. In normal mode
+    /// the sprite is pinned to the viewport center instead.
+    fn screenshot_cursor_logical(&self) -> Option<(f64, f64)> {
+        if !self.screenshot_active {
+            return self.viewport_center();
+        }
+        let c = self.captured.as_ref()?;
+        let zoom = self.state.zoom.max(1e-3);
+        let view_w = self.width as f64 / zoom;
+        let view_h = self.height as f64 / zoom;
+        let dest_w = (view_w.min(c.buffer.width as f64) * zoom).round();
+        let dest_h = (view_h.min(c.buffer.height as f64) * zoom).round();
+        if dest_w <= 0.0 || dest_h <= 0.0 {
+            return None;
+        }
+        let off_x = ((self.width as f64 - dest_w) / 2.0).max(0.0);
+        let off_y = ((self.height as f64 - dest_h) / 2.0).max(0.0);
+        let (ox, oy) = self.screenshot_cursor_offset.unwrap_or((0.0, 0.0));
+        Some((
+            (self.pointer_position_f.0 + ox).clamp(off_x, off_x + dest_w),
+            (self.pointer_position_f.1 + oy).clamp(off_y, off_y + dest_h),
+        ))
+    }
+
+    /// The magnified cursor sprite's position in capture px (where the user
+    /// aims/draws in Screenshot Mode): the logical sprite position mapped to
+    /// capture coordinates, falling back to the raw pointer when no capture
+    /// exists yet.
+    fn screenshot_capture_position(&self) -> (f64, f64) {
+        self.screenshot_cursor_logical()
+            .map(|pos| self.logical_to_capture(pos))
+            .unwrap_or_else(|| self.logical_to_capture(self.pointer_position_f))
+    }
+
+    fn logical_to_capture(&self, pos: (f64, f64)) -> (f64, f64) {
+        let Some(c) = &self.captured else {
+            return pos;
+        };
+        let zoom = self.state.zoom.max(1e-3);
+        let view_w = self.width as f64 / zoom;
+        let view_h = self.height as f64 / zoom;
+        let dest_w = (view_w.min(c.buffer.width as f64) * zoom).round();
+        let dest_h = (view_h.min(c.buffer.height as f64) * zoom).round();
+        if dest_w <= 0.0 || dest_h <= 0.0 {
+            return pos;
+        }
+        let off_x = ((self.width as f64 - dest_w) / 2.0).max(0.0);
+        let off_y = ((self.height as f64 - dest_h) / 2.0).max(0.0);
+        let (cx, cy) = self
+            .view_center
+            .unwrap_or((c.buffer.width as f64 / 2.0, c.buffer.height as f64 / 2.0));
+        let src_x = cx - view_w / 2.0;
+        let src_y = cy - view_h / 2.0;
+        let sx = view_w / dest_w;
+        let sy = view_h / dest_h;
+        (
+            ((pos.0 - off_x) * sx + src_x).clamp(0.0, c.buffer.width as f64),
+            ((pos.1 - off_y) * sy + src_y).clamp(0.0, c.buffer.height as f64),
+        )
+    }
+
+    /// Inverse of [`Self::logical_to_capture`]: capture px to logical
+    /// (viewport) px. Unchanged before the first capture arrives.
+    fn capture_to_logical(&self, pos: (f64, f64)) -> (f64, f64) {
+        let Some(c) = &self.captured else {
+            return pos;
+        };
+        let zoom = self.state.zoom.max(1e-3);
+        let view_w = self.width as f64 / zoom;
+        let view_h = self.height as f64 / zoom;
+        let dest_w = (view_w.min(c.buffer.width as f64) * zoom).round();
+        let dest_h = (view_h.min(c.buffer.height as f64) * zoom).round();
+        if dest_w <= 0.0 || dest_h <= 0.0 {
+            return pos;
+        }
+        let off_x = ((self.width as f64 - dest_w) / 2.0).max(0.0);
+        let off_y = ((self.height as f64 - dest_h) / 2.0).max(0.0);
+        let (cx, cy) = self
+            .view_center
+            .unwrap_or((c.buffer.width as f64 / 2.0, c.buffer.height as f64 / 2.0));
+        let src_x = cx - view_w / 2.0;
+        let src_y = cy - view_h / 2.0;
+        let sx = view_w / dest_w;
+        let sy = view_h / dest_h;
+        ((pos.0 - src_x) / sx + off_x, (pos.1 - src_y) / sy + off_y)
+    }
+
+    /// Enter Screenshot Mode. `fullscreen` pre-selects the whole frozen frame
+    /// (the `F` key); otherwise the mode starts with no selection and the
+    /// user drags one out.
+    fn enter_screenshot_mode(&mut self, fullscreen: bool) {
+        self.screenshot_active = true;
+        // Each entry starts at the configured default save scale; the toggle
+        // key then flips it while in the mode.
+        self.effective_screenshot_scale = None;
+        self.screenshot_dragging = false;
+        self.screenshot_drag_start = None;
+        self.screenshot_rect = if fullscreen {
+            self.captured
+                .as_ref()
+                .map(|c| (0.0, 0.0, c.buffer.width as f64, c.buffer.height as f64))
+        } else {
+            None
+        };
+        // Anchor the magnified cursor to its current visual position (the
+        // viewport center) so entering the mode never jumps it: the sprite
+        // follows the pointer plus this offset, and only *relative* pointer
+        // movement moves it.
+        self.screenshot_cursor_offset = self.viewport_center().map(|center| {
+            (
+                center.0 - self.pointer_position_f.0,
+                center.1 - self.pointer_position_f.1,
+            )
+        });
+        tracing::info!("Screenshot mode entered (fullscreen: {fullscreen})");
+    }
+
+    /// Leave Screenshot Mode, discarding the selection.
+    fn exit_screenshot_mode(&mut self) {
+        self.screenshot_active = false;
+        self.screenshot_dragging = false;
+        self.screenshot_drag_start = None;
+        self.screenshot_rect = None;
+        self.effective_screenshot_scale = None;
+        self.nudge_hold = None;
+        self.screenshot_cursor_offset = None;
+        tracing::info!("Screenshot mode exited");
+    }
+
+    /// The screenshot save scale currently in effect: the configured
+    /// `screenshot_scale` default, overridden while in Screenshot Mode by the
+    /// scale-toggle key.
+    fn effective_screenshot_scale(&self) -> crate::config::ScreenshotScale {
+        self.effective_screenshot_scale
+            .unwrap_or(self.state.config.screenshot_scale)
+    }
+
+    /// Fire any pending repeat nudges for a held WASD key. Called from
+    /// `draw_frame` (which runs on every event and on the loop's repeat
+    /// deadline wake-ups, see [`NUDGE_REPEAT_DELAY_MS`]); the cadence is
+    /// drift-free, so a delayed wake-up never bunches up extra nudges.
+    fn fire_repeat_nudges(&mut self) {
+        let Some((key, next_at)) = self.nudge_hold else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if now < next_at {
+            return;
+        }
+        self.nudge_hold = Some((
+            key,
+            advance_repeat_deadline(
+                now,
+                next_at,
+                std::time::Duration::from_millis(NUDGE_REPEAT_INTERVAL_MS),
+            ),
+        ));
+        self.nudge_screenshot(key);
+    }
+
+    /// How long the event loop may block before the next nudge repeat is due:
+    /// `Some(remaining)` while a nudge key is held (zero if already due),
+    /// `None` (block indefinitely) when idle. The loop passes this to
+    /// [`dispatch_with_timeout`], so it wakes on the repeat deadline even
+    /// when the compositor delivers no events at all.
+    fn repeat_poll_timeout(&self) -> Option<std::time::Duration> {
+        let (_, next_at) = self.nudge_hold?;
+        let now = std::time::Instant::now();
+        Some(if now >= next_at {
+            std::time::Duration::ZERO
+        } else {
+            next_at - now
+        })
+    }
+
+    /// After a timed wait, redraw if a nudge repeat came due while the loop
+    /// was blocked with no events to wake the normal dispatch path.
+    /// `draw_frame` fires the due repeat(s) at its top.
+    fn draw_frame_if_repeat_due(&mut self, qh: &QueueHandle<Self>) {
+        let Some((_, next_at)) = self.nudge_hold else {
+            return;
+        };
+        if std::time::Instant::now() >= next_at {
+            self.draw_frame(qh);
+        }
+    }
+
+    /// Nudge the selection border closest to the magnified cursor by 1 real
+    /// capture pixel in the WASD direction. In Screenshot Mode the cursor
+    /// sprite follows the live pointer (the view stays put), so the anchor is
+    /// the pointer's capture position — the user moves the cursor next to a
+    /// border and nudges that one.
+    fn nudge_screenshot(&mut self, key: char) {
+        let Some(rect) = self.screenshot_rect else {
+            return;
+        };
+        let Some(bounds) = self
+            .captured
+            .as_ref()
+            .map(|c| (c.buffer.width as f64, c.buffer.height as f64))
+        else {
+            return;
+        };
+        // The nudge anchor is where the magnified cursor *visually* sits
+        // (pointer + mode-entry offset, clamped to the quad) — detection is
+        // based on what the user sees, not the raw hand position.
+        let border = active_screenshot_border(rect, self.screenshot_capture_position());
+        self.screenshot_rect = Some(nudge_screenshot_border(rect, border, key, bounds));
+    }
+
+    /// Whether the transient screenshot notice (e.g. "Saved …") is still
+    /// fresh enough to show (used to force the OSD legend on briefly after a
+    /// screenshot, even when the legend is otherwise toggled off).
+    fn screenshot_notice_fresh(&self) -> bool {
+        matches!(
+            &self.screenshot_notice,
+            Some((_, at)) if at.elapsed() < std::time::Duration::from_secs(SCREENSHOT_NOTICE_SECS)
+        )
+    }
+
+    /// Crop the frozen frame to `rect` (capture px) and save it as a PNG at
+    /// the configured path/filename pattern, then leave Screenshot Mode and
+    /// show a transient "Saved …" notice in the OSD.
+    fn capture_screenshot(&mut self, rect: (f64, f64, f64, f64)) {
+        let region = ScreenshotRegion {
+            x: rect.0.round() as i32,
+            y: rect.1.round() as i32,
+            width: ((rect.2 - rect.0).round() as u32).max(1),
+            height: ((rect.3 - rect.1).round() as u32).max(1),
+        };
+        match self.save_screenshot(Some(&region)) {
+            Ok(path) => {
+                self.screenshot_notice = Some((
+                    format!("Saved {}", path.display()),
+                    std::time::Instant::now(),
+                ));
+            }
+            Err(e) => {
+                self.screenshot_notice =
+                    Some((format!("Screenshot failed: {e}"), std::time::Instant::now()));
+            }
+        }
+        self.exit_screenshot_mode();
+        self.screenshot_rect = None;
+    }
+
+    /// Handle a key press while Screenshot Mode is active: `F` selects the
+    /// whole screen, Return saves the current selection, Esc/Q cancel, and
+    /// WASD nudges the border closest to the cursor. All other keys are
+    /// suspended (no zoom, no pan, no quit).
+    fn handle_screenshot_key(&mut self, keysym: Keysym, keysym_str: &str) {
+        let config_key = &self.state.config.keybindings;
+        if keysym_str == config_key.screenshot_fullscreen {
+            if let Some(c) = &self.captured {
+                self.screenshot_rect =
+                    Some((0.0, 0.0, c.buffer.width as f64, c.buffer.height as f64));
+            }
+        } else if keysym == Keysym::Return || keysym == Keysym::KP_Enter {
+            if let Some(rect) = self.screenshot_rect {
+                self.capture_screenshot(rect);
+            }
+        } else if keysym == Keysym::Escape || keysym == Keysym::q || keysym == Keysym::Q {
+            self.exit_screenshot_mode();
+        } else if keysym_str == config_key.screenshot_scale_toggle {
+            // Flip the effective save scale (real <-> magnified); the legend
+            // shows the current one and the next save honors it.
+            self.effective_screenshot_scale =
+                Some(toggle_screenshot_scale(self.effective_screenshot_scale()));
+        } else if matches!(keysym_str, "w" | "W" | "a" | "A" | "s" | "S" | "d" | "D")
+            && let Some(key) = keysym_str.to_ascii_lowercase().chars().next()
+        {
+            self.nudge_screenshot(key);
+            // Arm app-side key repeat: the event loop wakes on the repeat
+            // deadline (`dispatch_with_timeout`) and `draw_frame` fires the
+            // nudges (compositor-independent — niri does not deliver
+            // `wl_keyboard` repeated-key events to this manual-loop client).
+            // Only armed once a selection exists, so holding WASD before
+            // drawing one cannot spin pointless wake-ups.
+            if self.screenshot_rect.is_some() {
+                self.nudge_hold = Some((
+                    key,
+                    std::time::Instant::now()
+                        + std::time::Duration::from_millis(NUDGE_REPEAT_DELAY_MS),
+                ));
+            }
+        }
+    }
+
+    /// Handle a pointer event while Screenshot Mode is active: LMB drag draws
+    /// the selection, RMB cancels the mode, motion updates the drag (and the
+    /// view never pans in this mode).
+    fn handle_screenshot_pointer(&mut self, event: &PointerEvent, qh: &QueueHandle<Self>) {
+        match event.kind {
+            PointerEventKind::Motion { .. } => {
+                let position = event.position;
+                self.pointer_position_f = position;
+                self.state.pointer_position = (position.0 as i32, position.1 as i32);
+                if self.screenshot_dragging
+                    && let Some(start) = self.screenshot_drag_start
+                    && let Some(c) = &self.captured
+                {
+                    let bounds = (c.buffer.width as f64, c.buffer.height as f64);
+                    // The drag tracks the magnified cursor *sprite* (pointer
+                    // + the mode-entry offset), not the raw physical pointer:
+                    // the user aims and draws with the visible cursor, so the
+                    // rectangle must follow it, never diverge from it.
+                    let cur = self.screenshot_capture_position();
+                    self.screenshot_rect = Some(normalize_screenshot_rect(start, cur, bounds));
+                }
+                self.draw_frame(qh);
+            }
+            PointerEventKind::Press { button, .. } => {
+                if button == BTN_LEFT {
+                    let cap = self.screenshot_capture_position();
+                    self.screenshot_drag_start = Some(cap);
+                    self.screenshot_dragging = true;
+                    if let Some(c) = &self.captured {
+                        let bounds = (c.buffer.width as f64, c.buffer.height as f64);
+                        self.screenshot_rect = Some(normalize_screenshot_rect(cap, cap, bounds));
+                    }
+                } else if button == BTN_RIGHT {
+                    self.exit_screenshot_mode();
+                }
+                self.draw_frame(qh);
+            }
+            PointerEventKind::Release { button, .. } => {
+                if button == BTN_LEFT {
+                    self.screenshot_dragging = false;
+                    self.screenshot_drag_start = None;
+                }
+                self.draw_frame(qh);
+            }
+            _ => {}
+        }
+    }
+
     /// Clamp a view-center coordinate to the frozen capture's bounds
     /// (capture px). The magnified cursor sits at the viewport center, which
     /// *is* the view center: keeping the center inside the capture guarantees
@@ -1668,8 +2520,25 @@ impl MagnifierWindow {
     }
 
     fn osd_lines(&self) -> Vec<String> {
+        // Screenshot Mode shows its own instruction legend.
+        if self.screenshot_active {
+            let config_key = &self.state.config.keybindings;
+            return vec![
+                "maggie  screenshot mode".to_string(),
+                "drag  select".to_string(),
+                format!("{}  fullscreen", config_key.screenshot_fullscreen),
+                "Return  save".to_string(),
+                "Esc  cancel".to_string(),
+                "WASD  nudge border".to_string(),
+                format!(
+                    "{}  scale: {}",
+                    config_key.screenshot_scale_toggle,
+                    self.effective_screenshot_scale().name()
+                ),
+            ];
+        }
         let config_key = &self.state.config.keybindings;
-        vec![
+        let mut lines = vec![
             // At the fully-zoomed-out view the readout shows "0 %" (see
             // [`zoom_readout`]); otherwise the zoom factor.
             format!(
@@ -1692,7 +2561,15 @@ impl MagnifierWindow {
             format!("hold {} + move  smooth zoom", config_key.hold_to_zoom),
             format!("MMB / {}  reset zoom", config_key.reset_zoom),
             "Q / Esc / RMB  quit".to_string(),
-        ]
+        ];
+        // A transient notice (e.g. the path of the last saved screenshot) is
+        // shown for a few seconds after the event.
+        if let Some((message, at)) = &self.screenshot_notice
+            && at.elapsed() < std::time::Duration::from_secs(SCREENSHOT_NOTICE_SECS)
+        {
+            lines.insert(1, message.clone());
+        }
+        lines
     }
 
     fn request_frame_callback(&mut self, qh: &QueueHandle<Self>) {
@@ -1945,6 +2822,11 @@ impl MagnifierWindow {
     }
 
     fn draw_frame(&mut self, qh: &QueueHandle<Self>) {
+        // Held WASD nudge keys repeat here (on the frame-callback cadence);
+        // this runs before drawing so the selection reflects the latest
+        // nudge. No-op unless a repeat deadline is due.
+        self.fire_repeat_nudges();
+
         // Configuration window mode: paint the egui UI instead of the magnifier.
         if let Some(mut cw) = self.config_window.take() {
             let result = cw.update(&mut self.state.config);
@@ -2028,19 +2910,30 @@ impl MagnifierWindow {
 
         let lines = self.osd_lines();
 
-        // The magnified cursor is always drawn at the exact center of the
-        // viewport (the center of the magnified quad; the quad fills the
-        // screen at zoom >= 1). At 0 % zoom the sprite would be a degenerate
-        // 0x0 texture (and invisible anyway), so it is skipped entirely.
+        // The magnified cursor is drawn at the exact center of the viewport
+        // (the center of the magnified quad; the quad fills the screen at
+        // zoom >= 1) — except in Screenshot Mode, where it follows the live
+        // pointer instead (the view stays put, so the user can aim the cursor
+        // at a selection border to nudge it). Clamped to the quad so it never
+        // floats in the letterbox black bars at fit zoom. At 0 % zoom the
+        // sprite would be a degenerate 0x0 texture (and invisible anyway), so
+        // it is skipped entirely.
         let cursor_logical = if self.pointer_seen
             && zoom > 0.0
             && self.state.cursor_visible
             && self.magnified_cursor.is_some()
         {
-            Some((
-                off_x as f64 + dest_w as f64 / 2.0,
-                off_y as f64 + dest_h as f64 / 2.0,
-            ))
+            if self.screenshot_active {
+                // In Screenshot Mode the sprite follows the live pointer plus
+                // the mode-entry offset (anchored so entering the mode never
+                // jumps it), clamped to the quad.
+                self.screenshot_cursor_logical()
+            } else {
+                Some((
+                    off_x as f64 + dest_w as f64 / 2.0,
+                    off_y as f64 + dest_h as f64 / 2.0,
+                ))
+            }
         } else {
             None
         };
@@ -2051,14 +2944,52 @@ impl MagnifierWindow {
         let osd_ring = cursor_logical
             .map(|(cx, cy)| (cx as i32, cy as i32))
             .unwrap_or(self.state.pointer_position);
+        // In Screenshot Mode the legend moves to a fixed top-left corner so
+        // it never overlaps the area being selected; otherwise it follows the
+        // cursor ring as usual.
+        let osd_anchor = if self.screenshot_active {
+            (16, 16)
+        } else {
+            osd_ring
+        };
+        // The screenshot selection rectangle mapped into logical (viewport)
+        // px, and the configured border color — computed here (before the
+        // GPU/CPU branches) because those branches borrow `self` mutably and
+        // cannot call `&self` methods.
+        let screenshot_rect_logical = if self.screenshot_active {
+            self.screenshot_rect.map(|r| {
+                let a = self.capture_to_logical((r.0, r.1));
+                let b = self.capture_to_logical((r.2, r.3));
+                (a.0, a.1, b.0, b.1)
+            })
+        } else {
+            None
+        };
+        let screenshot_color = self.state.config.screenshot_selection_color;
+        // A fresh screenshot notice forces the legend on briefly, so the
+        // "Saved …" heads-up is always visible even with the legend toggled
+        // off. Computed before the GPU branch (which borrows `self.gpu`).
+        let notice_fresh = self.screenshot_notice_fresh();
+        // The active selection border — always the edge closest to the
+        // cursor, wherever it is (no proximity requirement) — highlighted in
+        // the overlay so it is obvious which edge WASD will nudge.
+        let screenshot_active_border = if self.screenshot_active {
+            self.screenshot_rect.map(|r| {
+                // Detection is based on where the magnified cursor *visibly*
+                // sits (pointer + entry offset), not the raw hand position.
+                active_screenshot_border(r, self.screenshot_capture_position())
+            })
+        } else {
+            None
+        };
 
         if let Some(gpu) = &mut self.gpu {
-            let osd = if self.state.osd_visible {
+            let osd = if self.state.osd_visible || notice_fresh {
                 crate::osd::build_osd_sprite(
                     &lines,
                     (
-                        osd_ring.0 * crate::gpu::RENDER_SCALE,
-                        osd_ring.1 * crate::gpu::RENDER_SCALE,
+                        osd_anchor.0 * crate::gpu::RENDER_SCALE,
+                        osd_anchor.1 * crate::gpu::RENDER_SCALE,
                     ),
                     self.width as i32 * crate::gpu::RENDER_SCALE,
                     self.height as i32 * crate::gpu::RENDER_SCALE,
@@ -2066,6 +2997,61 @@ impl MagnifierWindow {
             } else {
                 None
             };
+            // The screenshot selection overlay (scrim + colored border) at
+            // the RENDER_SCALE buffer resolution, uploaded as a fullscreen
+            // sprite on the GPU. It is **cached**: only rebuilt (and only
+            // re-uploaded) when the mode/selection changed — plain pointer
+            // motion reuses the existing texture, which is what keeps the
+            // mouse snappy in Screenshot Mode.
+            let lw = self.width as i32 * crate::gpu::RENDER_SCALE;
+            let lh = self.height as i32 * crate::gpu::RENDER_SCALE;
+            let overlay_state = (
+                self.screenshot_active,
+                self.screenshot_rect,
+                screenshot_active_border,
+            );
+            let size_mismatch = self
+                .screenshot_overlay
+                .as_ref()
+                .is_none_or(|b| b.width != lw || b.height != lh);
+            let rebuild = self.screenshot_overlay_state != Some(overlay_state) || size_mismatch;
+            if rebuild {
+                let mut buf = self
+                    .screenshot_overlay
+                    .take()
+                    .unwrap_or_else(|| RgbaBuffer {
+                        width: lw,
+                        height: lh,
+                        data: Vec::new(),
+                    });
+                buf.width = lw;
+                buf.height = lh;
+                buf.data.resize((lw as usize) * (lh as usize) * 4, 0);
+                if self.screenshot_active {
+                    let rect_px = screenshot_rect_logical.map(|(x0, y0, x1, y1)| {
+                        (
+                            x0 * crate::gpu::RENDER_SCALE as f64,
+                            y0 * crate::gpu::RENDER_SCALE as f64,
+                            x1 * crate::gpu::RENDER_SCALE as f64,
+                            y1 * crate::gpu::RENDER_SCALE as f64,
+                        )
+                    });
+                    fill_screenshot_overlay(
+                        &mut buf.data,
+                        lw,
+                        lh,
+                        rect_px,
+                        screenshot_color,
+                        2 * crate::gpu::RENDER_SCALE,
+                        screenshot_active_border,
+                    );
+                } else {
+                    buf.data.fill(0);
+                }
+                self.screenshot_overlay = Some(buf);
+                self.screenshot_overlay_state = Some(overlay_state);
+            }
+            let overlay = self.screenshot_overlay.as_ref();
             // The GPU buffer is RENDER_SCALE x the logical size, so both the
             // cursor sprite, its hotspot and its position must be scaled to
             // match.
@@ -2091,13 +3077,13 @@ impl MagnifierWindow {
                     view_w.min(source_w as f64) / source_w as f64,
                     view_h.min(source_h as f64) / source_h as f64,
                 );
-                gpu.draw(Some(uv), osd.as_ref(), cursor.as_ref());
+                gpu.draw(Some(uv), osd.as_ref(), cursor.as_ref(), overlay, rebuild);
             } else {
                 // 0 % zoom: the magnified view collapses to nothing — draw a
                 // plain black view (src = None clears the buffer) while the
                 // magnified cursor and OSD legend stay visible so the user
                 // can still navigate back in.
-                gpu.draw(None, osd.as_ref(), cursor.as_ref());
+                gpu.draw(None, osd.as_ref(), cursor.as_ref(), overlay, rebuild);
             }
             if self.animating {
                 self.request_frame_callback(qh);
@@ -2110,7 +3096,9 @@ impl MagnifierWindow {
                 .renderer
                 .render_bilinear(&captured.buffer, (src_x, src_y), dest_w, dest_h);
 
-        let show_osd = self.state.osd_visible;
+        // Same forced-on behavior as the GPU path: a fresh screenshot notice
+        // always shows the legend briefly.
+        let show_osd = self.state.osd_visible || notice_fresh;
         let osd_lines = self.osd_lines();
         let osd_cursor = osd_ring; // Precompute the cursor sprite up front: the fill closure below cannot
         // borrow `self` while `render_frame` holds `&mut self`.
@@ -2126,6 +3114,52 @@ impl MagnifierWindow {
                 (hx.round() as i32, hy.round() as i32),
             )
         });
+        // The screenshot overlay at logical resolution, blended into the
+        // canvas inside the render closure (which cannot borrow `self`).
+        // Cached like the GPU path: rebuilt only when the mode/selection
+        // changed.
+        let (ow, oh) = (self.width as i32, self.height as i32);
+        let overlay_state = (
+            self.screenshot_active,
+            self.screenshot_rect,
+            screenshot_active_border,
+        );
+        let size_mismatch = self
+            .screenshot_overlay
+            .as_ref()
+            .is_none_or(|b| b.width != ow || b.height != oh);
+        if self.screenshot_overlay_state != Some(overlay_state) || size_mismatch {
+            let mut buf = self
+                .screenshot_overlay
+                .take()
+                .unwrap_or_else(|| RgbaBuffer {
+                    width: ow,
+                    height: oh,
+                    data: Vec::new(),
+                });
+            buf.width = ow;
+            buf.height = oh;
+            buf.data.resize((ow as usize) * (oh as usize) * 4, 0);
+            if self.screenshot_active {
+                fill_screenshot_overlay(
+                    &mut buf.data,
+                    ow,
+                    oh,
+                    screenshot_rect_logical,
+                    screenshot_color,
+                    2,
+                    screenshot_active_border,
+                );
+            } else {
+                buf.data.fill(0);
+            }
+            self.screenshot_overlay = Some(buf);
+            self.screenshot_overlay_state = Some(overlay_state);
+        }
+        let screenshot_overlay_cpu: Option<(Vec<u8>, i32, i32)> = self
+            .screenshot_overlay
+            .as_ref()
+            .map(|b| (b.data.clone(), b.width, b.height));
 
         self.render_frame(qh, |canvas, width, height, stride| {
             canvas.fill(0);
@@ -2135,6 +3169,9 @@ impl MagnifierWindow {
                     [((y + off_y) as usize) * (stride as usize) + (off_x as usize) * 4..];
                 dest_row[..(dest_w as usize) * 4]
                     .copy_from_slice(&src_row[..(dest_w as usize) * 4]);
+            }
+            if let Some((ref overlay, ow, oh)) = screenshot_overlay_cpu {
+                blend_overlay_into(canvas, stride, overlay, ow, oh);
             }
             if let Some((cursor_pos, ref cursor_sprite, hotspot)) = cursor_buf {
                 Self::draw_cursor_at(canvas, stride, cursor_pos, cursor_sprite, hotspot);
@@ -2189,7 +3226,7 @@ impl MagnifierWindow {
 
     fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
         if let Some(gpu) = &mut self.gpu {
-            gpu.draw(None, None, None);
+            gpu.draw(None, None, None, None, false);
             return;
         }
         self.render_frame(qh, |canvas, _width, _height, _stride| {
@@ -2202,25 +3239,55 @@ impl MagnifierWindow {
         });
     }
 
-    fn save_screenshot(&mut self) -> anyhow::Result<()> {
-        let Some(captured) = &self.captured else {
-            tracing::warn!("No captured frame yet");
-            return Ok(());
+    /// Save the frozen frame (cropped to `region` when given, otherwise the
+    /// whole frame) as a PNG at the configured path/pattern, returning the
+    /// written path.
+    fn save_screenshot(&mut self, region: Option<&ScreenshotRegion>) -> anyhow::Result<PathBuf> {
+        // Crop the frozen frame first (inside the borrow of `self.captured`),
+        // then release it before touching `self.capture_manager`.
+        let (mut crop, mut w, mut h) = {
+            let Some(captured) = &self.captured else {
+                return Err(anyhow::anyhow!("No captured frame yet"));
+            };
+            let buffer = &captured.buffer;
+            let (x, y, w, h) = match region {
+                Some(r) => {
+                    let x = r.x.clamp(0, buffer.width - 1);
+                    let y = r.y.clamp(0, buffer.height - 1);
+                    let w = (r.width as i32).clamp(1, buffer.width - x) as u32;
+                    let h = (r.height as i32).clamp(1, buffer.height - y) as u32;
+                    (x, y, w, h)
+                }
+                None => (0, 0, buffer.width as u32, buffer.height as u32),
+            };
+            let mut crop = Vec::with_capacity((w as usize) * (h as usize) * 4);
+            for row in y..y + h as i32 {
+                let start = (row as usize * buffer.width as usize + x as usize) * 4;
+                crop.extend_from_slice(&buffer.data[start..start + (w as usize) * 4]);
+            }
+            (crop, w, h)
         };
+        // When the user chose the magnified scale, upscale the crop to the
+        // current zoom (nearest neighbor, matching the crisp magnifier look;
+        // clamped to real size when zoom is below 1x).
+        if self.effective_screenshot_scale() == crate::config::ScreenshotScale::Magnified {
+            let scale = self.state.zoom.max(1.0);
+            if scale > 1.0 {
+                let (scaled, nw, nh) = upscale_nearest(&crop, w, h, scale);
+                crop = scaled;
+                w = nw;
+                h = nh;
+            }
+        }
         let path = self.capture_manager.generate_screenshot_path()?;
         let file = std::fs::File::create(&path)?;
-        let buffer = &captured.buffer;
-        let mut encoder = png::Encoder::new(
-            std::io::BufWriter::new(file),
-            buffer.width as u32,
-            buffer.height as u32,
-        );
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header()?;
-        writer.write_image_data(&buffer.data)?;
+        writer.write_image_data(&crop)?;
         tracing::info!("Screenshot saved to {}", path.display());
-        Ok(())
+        Ok(path)
     }
 }
 
@@ -2316,6 +3383,16 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         config_cursor_surface: None,
         config_cursor_pool: None,
         config_cursor_hotspot: None,
+        screenshot_active: false,
+        screenshot_dragging: false,
+        screenshot_drag_start: None,
+        screenshot_rect: None,
+        effective_screenshot_scale: None,
+        nudge_hold: None,
+        screenshot_cursor_offset: None,
+        screenshot_notice: None,
+        screenshot_overlay: None,
+        screenshot_overlay_state: None,
         config_window: None,
         last_pointer_serial: None,
         hold_to_zoom_active: false,
@@ -2339,12 +3416,77 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
             break;
         }
         // Block on the display, dispatching as events arrive (pointer motion,
-        // capture Ready, frame callbacks). The first capture was already
+        // capture Ready, frame callbacks) — but never longer than until the
+        // next held-key nudge repeat is due (`None` blocks indefinitely, so
+        // idle behaviour is unchanged). The first capture was already
         // requested at first configure, so the frame appears with no delay.
-        event_queue.blocking_dispatch(&mut window)?;
+        let timeout = window.repeat_poll_timeout();
+        dispatch_with_timeout(&conn, &mut event_queue, &mut window, timeout)?;
+        // A nudge repeat may have come due while the loop was blocked with no
+        // events to wake it — fire it now (compositor-independent repeat).
+        window.draw_frame_if_repeat_due(&qh);
     }
 
     Ok(())
+}
+
+/// Block for Wayland events like `EventQueue::blocking_dispatch`, but never
+/// longer than `timeout` — the blocking poll is bounded so the event loop
+/// wakes in time to fire a pending nudge repeat even when the compositor
+/// delivers no events at all. A `None` timeout blocks indefinitely, exactly
+/// like `blocking_dispatch`.
+fn dispatch_with_timeout(
+    conn: &Connection,
+    event_queue: &mut wayland_client::EventQueue<MagnifierWindow>,
+    window: &mut MagnifierWindow,
+    timeout: Option<std::time::Duration>,
+) -> Result<usize, wayland_client::DispatchError> {
+    let dispatched = event_queue.dispatch_pending(window)?;
+    if dispatched > 0 {
+        return Ok(dispatched);
+    }
+    conn.flush()?;
+    if let Some(guard) = event_queue.prepare_read() {
+        let timeout_ts = timeout.map(|d| rustix::event::Timespec {
+            tv_sec: d.as_secs() as i64,
+            tv_nsec: d.subsec_nanos() as i64,
+        });
+        // Poll the socket, bounded by the timeout. The poll borrows the
+        // guard's fd, so it runs in an inner scope that ends before the read.
+        let ready = {
+            let fd = guard.connection_fd();
+            let mut fds = [rustix::event::PollFd::new(
+                &fd,
+                rustix::event::PollFlags::IN | rustix::event::PollFlags::ERR,
+            )];
+            loop {
+                match rustix::event::poll(&mut fds, timeout_ts.as_ref()) {
+                    Ok(_) => break,
+                    // A signal restarts the wait from the full timeout; at the
+                    // ~30 Hz repeat cadence the worst-case overshoot is one
+                    // interval, which is acceptable.
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(e) => {
+                        return Err(wayland_client::backend::WaylandError::Io(e.into()).into());
+                    }
+                }
+            }
+            fds[0].revents() & (rustix::event::PollFlags::IN | rustix::event::PollFlags::ERR)
+        };
+        // Only read when the socket is actually ready; when the timeout
+        // simply expired with no events, dropping the guard cancels the read
+        // and the caller retries on the next iteration. A WouldBlock read is
+        // treated as "no events" (mirroring `blocking_read`).
+        if !ready.is_empty() {
+            match guard.read() {
+                Ok(_) => {}
+                Err(wayland_client::backend::WaylandError::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    event_queue.dispatch_pending(window)
 }
 
 #[cfg(test)]
@@ -3064,6 +4206,358 @@ mod tests {
         // When the whole screen already fills the viewport at 1x (fit == 1),
         // there is no real zoom-out headroom: 1x reads as the factor, not 0x.
         assert_eq!(zoom_readout(1.0, 1.0), "1.00x");
+    }
+
+    #[test]
+    fn screenshot_rect_normalization_flips_and_clamps() {
+        // Dragging up/left yields a normalized rect regardless of drag order.
+        let rect = normalize_screenshot_rect((10.0, 20.0), (4.0, 6.0), (320.0, 200.0));
+        assert_eq!(rect, (4.0, 6.0, 10.0, 20.0));
+        // Dragging outside the capture clamps to the bounds.
+        let rect = normalize_screenshot_rect((-5.0, 0.0), (500.0, 300.0), (320.0, 200.0));
+        assert_eq!(rect, (0.0, 0.0, 320.0, 200.0));
+        // A plain click (no drag) still yields a valid 1px rectangle.
+        let rect = normalize_screenshot_rect((100.0, 100.0), (100.0, 100.0), (320.0, 200.0));
+        assert_eq!(rect, (100.0, 100.0, 101.0, 101.0));
+        // An edge click cannot push the rect out of bounds.
+        let rect = normalize_screenshot_rect((319.5, 199.5), (319.5, 199.5), (320.0, 200.0));
+        assert_eq!(rect, (319.0, 199.0, 320.0, 200.0));
+    }
+
+    #[test]
+    fn active_screenshot_border_picks_closest_edge() {
+        let rect = (0.0, 0.0, 100.0, 100.0);
+        // Near the middle: ties break left < right < top < bottom, so the
+        // exact center selects the left border.
+        assert_eq!(
+            active_screenshot_border(rect, (50.0, 50.0)),
+            ScreenshotBorder::Left
+        );
+        assert_eq!(
+            active_screenshot_border(rect, (99.0, 50.0)),
+            ScreenshotBorder::Right
+        );
+        assert_eq!(
+            active_screenshot_border(rect, (50.0, 1.0)),
+            ScreenshotBorder::Top
+        );
+        assert_eq!(
+            active_screenshot_border(rect, (50.0, 98.0)),
+            ScreenshotBorder::Bottom
+        );
+        // A corner-ish point: left edge wins over top when horizontally closer.
+        assert_eq!(
+            active_screenshot_border(rect, (2.0, 20.0)),
+            ScreenshotBorder::Left
+        );
+        // A wide rectangle: a cursor far to the right of the rect must pick
+        // the short right edge (visible segment), NOT the long top/bottom
+        // edges — the distance to a segment is what counts, not the distance
+        // to the infinite lines through the top/bottom edges.
+        let wide = (0.0, 0.0, 2000.0, 100.0);
+        assert_eq!(
+            active_screenshot_border(wide, (2500.0, 50.0)),
+            ScreenshotBorder::Right
+        );
+        assert_eq!(
+            active_screenshot_border(wide, (-500.0, 50.0)),
+            ScreenshotBorder::Left
+        );
+        // Far above a wide rect: the top edge is closest.
+        assert_eq!(
+            active_screenshot_border(wide, (1000.0, -500.0)),
+            ScreenshotBorder::Top
+        );
+        // Inside a wide rect near its left edge: left wins.
+        assert_eq!(
+            active_screenshot_border(wide, (10.0, 50.0)),
+            ScreenshotBorder::Left
+        );
+    }
+    #[test]
+    fn nudge_screenshot_border_moves_active_edge_1px_and_clamps() {
+        let bounds = (100.0, 100.0);
+        // Top border: W moves the top edge up, S moves it down.
+        let r = (10.0, 20.0, 90.0, 80.0);
+        assert_eq!(
+            nudge_screenshot_border(r, ScreenshotBorder::Top, 'w', bounds),
+            (10.0, 19.0, 90.0, 80.0)
+        );
+        assert_eq!(
+            nudge_screenshot_border(r, ScreenshotBorder::Top, 's', bounds),
+            (10.0, 21.0, 90.0, 80.0)
+        );
+        // Bottom border: W shrinks up (y1 decreases), S extends down.
+        assert_eq!(
+            nudge_screenshot_border(r, ScreenshotBorder::Bottom, 'w', bounds),
+            (10.0, 20.0, 90.0, 79.0)
+        );
+        assert_eq!(
+            nudge_screenshot_border(r, ScreenshotBorder::Bottom, 's', bounds),
+            (10.0, 20.0, 90.0, 81.0)
+        );
+        // Left border: A extends left, D shrinks right.
+        assert_eq!(
+            nudge_screenshot_border(r, ScreenshotBorder::Left, 'a', bounds),
+            (9.0, 20.0, 90.0, 80.0)
+        );
+        assert_eq!(
+            nudge_screenshot_border(r, ScreenshotBorder::Left, 'd', bounds),
+            (11.0, 20.0, 90.0, 80.0)
+        );
+        // Right border: A shrinks left, D extends right.
+        assert_eq!(
+            nudge_screenshot_border(r, ScreenshotBorder::Right, 'a', bounds),
+            (10.0, 20.0, 89.0, 80.0)
+        );
+        assert_eq!(
+            nudge_screenshot_border(r, ScreenshotBorder::Right, 'd', bounds),
+            (10.0, 20.0, 91.0, 80.0)
+        );
+        // Clamps: a border can never move past its opposite edge (min 1px) or
+        // outside the capture.
+        assert_eq!(
+            nudge_screenshot_border((0.0, 0.0, 1.0, 1.0), ScreenshotBorder::Left, 'a', bounds),
+            (0.0, 0.0, 1.0, 1.0)
+        );
+        assert_eq!(
+            nudge_screenshot_border((0.0, 0.0, 1.0, 1.0), ScreenshotBorder::Left, 'd', bounds),
+            (0.0, 0.0, 1.0, 1.0)
+        );
+        assert_eq!(
+            nudge_screenshot_border(
+                (99.0, 99.0, 100.0, 100.0),
+                ScreenshotBorder::Bottom,
+                's',
+                bounds
+            ),
+            (99.0, 99.0, 100.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn nudge_off_axis_translates_whole_rectangle() {
+        let bounds = (100.0, 100.0);
+        let r = (10.0, 20.0, 90.0, 80.0);
+        // A/D on a horizontal (top) border translate the whole rect
+        // horizontally, preserving its size.
+        assert_eq!(
+            nudge_screenshot_border(r, ScreenshotBorder::Top, 'a', bounds),
+            (9.0, 20.0, 89.0, 80.0)
+        );
+        assert_eq!(
+            nudge_screenshot_border(r, ScreenshotBorder::Top, 'd', bounds),
+            (11.0, 20.0, 91.0, 80.0)
+        );
+        // W/S on a vertical (left) border translate it vertically.
+        assert_eq!(
+            nudge_screenshot_border(r, ScreenshotBorder::Left, 'w', bounds),
+            (10.0, 19.0, 90.0, 79.0)
+        );
+        assert_eq!(
+            nudge_screenshot_border(r, ScreenshotBorder::Left, 's', bounds),
+            (10.0, 21.0, 90.0, 81.0)
+        );
+        // At the capture edge a translate simply does not move (never shrinks).
+        assert_eq!(
+            nudge_screenshot_border((0.0, 20.0, 80.0, 80.0), ScreenshotBorder::Top, 'a', bounds),
+            (0.0, 20.0, 80.0, 80.0)
+        );
+        assert_eq!(
+            nudge_screenshot_border(
+                (20.0, 20.0, 100.0, 80.0),
+                ScreenshotBorder::Bottom,
+                'd',
+                bounds
+            ),
+            (20.0, 20.0, 100.0, 80.0)
+        );
+    }
+
+    #[test]
+    fn screenshot_overlay_dims_outside_and_draws_border() {
+        let color = [255, 153, 0];
+        // 8x8 overlay, 2px border around rect (2,2)-(8,8) -> transparent
+        // interior (4,4)-(6,6).
+        let mut ov = vec![0u8; 8 * 8 * 4];
+        fill_screenshot_overlay(&mut ov, 8, 8, Some((2.0, 2.0, 8.0, 8.0)), color, 2, None);
+        let px = |x: usize, y: usize| {
+            let i = (y * 8 + x) * 4;
+            [ov[i], ov[i + 1], ov[i + 2], ov[i + 3]]
+        };
+        // Inside the selection (away from the border): fully transparent.
+        assert_eq!(px(4, 4), [0, 0, 0, 0]);
+        // On the border: opaque orange.
+        assert_eq!(px(2, 4), [color[0], color[1], color[2], 255]);
+        assert_eq!(px(7, 3), [color[0], color[1], color[2], 255]);
+        // Outside the selection: fully transparent (no dimming — the
+        // magnified screen stays opaque and undimmed).
+        assert_eq!(px(0, 0), [0, 0, 0, 0]);
+        // No rect: the whole overlay stays fully transparent.
+        let mut ov2 = vec![0u8; 8 * 8 * 4];
+        fill_screenshot_overlay(&mut ov2, 8, 8, None, color, 2, None);
+        assert!(ov2.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn screenshot_overlay_highlights_active_border() {
+        let color = [255, 153, 0];
+        // 12x12 overlay, 2px border around rect (2,2)-(10,10); the top edge
+        // is active, so its band is 4px tall and lightened toward white.
+        let mut ov = vec![0u8; 12 * 12 * 4];
+        fill_screenshot_overlay(
+            &mut ov,
+            12,
+            12,
+            Some((2.0, 2.0, 10.0, 10.0)),
+            color,
+            2,
+            Some(ScreenshotBorder::Top),
+        );
+        let px = |x: usize, y: usize| {
+            let i = (y * 12 + x) * 4;
+            [ov[i], ov[i + 1], ov[i + 2], ov[i + 3]]
+        };
+        // Active band is 4px (2*2): rows 2..6 at x=3 are the lightened color.
+        let active = [
+            255u8,
+            (153u16 + (255 - 153) * 3 / 5) as u8,
+            (255 * 3 / 5) as u8,
+            255,
+        ];
+        assert_eq!(px(3, 2), active);
+        assert_eq!(px(3, 5), active);
+        // Row 6 is past the active band: normal border color.
+        assert_eq!(px(3, 6), [color[0], color[1], color[2], 255]);
+        // The inactive right border stays 2px and normal-colored (row 7 is
+        // below the active top band).
+        assert_eq!(px(9, 7), [color[0], color[1], color[2], 255]);
+        // Interior next to it stays transparent.
+        assert_eq!(px(7, 7), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn screenshot_overlay_narrow_rect_does_not_panic() {
+        // Regression: a selection narrower than its own combined border
+        // widths (or a 1px click rect) used to make the interior fill
+        // invert and panic on a slice index, and full-width border bands
+        // drew lines across the whole screen. It must render a small
+        // outlined box instead.
+        let color = [255, 153, 0];
+        // 1px-wide, 6px-tall rect at (3,1): the horizontal bands would
+        // previously span the whole 8px canvas width.
+        let mut ov = vec![0u8; 8 * 8 * 4];
+        fill_screenshot_overlay(&mut ov, 8, 8, Some((3.0, 1.0, 4.0, 7.0)), color, 2, None);
+        let px = |x: usize, y: usize| {
+            let i = (y * 8 + x) * 4;
+            [ov[i], ov[i + 1], ov[i + 2], ov[i + 3]]
+        };
+        // A border pixel: orange.
+        assert_eq!(px(3, 1), [color[0], color[1], color[2], 255]);
+        assert_eq!(px(3, 6), [color[0], color[1], color[2], 255]);
+        // A row far from the rect's x-range is transparent (no scrim), NOT a
+        // full-width horizontal border line.
+        assert_eq!(px(7, 1), [0, 0, 0, 0]);
+        assert_eq!(px(7, 6), [0, 0, 0, 0]);
+        // A column far from the rect's y-range is transparent, NOT a
+        // full-height vertical border line.
+        assert_eq!(px(3, 0), [0, 0, 0, 0]);
+        assert_eq!(px(3, 7), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn toggle_screenshot_scale_flips_between_real_and_magnified() {
+        use crate::config::ScreenshotScale;
+        assert_eq!(
+            toggle_screenshot_scale(ScreenshotScale::Real),
+            ScreenshotScale::Magnified
+        );
+        assert_eq!(
+            toggle_screenshot_scale(ScreenshotScale::Magnified),
+            ScreenshotScale::Real
+        );
+    }
+
+    #[test]
+    fn advance_repeat_deadline_steps_whole_intervals() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        // 10 ms late: steps one whole 33 ms interval.
+        let d1 = advance_repeat_deadline(
+            t0 + Duration::from_millis(10),
+            t0,
+            Duration::from_millis(33),
+        );
+        assert_eq!(d1.duration_since(t0), Duration::from_millis(33));
+        // 100 ms late (3+ intervals): advances past now, not one behind.
+        let late = t0 + Duration::from_millis(100);
+        let d2 = advance_repeat_deadline(late, t0, Duration::from_millis(33));
+        assert!(d2 > late);
+        assert!(d2.duration_since(late) <= Duration::from_millis(33));
+        // Not yet due: unchanged.
+        assert_eq!(
+            advance_repeat_deadline(
+                t0,
+                t0 + Duration::from_millis(50),
+                Duration::from_millis(33)
+            ),
+            t0 + Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn upscale_nearest_scales_rgba_correctly() {
+        // 2x1 image: red pixel (255,0,0,255) then blue (0,0,255,255).
+        let src: Vec<u8> = vec![255, 0, 0, 255, 0, 0, 255, 255];
+        let (out, w, h) = upscale_nearest(&src, 2, 1, 3.0);
+        assert_eq!((w, h), (6, 3));
+        // Row 0: three red then three blue.
+        let px = |x: usize, y: usize| {
+            let i = (y * 6 + x) * 4;
+            [out[i], out[i + 1], out[i + 2], out[i + 3]]
+        };
+        assert_eq!(px(0, 0), [255, 0, 0, 255]);
+        assert_eq!(px(2, 0), [255, 0, 0, 255]);
+        assert_eq!(px(3, 0), [0, 0, 255, 255]);
+        assert_eq!(px(5, 0), [0, 0, 255, 255]);
+        // All rows are the same (vertical nearest neighbor).
+        assert_eq!(px(1, 2), [255, 0, 0, 255]);
+        assert_eq!(px(4, 2), [0, 0, 255, 255]);
+        // Scale below 1 is clamped: the output is never smaller than 1 px.
+        let (out2, w2, h2) = upscale_nearest(&src, 2, 1, 0.5);
+        assert_eq!((w2, h2), (1, 1));
+        assert_eq!(out2, vec![255, 0, 0, 255]);
+        // Non-integer scale (1.5) rounds the output size up.
+        let (out3, w3, h3) = upscale_nearest(&src, 2, 1, 1.5);
+        assert_eq!((w3, h3), (3, 2));
+        let px3 = |x: usize, y: usize| {
+            let i = (y * 3 + x) * 4;
+            [out3[i], out3[i + 1], out3[i + 2], out3[i + 3]]
+        };
+        assert_eq!(px3(0, 0), [255, 0, 0, 255]);
+        assert_eq!(px3(2, 0), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn screenshot_overlay_blends_into_canvas() {
+        let mut canvas = vec![255u8; 4 * 4 * 4]; // opaque white canvas
+        let mut ov = vec![0u8; 4 * 4 * 4];
+        // Opaque orange border pixel at (1,1) and a translucent black pixel
+        // at (0,0) of a 4-wide RGBA overlay.
+        let i_border = 20; // (1 * 4 + 1) * 4
+        ov[i_border..i_border + 4].copy_from_slice(&[255, 153, 0, 255]);
+        let i_scrim = 0; // pixel (0,0)
+        ov[i_scrim..i_scrim + 4].copy_from_slice(&[0, 0, 0, 128]);
+        blend_overlay_into(&mut canvas, 4, &ov, 4, 4);
+        let border_px = &canvas[i_border..i_border + 4];
+        assert_eq!(border_px, [255, 153, 0, 255]);
+        let scrim_px = &canvas[0..4];
+        // White * 0.5 + black * 0.5 = ~128 gray.
+        assert!(
+            scrim_px[0] > 100 && scrim_px[0] < 160,
+            "gray {}",
+            scrim_px[0]
+        );
     }
 
     #[test]
