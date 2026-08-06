@@ -66,6 +66,8 @@ cp target/release/maggie /usr/local/bin/
 
 System dependencies (Debian/Ubuntu): `libwayland-dev` and `libxkbcommon-dev`. Prefer a pre-built binary? Check the [Releases](https://github.com/hced/maggie/releases) page — tag pushes build and publish a `maggie-linux.tar.gz` automatically.
 
+Release builds target **x86-64-v3** (AVX2/FMA — every mainstream CPU from the last decade, set in `.cargo/config.toml`), so the render loops auto-vectorize. On pre-v3 hardware, build with `just build-generic` (or `RUSTFLAGS="-C target-cpu=x86-64" cargo build --release`). For a build tuned to your exact CPU, use `just build-native` — fastest, but the binary only runs on identical-or-newer CPUs.
+
 The repo includes a `justfile` with developer conveniences: `just build`, `just run`, `just tests`, `just check`, `just lint` — and a full release workflow (`just release`, `just push-release-tag`).
 
 ## Configuration

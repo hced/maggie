@@ -1,0 +1,12 @@
+# Maggie release builds target x86-64-v3 (AVX2 + FMA + BMI1/BMI2) — the same
+# baseline CachyOS, ALHP and most modern distros use. It covers every mainstream
+# CPU from the last decade (Intel Haswell+ / AMD Zen+), so prebuilt binaries
+# stay broadly portable while the hot pixel loops (scaling, blending, OSD
+# rasterization) get to auto-vectorize. On machines older than that, build with:
+#
+#   RUSTFLAGS="-C target-cpu=x86-64" cargo build --release
+#   (or `just build-generic`)
+#
+# The env var is applied after this config, so the last -C target-cpu wins.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

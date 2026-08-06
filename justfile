@@ -14,6 +14,15 @@ set default-list := true
 build:
   cargo build --release
 
+# Build with every instruction this machine's CPU supports (fastest locally,
+# but the binary only runs on identical-or-newer CPUs).
+build-native:
+  RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+# Build for the widest compatibility (pre-x86-64-v3 CPUs, i.e. pre-2013 hardware).
+build-generic:
+  RUSTFLAGS="-C target-cpu=x86-64" cargo build --release
+
 run *args:
   cargo run --release -- $args
 

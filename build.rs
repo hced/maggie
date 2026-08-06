@@ -5,6 +5,18 @@ use std::path::Path;
 use gl_generator::{Api, Fallbacks, GlobalGenerator, Profile, Registry};
 
 fn main() {
+    // Maggie's committed build baseline is x86-64-v3 (AVX2). If this build
+    // machine's CPU can't run AVX2, warn loudly at build time: a v3 binary
+    // would otherwise crash with SIGILL the moment it starts. On machines
+    // that do support AVX2 this is a silent no-op.
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        println!(
+            "cargo:warning=this CPU does not support AVX2 (x86-64-v3), Maggie's committed \
+             build baseline — the release binary would crash with SIGILL. Build with \
+             `just build-generic` or RUSTFLAGS=\"-C target-cpu=x86-64\" instead."
+        );
+    }
+
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let dest = Path::new(&out_dir).join("gles2.rs");
 
