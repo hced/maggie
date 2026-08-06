@@ -299,10 +299,24 @@ fn zoom_readout(zoom: f64, fit: f64) -> String {
     }
 }
 
+/// Snap a capture-px position to the nearest whole capture pixel. The
+/// screenshot selection must align with the pixel grid of the frozen frame
+/// — the grid the user sees as the magnified pixels (each magnified block
+/// is one capture px scaled by the zoom) — so the drag anchor and live
+/// corner are snapped here and the resulting rectangle is always
+/// integer-valued. That makes the saved crop exactly match the visually
+/// selected region: the save path rounds independently, and an un-snapped
+/// fractional rect could otherwise crop up to a pixel off from what was
+/// shown on screen.
+fn snap_capture_px(pos: (f64, f64)) -> (f64, f64) {
+    (pos.0.round(), pos.1.round())
+}
+
 /// Normalize a screenshot drag (anchor, live pointer) into an axis-aligned
 /// selection rectangle in capture px, clamped to the capture bounds with a
 /// minimum size of 1 px per axis (a plain click without drag still yields a
-/// valid, nudgeable rectangle).
+/// valid, nudgeable rectangle). Callers pass [`snap_capture_px`] values so
+/// the rectangle stays aligned to the magnified pixel grid.
 fn normalize_screenshot_rect(
     p0: (f64, f64),
     p1: (f64, f64),
@@ -2440,15 +2454,23 @@ impl MagnifierWindow {
                     // The drag tracks the magnified cursor *sprite* (pointer
                     // + the mode-entry offset), not the raw physical pointer:
                     // the user aims and draws with the visible cursor, so the
-                    // rectangle must follow it, never diverge from it.
-                    let cur = self.screenshot_capture_position();
+                    // rectangle must follow it, never diverge from it. The
+                    // live corner is snapped to the nearest whole capture
+                    // pixel, so the rectangle stays aligned to the magnified
+                    // pixel grid in capture space while dragging (the anchor
+                    // was snapped on press) and the saved crop is exact.
+                    let cur = snap_capture_px(self.screenshot_capture_position());
                     self.screenshot_rect = Some(normalize_screenshot_rect(start, cur, bounds));
                 }
                 self.request_motion_redraw(qh);
             }
             PointerEventKind::Press { button, .. } => {
                 if button == BTN_LEFT {
-                    let cap = self.screenshot_capture_position();
+                    // Snap the drag anchor to the nearest whole capture pixel
+                    // so the drawn rectangle always aligns with the magnified
+                    // pixel grid (and the saved crop matches exactly what the
+                    // user sees — see [`snap_capture_px`]).
+                    let cap = snap_capture_px(self.screenshot_capture_position());
                     self.screenshot_drag_start = Some(cap);
                     self.screenshot_dragging = true;
                     if let Some(c) = &self.captured {
@@ -4328,6 +4350,43 @@ mod tests {
         // An edge click cannot push the rect out of bounds.
         let rect = normalize_screenshot_rect((319.5, 199.5), (319.5, 199.5), (320.0, 200.0));
         assert_eq!(rect, (319.0, 199.0, 320.0, 200.0));
+    }
+
+    #[test]
+    fn snap_capture_px_snaps_to_the_magnified_pixel_grid() {
+        // Fractional capture positions snap to the nearest whole capture
+        // pixel — the grid the user sees as magnified blocks — so a drag
+        // always produces an integer-aligned selection.
+        assert_eq!(snap_capture_px((10.4, 20.6)), (10.0, 21.0));
+        assert_eq!(snap_capture_px((123.7, 55.2)), (124.0, 55.0));
+        // Negative values round toward +inf (nearest, not floor): a pointer
+        // slightly outside the capture anchors on the edge pixel.
+        assert_eq!(snap_capture_px((-0.6, 319.5)), (-1.0, 320.0));
+    }
+
+    #[test]
+    fn snapped_drag_yields_an_integer_rect() {
+        // The drag pipeline the runtime uses: snap both corners, then
+        // normalize. The result is integer-valued and clamped to the
+        // capture, so the saved crop matches the visually selected region
+        // exactly (the save path rounds — here it is a no-op).
+        let bounds = (320.0, 200.0);
+        let start = snap_capture_px((101.3, 41.7));
+        let cur = snap_capture_px((267.9, 168.2));
+        let rect = normalize_screenshot_rect(start, cur, bounds);
+        assert_eq!(rect, (101.0, 42.0, 268.0, 168.0));
+        assert!(rect.0.fract() == 0.0 && rect.1.fract() == 0.0);
+        assert!(rect.2.fract() == 0.0 && rect.3.fract() == 0.0);
+        // The save region derived from it is exact: no independent rounding
+        // drift between position and size.
+        let region_x = rect.0.round() as i32;
+        let region_y = rect.1.round() as i32;
+        let region_w = (rect.2 - rect.0).round() as u32;
+        let region_h = (rect.3 - rect.1).round() as u32;
+        assert_eq!(
+            (region_x, region_y, region_w, region_h),
+            (101, 42, 167, 126)
+        );
     }
 
     #[test]
