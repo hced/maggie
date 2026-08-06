@@ -455,7 +455,7 @@ mod tests {
         // Canvas is large enough that the (now bigger) legend box always fits
         // entirely in the chosen corner quadrant.
         let size = 600;
-        let mid = (size / 2) as i32;
+        let mid = size / 2;
         let corners = [
             ("top-left", (400, 400)),
             ("top-right", (100, 400)),

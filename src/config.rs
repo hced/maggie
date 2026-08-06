@@ -273,6 +273,21 @@ pub(crate) fn normalize_config(config: &mut MagnifierConfig) {
     }
 }
 
+pub fn save_config(config: &MagnifierConfig) -> anyhow::Result<()> {
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
+        .join("maggie");
+
+    std::fs::create_dir_all(&config_dir)?;
+
+    let config_file = config_dir.join("config.ron");
+    let contents = ron::ser::to_string_pretty(config, ron::ser::PrettyConfig::default())?;
+    std::fs::write(config_file, contents)?;
+
+    tracing::info!("Config saved to directory");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,19 +435,4 @@ mod tests {
         // Newer keybindings added since this config was written get defaults.
         assert_eq!(legacy.keybindings.screenshot_scale_toggle, "v");
     }
-}
-
-pub fn save_config(config: &MagnifierConfig) -> anyhow::Result<()> {
-    let config_dir = dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
-        .join("maggie");
-
-    std::fs::create_dir_all(&config_dir)?;
-
-    let config_file = config_dir.join("config.ron");
-    let contents = ron::ser::to_string_pretty(config, ron::ser::PrettyConfig::default())?;
-    std::fs::write(config_file, contents)?;
-
-    tracing::info!("Config saved to directory");
-    Ok(())
 }
