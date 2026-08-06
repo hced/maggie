@@ -35,7 +35,7 @@ use smithay_client_toolkit::shm::slot::SlotPool;
 use wayland_client::Proxy;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{
-    wl_callback, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
+    wl_callback, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_surface,
 };
 use wayland_client::{Connection, QueueHandle};
 
@@ -1993,6 +1993,23 @@ fn keysym_to_string(keysym: Keysym) -> String {
 
 smithay_client_toolkit::delegate_dispatch2!(MagnifierWindow);
 
+// User data for the opaque-region `wl_region` created at startup (see the
+// `set_opaque_region` call in `run`). `wl_region` has no events, so this
+// handler is a no-op.
+impl wayland_client::Dispatch<wl_region::WlRegion, ()> for MagnifierWindow {
+    fn event(
+        _state: &mut Self,
+        _region: &wl_region::WlRegion,
+        event: <wl_region::WlRegion as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // wl_region has no events.
+        let _ = event;
+    }
+}
+
 impl MagnifierWindow {
     /// Request a screencopy of the current output. Returns `false` (without
     /// retrying) when the capture cannot be issued yet — e.g. no output is
@@ -3435,7 +3452,19 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
     // keybindings keep working while the magnifier stays keyboard-receivable.
     layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
     layer.set_size(0, 0);
+    // The layer surface is fully opaque everywhere (the magnified frame, the
+    // black bars beyond it, and every overlay/cursor/OSD blend into opaque
+    // pixels), so mark it opaque to the compositor. Compositors use this for
+    // occlusion culling: everything fully covered by this surface stops being
+    // composited, which makes Maggie's redraw cost independent of whatever
+    // app happens to be underneath it (a constantly repainting browser no
+    // longer adds compositor load while the magnifier is up). The region is
+    // only consulted at commit time, so it can be destroyed right after.
+    let opaque_region = compositor.wl_compositor().create_region(&qh, ());
+    opaque_region.add(0, 0, i32::MAX, i32::MAX);
+    layer.wl_surface().set_opaque_region(Some(&opaque_region));
     layer.commit();
+    opaque_region.destroy();
 
     let pool = SlotPool::new(1920 * 1080 * 4, &shm)?;
     let capture_manager = CaptureManager::new(

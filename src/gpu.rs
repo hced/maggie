@@ -194,6 +194,24 @@ impl GpuRenderer {
                 .unwrap_or(ptr::null())
         });
 
+        // Report which GPU is actually rendering (after load_with, so the
+        // GL function pointers are available). On Wayland, the EGL display
+        // follows the compositor's render GPU (dGPU in hybrid setups whose
+        // compositor renders on it), so this makes dGPU/iGPU routing
+        // verifiable at a glance instead of assumed.
+        let gl_string = |name: u32| unsafe {
+            let ptr = gles2::GetString(name);
+            if ptr.is_null() {
+                return "(unknown)".to_string();
+            }
+            std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let vendor = gl_string(gles2::VENDOR);
+        let renderer = gl_string(gles2::RENDERER);
+        tracing::info!("EGL GPU: {vendor} — {renderer}");
+
         // A `glow` context bound to the same EGL/GLES2 function pointers,
         // used by the egui-based Configuration window (egui-glow).
         let glow = unsafe {
