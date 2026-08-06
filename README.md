@@ -111,6 +111,12 @@ Maggie is a single-binary Wayland client built on `wayland-client` + `smithay-cl
 | `src/input.rs` | Legacy keysym → `Action` dispatch layer (actual key handling lives in `engine.rs`) |
 | `src/config.rs` | RON config schema, defaults, `load_config` / `save_config` |
 
+## GPU & performance notes
+
+- **Which GPU renders?** On Wayland the compositor decides, not the app: `eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND)` hands clients the compositor's client-buffer device, and there is no client-side way to pick another GPU. Maggie logs the actual device at startup — `EGL GPU: <vendor> — <renderer>` — so routing is always verifiable at a glance.
+- **Hybrid laptops (iGPU + dGPU):** if the log shows the integrated GPU but you want the discrete one, the lever is the compositor. For niri: `debug { render-drm-device "/dev/dri/renderD129" }` (use your dGPU's render node) renders everything — the compositor and all EGL clients — on the discrete GPU while the panel stays on the iGPU (niri's multi-GPU/PRIME copy path). Verify with `nvidia-smi` (compositor and clients will show real VRAM usage) or the `EGL GPU` log. Expect higher power draw.
+- **Panning smoothness:** motion-driven redraws are coalesced to ~120 Hz, and the fullscreen surface is marked opaque so compositors occlusion-cull whatever is underneath — compositor load is roughly independent of the app beneath the magnifier, so a constantly repainting app (e.g. a browser) no longer steals frames.
+
 ## Roadmap
 
 Broader compositor and distro support is a direction I'd like to take Maggie in, but **none of it is implemented yet**:
