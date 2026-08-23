@@ -32,9 +32,8 @@ fn default_toggle_cursor() -> String {
 }
 
 /// Default modifier key held to smooth-zoom with vertical mouse motion.
-/// (Changed from "Super" to "Space" at the user's request.)
 fn default_hold_to_zoom() -> String {
-    "Space".to_string()
+    "Super".to_string()
 }
 
 /// Default key that toggles the effective screenshot scale (real size vs
@@ -45,7 +44,7 @@ fn default_screenshot_scale_toggle() -> String {
 
 /// Default zoom-per-pixel rate for hold-to-zoom vertical motion.
 fn default_hold_to_zoom_speed() -> f64 {
-    0.05
+    0.02
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -56,8 +55,8 @@ pub struct MagnifierConfig {
     #[serde(default = "default_max_zoom")]
     pub max_zoom: f64,
     /// How fast hold-to-zoom changes the zoom per pixel of vertical pointer
-    /// motion (default 0.05 → 5 % per pixel, i.e. the full 1×–9× range in
-    /// 160 px of movement).
+    /// motion (default 0.02 → 2 % per pixel, i.e. the full 1×–9× range in
+    /// 400 px of movement).
     #[serde(default = "default_hold_to_zoom_speed")]
     pub hold_to_zoom_speed: f64,
     #[serde(default)]
@@ -173,9 +172,9 @@ impl Default for Keybindings {
 impl Default for MagnifierConfig {
     fn default() -> Self {
         MagnifierConfig {
-            default_zoom: Some(3.0),
+            default_zoom: Some(2.0),
             max_zoom: 9.0,
-            hold_to_zoom_speed: 0.05,
+            hold_to_zoom_speed: 0.02,
             scroll_zoom_mode: ScrollZoomMode::Levels,
             invert_scroll_zoom: false,
             allow_zero_zoom: false,
@@ -191,7 +190,7 @@ impl Default for MagnifierConfig {
                 mode_miniature: "Control-m".to_string(),
                 reset_zoom: "r".to_string(),
                 toggle_cursor: "c".to_string(),
-                hold_to_zoom: "Space".to_string(),
+                hold_to_zoom: "Super".to_string(),
                 screenshot_scale_toggle: "v".to_string(),
             },
             screenshot_scale: ScreenshotScale::Real,
@@ -235,7 +234,7 @@ pub(crate) fn normalize_config(config: &mut MagnifierConfig) {
         if config.hold_to_zoom_speed.is_finite() && config.hold_to_zoom_speed > 0.0 {
             config.hold_to_zoom_speed.clamp(0.001, 1.0)
         } else {
-            0.05
+            0.02
         };
     // A default zoom of exactly 0 % requires 0 % zoom to be reachable, so the
     // allow-zero setting is forced on while it stays at 0 (the Configuration
@@ -257,12 +256,6 @@ pub(crate) fn normalize_config(config: &mut MagnifierConfig) {
     // window to the new default.
     if config.keybindings.config_window == "c" && config.keybindings.toggle_cursor == "c" {
         config.keybindings.config_window = "Tab".to_string();
-    }
-    // Migration: the hold-to-zoom default moved from Super to Space. Config
-    // files saved before the change carry "Super"; migrate them to the new
-    // default the user asked for.
-    if config.keybindings.hold_to_zoom == "Super" {
-        config.keybindings.hold_to_zoom = "Space".to_string();
     }
     // Migration: the manual-screenshot (Screenshot Mode) key moved from `S`
     // to `G` so the WASD keys are owned by selection-border nudging (S
@@ -311,20 +304,20 @@ mod tests {
     }
 
     #[test]
-    fn pre_space_configs_migrate_hold_to_zoom() {
-        // Configs saved while the hold-to-zoom default was Super migrate to
-        // the new Space default.
+    fn hold_to_zoom_default_is_super() {
+        // The hold-to-zoom modifier default is Super; an explicit legacy
+        // "Space" binding is left exactly as the user wrote it.
         let mut config = MagnifierConfig {
             keybindings: Keybindings {
-                hold_to_zoom: "Super".to_string(),
+                hold_to_zoom: "Space".to_string(),
                 ..Keybindings::default()
             },
             ..MagnifierConfig::default()
         };
         normalize_config(&mut config);
         assert_eq!(config.keybindings.hold_to_zoom, "Space");
-        // The new default also is Space.
-        assert_eq!(MagnifierConfig::default().keybindings.hold_to_zoom, "Space");
+        // And the default is Super.
+        assert_eq!(MagnifierConfig::default().keybindings.hold_to_zoom, "Super");
     }
 
     #[test]
@@ -338,7 +331,7 @@ mod tests {
         normalize_config(&mut config);
         assert_eq!(config.max_zoom, 32.0);
         assert_eq!(config.default_zoom, None); // NaN dropped
-        assert_eq!(config.hold_to_zoom_speed, 0.05);
+        assert_eq!(config.hold_to_zoom_speed, 0.02);
     }
 
     #[test]

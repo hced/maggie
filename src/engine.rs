@@ -74,6 +74,51 @@ fn offset_correction_factor(dt: f64) -> f64 {
     (1.0 - (-dt.min(OFFSET_CORRECT_DT_CAP) / OFFSET_CORRECT_TAU).exp()).min(1.0)
 }
 
+/// Dead zone (logical px) for hold-to-zoom zoom-in from the floor: while the
+/// zoom sits exactly on the runtime minimum (the fully-zoomed-out "0 %"
+/// view), tiny alternating pointer jitter must not flap the zoom between the
+/// floor and one step above it. Upward motion is ignored until it has
+/// accumulated past this many px, then zoom-in proceeds normally.
+const HTZ_FLOOR_DEADZONE: f64 = 2.0;
+
+/// The hold-to-zoom zoom step at/around the runtime minimum. While the zoom
+/// sits exactly on the floor (the fully-zoomed-out "0 %" view), zoom-out
+/// holds the floor rock-solid and zoom-in is ignored until the upward motion
+/// has accumulated past [`HTZ_FLOOR_DEADZONE`] px (then it proceeds
+/// normally) — a period-2 jitter (one px down, one px up, …) at the floor
+/// used to flap the zoom between the floor and one step above it. Below the
+/// floor (the `0` key when 0 % is not allowed) zoom-out stays put and
+/// zoom-in returns to the floor. Returns `(new_zoom, new_dead_travel)`.
+fn htz_floor_zoom(
+    zoom: f64,
+    min: f64,
+    max: f64,
+    dy: f64,
+    speed: f64,
+    dead_travel: f64,
+) -> (f64, f64) {
+    let at_floor = (zoom - min).abs() <= 1e-9;
+    if at_floor && dy > 0.0 {
+        // Zooming out at the floor: hold it exactly (and re-arm the dead
+        // zone — any upward jitter since the last down-tick is discarded).
+        (min, 0.0)
+    } else if at_floor && dy < 0.0 {
+        // Zooming in from the floor: swallow tremor up to the dead zone.
+        let travel = dead_travel + (-dy);
+        if travel >= HTZ_FLOOR_DEADZONE {
+            ((zoom - dy * speed).clamp(min, max), 0.0)
+        } else {
+            (min, travel)
+        }
+    } else if zoom < min && dy > 0.0 {
+        // Below the floor (the 0 key with 0 % not allowed): zooming out
+        // stays put.
+        (zoom, 0.0)
+    } else {
+        ((zoom - dy * speed).clamp(min, max), 0.0)
+    }
+}
+
 /// Clamp a view-center coordinate (capture px) to the capture bounds. The
 /// magnified cursor sits at the viewport center, which *is* the view center:
 /// keeping the center inside the capture guarantees the cursor never enters
@@ -97,8 +142,16 @@ fn clamp_to_capture_bounds(pos: (f64, f64), bounds: (f64, f64)) -> (f64, f64) {
 /// reach-blocking direction, `offset × travel < 0` per axis), the view
 /// catches up at least as fast as the hand travels (capped at 2× the
 /// hand's speed): the residual is erased during the push, and the far wall
-/// is reached exactly, at any speed. Moving away heals gently (time-based)
-/// and never fights the user. Returns the remaining offset.
+/// is reached exactly, at any speed. Moving away from the hand content
+/// does **not** heal at all: the view pans 1:1 with the hand, so a huge
+/// residual after a deep hold-to-zoom drag can never stick the view or
+/// drive it against the drag direction (it used to reverse the pan —
+/// mouse-down moved the view up, the same direction as mouse-up — and a
+/// later bounded heal left it momentarily stuck). The residual is erased
+/// only by the toward-content catch-up; both walls stay reachable
+/// regardless (the plain pan clamps the view to the capture at the far
+/// edge, and the hand-edge reach snaps it there exactly). Returns the
+/// remaining offset.
 fn offset_correction_step(
     offset: (f64, f64),
     dt: f64,
@@ -107,21 +160,24 @@ fn offset_correction_step(
 ) -> (f64, f64) {
     let f = offset_correction_factor(dt);
     let heal = |o: f64, t: f64, s: f64| {
-        // Time-based decay, bounded by the hand's own travel (×2) so a
-        // single event after a pause can never lurch the view.
+        if o * t >= 0.0 {
+            // Moving away from the hand content (or gliding): no correction
+            // — the view pans 1:1 with the hand, so a large residual can
+            // never stick the view or reverse its direction.
+            return 0.0;
+        }
+        // Pushing toward the hand content: catch up at least as fast as the
+        // hand travels (capped at 2× the hand's speed, never overshooting
+        // the hand content), so the far wall is reached exactly, at any
+        // speed, and the residual is erased during the push itself.
         let lim = t.abs() * s * 2.0;
         let mut corr = (o * f).clamp(-lim, lim);
-        if o * t < 0.0 {
-            // Pushing toward the hand content: catch up at least as fast as
-            // the hand travels (still within the 2× cap), so the far wall
-            // stays reachable en route.
-            let catch = t.abs() * s;
-            corr = if corr >= 0.0 {
-                corr.max(catch)
-            } else {
-                corr.min(-catch)
-            };
-        }
+        let catch = t.abs() * s;
+        corr = if corr >= 0.0 {
+            corr.max(catch)
+        } else {
+            corr.min(-catch)
+        };
         // Never overshoot the hand content.
         corr.clamp(o.min(0.0), o.max(0.0))
     };
@@ -1014,6 +1070,12 @@ pub struct MagnifierWindow {
     /// Pointer Y (logical) of the previous motion event while hold-to-zoom is
     /// active; the per-event delta drives the zoom change.
     hold_zoom_last_y: f64,
+    /// Accumulated upward travel (logical px) while the zoom sits exactly on
+    /// the runtime minimum (the fully-zoomed-out view): tiny alternating
+    /// pointer jitter must not flap the zoom between the floor and one step
+    /// above it, so zoom-in from the floor is ignored until this passes
+    /// [`HTZ_FLOOR_DEADZONE`] (see [`htz_floor_zoom`]).
+    hold_floor_dead_travel: f64,
     /// Recent per-event pointer travels, sizing the edge-reach margin (see
     /// [`TravelHistory`]).
     reach_travel: TravelHistory,
@@ -1459,16 +1521,21 @@ impl PointerHandler for MagnifierWindow {
                             // at press. Only horizontal motion pans the view.
                             let dy_zoom = position.1 - self.hold_zoom_last_y;
                             self.hold_zoom_last_y = position.1;
+                            let speed = self.state.config.hold_to_zoom_speed;
                             let max_zoom = self.state.config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
                             let min_zoom = self.runtime_min_zoom();
-                            let new_zoom = if self.state.zoom < min_zoom && dy_zoom > 0.0 {
-                                // Below the floor (the 0 key with 0 % not
-                                // allowed): zooming out stays put.
-                                self.state.zoom
-                            } else {
-                                (self.state.zoom - dy_zoom * self.state.config.hold_to_zoom_speed)
-                                    .clamp(min_zoom, max_zoom)
-                            };
+                            // The floor is held rock-solid against tiny
+                            // alternating pointer jitter (no flap between the
+                            // fully-zoomed-out view and one step above it).
+                            let (new_zoom, floor_dead) = htz_floor_zoom(
+                                self.state.zoom,
+                                min_zoom,
+                                max_zoom,
+                                dy_zoom,
+                                speed,
+                                self.hold_floor_dead_travel,
+                            );
+                            self.hold_floor_dead_travel = floor_dead;
                             if (new_zoom - self.state.zoom).abs() > 1e-9 {
                                 self.set_zoom(new_zoom, min_zoom);
                             }
@@ -1684,6 +1751,7 @@ impl KeyboardHandler for MagnifierWindow {
         if keysym_str == self.state.config.keybindings.hold_to_zoom {
             self.hold_to_zoom_active = true;
             self.hold_zoom_last_y = self.pointer_position_f.1;
+            self.hold_floor_dead_travel = 0.0;
             // Ensure the view center is initialized so the vertical lock
             // engages immediately (in case no motion/draw happened before
             // the press).
@@ -2645,7 +2713,7 @@ impl MagnifierWindow {
         if self.screenshot_active {
             let config_key = &self.state.config.keybindings;
             return vec![
-                "maggie  screenshot mode".to_string(),
+                format!("maggie v{}  screenshot mode", env!("CARGO_PKG_VERSION")),
                 "drag  select".to_string(),
                 format!("{}  fullscreen", config_key.screenshot_fullscreen),
                 "Return  save".to_string(),
@@ -2663,7 +2731,8 @@ impl MagnifierWindow {
             // At the fully-zoomed-out view the readout shows "0 %" (see
             // [`zoom_readout`]); otherwise the zoom factor.
             format!(
-                "maggie  zoom {}",
+                "maggie v{}  zoom {}",
+                env!("CARGO_PKG_VERSION"),
                 zoom_readout(self.state.zoom, self.fit_zoom())
             ),
             // Plain "0-9 zoom level": the built-in bitmap font has no glyphs
@@ -3532,6 +3601,7 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         last_pointer_serial: None,
         hold_to_zoom_active: false,
         hold_zoom_last_y: 0.0,
+        hold_floor_dead_travel: 0.0,
         reach_travel: TravelHistory::new(),
         last_motion_delta: None,
     };
@@ -4039,6 +4109,54 @@ mod tests {
     }
 
     #[test]
+    fn htz_floor_zoom_holds_the_floor_against_jitter() {
+        // The failure the user reported: at the fully-zoomed-out view (0x,
+        // zoom == fit), continuing to drag made the zoom flap between the
+        // floor and one step above it (0.57x <-> 0.59x) in a period-2 loop.
+        // A 1 px down / 1 px up jitter must never leave the floor.
+        let min = 0.5715;
+        let max = 12.0;
+        let speed = 0.02;
+        let mut zoom = min;
+        let mut dead = 0.0;
+        for i in 0..200 {
+            let dy = if i % 2 == 0 { 1.0 } else { -1.0 };
+            (zoom, dead) = htz_floor_zoom(zoom, min, max, dy, speed, dead);
+            assert_eq!(zoom, min, "jitter step {i} must hold the floor");
+        }
+        // A committed zoom-in leaves the floor: the first px is swallowed by
+        // the dead zone, the second crosses it, and motion off the floor is
+        // normal from there on.
+        let (z, dead) = htz_floor_zoom(min, min, max, -1.0, speed, 0.0);
+        assert_eq!(z, min);
+        assert!(dead > 0.0, "dead zone accumulates");
+        let (z, dead) = htz_floor_zoom(min, min, max, -1.0, speed, dead);
+        assert!(z > min, "crossing the dead zone zooms in");
+        assert_eq!(dead, 0.0);
+        let (z, _) = htz_floor_zoom(z, min, max, -1.0, speed, 0.0);
+        assert!(z > min + 0.01, "off the floor, zoom-in is normal");
+        // Zooming out at the floor holds it exactly and re-arms the zone.
+        let (z, dead) = htz_floor_zoom(min, min, max, 1.0, speed, 1.5);
+        assert_eq!(z, min);
+        assert_eq!(dead, 0.0);
+    }
+
+    #[test]
+    fn htz_floor_zoom_below_floor_keeps_existing_behavior() {
+        // The `0` key with 0 % not allowed leaves the zoom below the floor
+        // (fit < 1): zooming out stays put, zooming in returns to the floor.
+        let (z, _) = htz_floor_zoom(0.5715, 1.0, 12.0, 2.0, 0.02, 0.0);
+        assert_eq!(z, 0.5715);
+        let (z, _) = htz_floor_zoom(0.5715, 1.0, 12.0, -2.0, 0.02, 0.0);
+        assert_eq!(z, 1.0);
+        // Mid-range: plain clamp.
+        let (z, _) = htz_floor_zoom(5.0, 1.0, 12.0, -2.0, 0.02, 0.0);
+        assert_eq!(z, 5.04);
+        let (z, _) = htz_floor_zoom(5.0, 1.0, 12.0, 2.0, 0.02, 0.0);
+        assert_eq!(z, 4.96);
+    }
+
+    #[test]
     fn offset_correction_factor_is_bounded_and_capped() {
         // No time elapsed -> no correction.
         assert_eq!(offset_correction_factor(0.0), 0.0);
@@ -4076,6 +4194,45 @@ mod tests {
     }
 
     #[test]
+    fn away_motion_never_reverses_the_pan_direction() {
+        // The exact failure the user reported: after a deep hold-to-zoom
+        // zoom-in the view sits far *below* the hand content (huge positive
+        // offset, hand way up). Dragging away from the content used to let
+        // the time-based heal (capped at 2× the hand's travel) overpower the
+        // plain pan, so mouse-down panned the view *up* — the same direction
+        // as mouse-up. The away-motion correction must be bounded by the
+        // hand's own travel: the view moves with the drag or stands still,
+        // never backwards.
+        let o = 1050.0; // view below the hand content by 1050 capture px
+        let scale = (1.75, 1.75);
+        // Dragging down (away, t > 0): corrected at most the hand's travel.
+        let after = offset_correction_step((o, 0.0), 0.016, (10.0, 0.0), scale);
+        let corrected = o - after.0;
+        assert!(
+            corrected <= 10.0 * scale.0 + 1e-9,
+            "away correction {corrected} exceeds the hand's travel"
+        );
+        // Mirrored: dragging up (away) with the view above the hand content
+        // must not move the view down.
+        let after = offset_correction_step((-o, 0.0), 0.016, (-10.0, 0.0), scale);
+        let corrected = (-o) - after.0;
+        assert!(
+            corrected >= -10.0 * scale.0 - 1e-9,
+            "away correction {corrected} exceeds the hand's travel"
+        );
+        // The residual is erased by toward-motion (the catch-up boost);
+        // continuous toward-motion converges to zero.
+        let mut o2 = (o, 0.0);
+        for _ in 0..200_000 {
+            o2 = offset_correction_step(o2, 0.016, (-10.0, 0.0), scale);
+            if o2.0.hypot(o2.1) < 0.5 {
+                break;
+            }
+        }
+        assert!(o2.0.hypot(o2.1) < 0.5, "offset {o2:?}");
+    }
+
+    #[test]
     fn offset_correction_step_after_pause_does_not_lurch() {
         // A huge dt after a pause (capped internally) with the hand barely
         // moved: the per-event correction must be bounded by the hand's own
@@ -4090,10 +4247,11 @@ mod tests {
         assert!(o.1 - after.1 <= travel.1.abs() * scale.1 * 2.0 + 1e-9);
         // And it never overshoots past zero.
         assert!(after.0 >= 0.0 && after.1 <= 0.0);
-        // Continuous motion still converges.
+        // Continuous motion still converges — away-motion never heals, so
+        // use toward-motion travel (the catch-up boost erases the residual).
         let mut o2 = o;
         for _ in 0..100_000 {
-            o2 = offset_correction_step(o2, 0.016, (20.0, -20.0), scale);
+            o2 = offset_correction_step(o2, 0.016, (-20.0, 20.0), scale);
             if o2.0.hypot(o2.1) < 0.5 {
                 break;
             }
@@ -4108,14 +4266,10 @@ mod tests {
         // o = +5 (view below the hand), t = -100 (pushing up toward it).
         let after = offset_correction_step((5.0, 0.0), 0.016, (-100.0, 0.0), (1.5, 1.5));
         assert_eq!(after, (0.0, 0.0), "fully healed in one push, no overshoot");
-        // Moving away from the hand content heals gently (time-based only),
-        // so the correction never fights or lurches the user.
+        // Moving away from the hand content never heals: the view pans 1:1
+        // with the hand, so the correction can never stick or reverse it.
         let away = offset_correction_step((300.0, 0.0), 0.016, (100.0, 0.0), (1.5, 1.5));
-        assert!(
-            away.0 > 290.0,
-            "away-motion heals gently (time-based), got {}",
-            away.0
-        );
+        assert_eq!(away.0, 300.0, "away-motion must not heal");
         // The boosted correction is still bounded by 2x the hand's travel.
         let big = offset_correction_step((5000.0, 0.0), 0.016, (10.0, 0.0), (1.5, 1.5));
         assert!(
