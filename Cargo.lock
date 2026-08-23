@@ -785,7 +785,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "maggie"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -807,6 +807,7 @@ dependencies = [
  "tracing-subscriber",
  "wayland-client",
  "wayland-egl",
+ "wayland-protocols",
  "wayland-protocols-wlr",
  "xcursor",
 ]

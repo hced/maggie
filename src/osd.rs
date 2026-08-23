@@ -9,6 +9,62 @@ const LINE_HEIGHT: i32 = (GLYPH_HEIGHT as i32 + 2) * GLYPH_SCALE;
 const BOX_PADDING: i32 = 32;
 const BOX_MARGIN: i32 = 28;
 const BOX_ALPHA: u8 = 255;
+
+/// Screen corner for static placement of OSD legend or minimap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Corner {
+    /// The top-left position for a box of `box_w x box_h` at this corner,
+    /// inside `screen_w x screen_h` with `margin` px of breathing room.
+    pub fn position(
+        self,
+        screen_w: i32,
+        screen_h: i32,
+        box_w: i32,
+        box_h: i32,
+        margin: i32,
+    ) -> (i32, i32) {
+        match self {
+            Corner::TopLeft => (margin, margin),
+            Corner::TopRight => (screen_w - margin - box_w, margin),
+            Corner::BottomLeft => (margin, screen_h - margin - box_h),
+            Corner::BottomRight => (screen_w - margin - box_w, screen_h - margin - box_h),
+        }
+    }
+}
+
+impl std::fmt::Display for Corner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Corner::TopLeft => write!(f, "top-left"),
+            Corner::TopRight => write!(f, "top-right"),
+            Corner::BottomLeft => write!(f, "bottom-left"),
+            Corner::BottomRight => write!(f, "bottom-right"),
+        }
+    }
+}
+
+impl std::str::FromStr for Corner {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "top-left" => Ok(Self::TopLeft),
+            "top-right" => Ok(Self::TopRight),
+            "bottom-left" => Ok(Self::BottomLeft),
+            "bottom-right" => Ok(Self::BottomRight),
+            other => Err(format!(
+                "unknown corner: {other:?} (expected top-left, top-right, bottom-left, bottom-right)"
+            )),
+        }
+    }
+}
 const TEXT_COLOR: [u8; 3] = [0xE6, 0xE6, 0xE6];
 
 fn glyph(character: char) -> Option<&'static [u8; GLYPH_HEIGHT]> {
@@ -184,14 +240,8 @@ pub fn draw_text(
     }
 }
 
-pub fn draw_osd(
-    canvas: &mut [u8],
-    canvas_w: i32,
-    canvas_h: i32,
-    lines: &[String],
-    cursor: (i32, i32),
-) {
-    let Some(sprite) = build_osd_sprite(lines, cursor, canvas_w, canvas_h) else {
+pub fn draw_osd(canvas: &mut [u8], canvas_w: i32, canvas_h: i32, lines: &[String], corner: Corner) {
+    let Some(sprite) = build_osd_sprite(lines, corner, canvas_w, canvas_h) else {
         return;
     };
 
@@ -229,9 +279,23 @@ pub struct OsdSprite {
     pub height: i32,
 }
 
+/// Measure the OSD box size in logical px for a given set of lines, without
+/// building the full sprite — used to detect overlap with the minimap.
+pub fn measure_osd_box(lines: &[String]) -> (i32, i32) {
+    let widest = lines
+        .iter()
+        .map(|line| line.chars().count() as i32 * GLYPH_ADVANCE)
+        .max()
+        .unwrap_or(0);
+    (
+        widest + BOX_PADDING,
+        lines.len() as i32 * LINE_HEIGHT + BOX_PADDING,
+    )
+}
+
 pub fn build_osd_sprite(
     lines: &[String],
-    cursor: (i32, i32),
+    corner: Corner,
     screen_w: i32,
     screen_h: i32,
 ) -> Option<OsdSprite> {
@@ -248,22 +312,7 @@ pub fn build_osd_sprite(
     let box_w = widest + BOX_PADDING;
     let box_h = lines.len() as i32 * LINE_HEIGHT + BOX_PADDING;
 
-    let corners = [
-        (BOX_MARGIN, BOX_MARGIN),
-        (screen_w - BOX_MARGIN - box_w, BOX_MARGIN),
-        (BOX_MARGIN, screen_h - BOX_MARGIN - box_h),
-        (screen_w - BOX_MARGIN - box_w, screen_h - BOX_MARGIN - box_h),
-    ];
-    let (box_x, box_y) = corners
-        .into_iter()
-        .max_by(|a, b| {
-            let da =
-                ((a.0 + box_w / 2 - cursor.0) as f64).hypot((a.1 + box_h / 2 - cursor.1) as f64);
-            let db =
-                ((b.0 + box_w / 2 - cursor.0) as f64).hypot((b.1 + box_h / 2 - cursor.1) as f64);
-            da.total_cmp(&db)
-        })
-        .unwrap();
+    let (box_x, box_y) = corner.position(screen_w, screen_h, box_w, box_h, BOX_MARGIN);
 
     let mut buffer = crate::render::RgbaBuffer {
         width: box_w,
@@ -357,7 +406,7 @@ mod tests {
             "WASD  nudge border".to_string(),
             "v  scale: real size".to_string(),
         ];
-        let sprite = build_osd_sprite(&lines, (16, 16), 800, 600).unwrap();
+        let sprite = build_osd_sprite(&lines, Corner::TopLeft, 800, 600).unwrap();
         // Count distinct horizontal bands that contain text pixels.
         let mut bands = Vec::new();
         let mut current: Option<(i32, i32)> = None;
@@ -400,7 +449,7 @@ mod tests {
             "1-9  zoom level".to_string(),
             "k  toggle OSD".to_string(),
         ];
-        draw_osd(&mut canvas, 200, 200, &lines, (150, 150));
+        draw_osd(&mut canvas, 200, 200, &lines, Corner::TopLeft);
         let pixels: Vec<[u8; 4]> = canvas
             .chunks_exact(4)
             .map(|p| [p[0], p[1], p[2], p[3]])
@@ -431,7 +480,7 @@ mod tests {
     fn draw_osd_moves_bottom_right_when_cursor_top_left() {
         let mut canvas = vec![0u8; 200 * 200 * 4];
         let lines = vec!["k  toggle OSD".to_string()];
-        draw_osd(&mut canvas, 200, 200, &lines, (10, 10));
+        draw_osd(&mut canvas, 200, 200, &lines, Corner::BottomRight);
         let pixels: Vec<[u8; 4]> = canvas
             .chunks_exact(4)
             .map(|p| [p[0], p[1], p[2], p[3]])
@@ -451,47 +500,44 @@ mod tests {
     }
 
     #[test]
-    fn draw_osd_picks_farthest_corner() {
-        // Canvas is large enough that the (now bigger) legend box always fits
-        // entirely in the chosen corner quadrant.
+    fn osd_placed_at_configured_corner() {
+        // Each Corner enum places the OSD in the correct quadrant.
         let size = 600;
         let mid = size / 2;
-        let corners = [
-            ("top-left", (400, 400)),
-            ("top-right", (100, 400)),
-            ("bottom-left", (400, 100)),
-            ("bottom-right", (100, 100)),
+        let cases = [
+            (Corner::TopLeft, true, true),
+            (Corner::TopRight, false, true),
+            (Corner::BottomLeft, true, false),
+            (Corner::BottomRight, false, false),
         ];
-        for (name, cursor) in corners {
+        for (corner, expect_left, expect_top) in cases {
             let mut canvas = vec![0u8; (size * size * 4) as usize];
             let lines = vec!["zoom".to_string()];
-            draw_osd(&mut canvas, size, size, &lines, cursor);
+            draw_osd(&mut canvas, size, size, &lines, corner);
             let pixels: Vec<[u8; 4]> = canvas
                 .chunks_exact(4)
                 .map(|p| [p[0], p[1], p[2], p[3]])
                 .collect();
-            let text_xs: Vec<i32> = (0..size)
+            let min_x = (0..size)
                 .filter(|&x| {
                     (0..size).any(|y| {
                         let p = &pixels[(y * size + x) as usize];
                         p[3] == 255 && p[2] > 200
                     })
                 })
-                .collect();
-            let text_ys: Vec<i32> = (0..size)
+                .min();
+            let min_y = (0..size)
                 .filter(|&y| {
                     (0..size).any(|x| {
                         let p = &pixels[(y * size + x) as usize];
                         p[3] == 255 && p[2] > 200
                     })
                 })
-                .collect();
-            let min_x = *text_xs.iter().min().unwrap();
-            let min_y = *text_ys.iter().min().unwrap();
-            let expect_left = name == "top-left" || name == "bottom-left";
-            let expect_top = name == "top-left" || name == "top-right";
-            assert_eq!(min_x < mid, expect_left, "wrong x placement for {name}");
-            assert_eq!(min_y < mid, expect_top, "wrong y placement for {name}");
+                .min();
+            assert!(min_x.is_some(), "no text rendered for {corner}");
+            assert!(min_y.is_some(), "no text rendered for {corner}");
+            assert_eq!(min_x.unwrap() < mid, expect_left, "wrong x for {corner}");
+            assert_eq!(min_y.unwrap() < mid, expect_top, "wrong y for {corner}");
         }
     }
 }

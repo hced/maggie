@@ -23,6 +23,8 @@ use smithay_client_toolkit::seat::keyboard::RawModifiers;
 use smithay_client_toolkit::seat::pointer::PointerEvent;
 use smithay_client_toolkit::seat::pointer::PointerEventKind;
 use smithay_client_toolkit::seat::pointer::PointerHandler;
+use smithay_client_toolkit::seat::pointer_constraints::PointerConstraintsHandler;
+use smithay_client_toolkit::seat::pointer_constraints::PointerConstraintsState;
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -39,6 +41,9 @@ use wayland_client::protocol::{
 };
 use wayland_client::{Connection, QueueHandle};
 
+use wayland_protocols::wp::pointer_constraints::zv1::client::{
+    zwp_confined_pointer_v1::ZwpConfinedPointerV1, zwp_pointer_constraints_v1::Lifetime,
+};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1::Flags, zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
@@ -50,6 +55,7 @@ use crate::config::MagnifierConfig;
 use crate::config_window::ConfigWindow;
 use crate::config_window::UiResult;
 use crate::gpu::GpuRenderer;
+use crate::osd::OsdSprite;
 use crate::render::Renderer;
 use crate::render::RgbaBuffer;
 
@@ -233,6 +239,25 @@ const REACH_VIEW_SLACK_LOGICAL: f64 = 8.0;
 /// a delivery staleness of a few frames, short enough that a slow crawl
 /// right after a fast phase loses the inflated margin within a few events.
 const REACH_HISTORY_LEN: usize = 4;
+/// Wall-hold band (capture px): while the pointer rests at a physical edge
+/// and the view is within this band of the wall, the view is held **exactly
+/// on the wall** even if sub-pixel pointer jitter would pull it off by up to
+/// this much. The delivered position near an edge oscillates (the hand can
+/// never hold the mouse perfectly still), and scaled up by the capture
+/// scale it crosses rounding boundaries — the OSD position readout and the
+/// magnified content used to shiver between wall and wall-1 (worst at the
+/// right/bottom walls, where the resting delivered position sits below the
+/// edge). In steady state the view tracks the hand content, so the hold
+/// only fires while the pointer is within ~EPS/scale px of the edge; a
+/// deliberate pan away releases it immediately (no magnetic wall).
+const WALL_HOLD_EPS: f64 = 3.0;
+
+/// Whether the view should be held exactly on a wall: the pointer rests at
+/// the corresponding physical edge (within `margin` logical px) and the
+/// view is within `eps` capture px of the wall. See [`WALL_HOLD_EPS`].
+fn wall_hold(view: f64, wall: f64, pointer: f64, edge: f64, margin: f64, eps: f64) -> bool {
+    (view - wall).abs() <= eps && (pointer - edge).abs() <= margin
+}
 
 /// App-side key repeat for held Screenshot-Mode nudge keys: the delay before
 /// the first repeat fires, then the interval between repeats (~30 Hz). The
@@ -264,6 +289,43 @@ fn motion_redraw_due(last_draw_at: Option<std::time::Instant>, now: std::time::I
         None => true,
         Some(last) => now.duration_since(last) >= MOTION_REDRAW_INTERVAL,
     }
+}
+
+/// How long the pointer must be still before the frozen screen's sampling
+/// origin settles onto the cursor's lattice (see
+/// [`snap_src_to_cursor_lattice`] and `draw_frame`). While the pointer
+/// moves, the rendered origin uses the fine physical-pixel snap so panning
+/// stays smooth and the cursor sits exactly at the dead center (it never
+/// moves on its own); once the pointer rests for this long, the sampling
+/// origin is shifted by at most half a capture pixel so the magnified
+/// screen's texel grid coincides with the cursor's fixed grid — the screen's
+/// blocks and the cursor's blocks share one crisp lattice exactly when the
+/// user is inspecting, with the cursor still at the dead center. The settle
+/// is a single sub-block nudge of the *frozen image* per stop, never a
+/// movement of the cursor and never an animation.
+const CURSOR_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Snap a view origin (capture px) so the capture-texel lattice coincides
+/// with a fixed cursor lattice (whose sprite origin is `cursor_origin` in
+/// render-buffer px): texel boundary `i` starts at the same buffer-pixel
+/// boundary as cursor block `(cursor_origin + (i - i0) * px_per_texel)` for
+/// some `i0`, i.e. `(i - src) * px_per_texel - 0.5 ≡ cursor_origin
+/// (mod px_per_texel)` — the screen's blocks and the cursor's blocks are
+/// flush, like two layers in a bitmap editor, while the cursor itself stays
+/// at the dead center. The origin moves by at most half a capture pixel
+/// (sub-block), so the frozen content shifts imperceptibly when the settle
+/// engages. This is the "align on launch" idea applied continuously: the
+/// alignment holds whenever the pointer is still.
+fn snap_src_to_cursor_lattice(src: f64, cursor_origin: f64, px_per_texel: f64) -> f64 {
+    let target_frac = ((-cursor_origin - 0.5) / px_per_texel).rem_euclid(1.0);
+    let raw_frac = src.rem_euclid(1.0);
+    let mut delta = target_frac - raw_frac;
+    if delta > 0.5 {
+        delta -= 1.0;
+    } else if delta < -0.5 {
+        delta += 1.0;
+    }
+    src + delta
 }
 
 /// The reach margin (logical px) for one axis, sized from the pointer's
@@ -353,6 +415,449 @@ fn zoom_readout(zoom: f64, fit: f64) -> String {
     } else {
         format!("{zoom:.2}x")
     }
+}
+
+/// Snap a view origin (capture px) so the magnified screen's texel grid lands
+/// exactly on the render buffer's pixel grid. `px_per_texel` is the number of
+/// buffer px one capture texel spans: `RENDER_SCALE * zoom` on the GPU path
+/// (the buffer is RENDER_SCALE times the logical size), `zoom` on the CPU
+/// path. The sampling origin has an arbitrary fractional part because the
+/// view pans continuously, and an unsnapped origin puts texel boundaries at
+/// fractional buffer-pixel positions — the magnified pixel blocks render at
+/// uneven, shifting widths and never line up with the cursor sprite (or the
+/// display's physical pixels). Locking the phase to half a texel places every
+/// texel boundary on an exact buffer-pixel boundary (when `px_per_texel` is
+/// integral), so the magnified grid and the cursor sprite share one crisp,
+/// stationary lattice. The snap never moves the origin by more than half a
+/// texel, and it only affects the *rendered* grid — the view center (cursor
+/// content, readout, panning math) stays untouched.
+fn snap_render_origin(origin: f64, px_per_texel: f64) -> f64 {
+    if !px_per_texel.is_finite() || px_per_texel <= 0.0 {
+        return origin;
+    }
+    let t = origin * px_per_texel;
+    ((t - 0.5).round() + 0.5) / px_per_texel
+}
+
+/// Quantize the view center (capture px) to the capture's pixel grid and
+/// clamp it inside the capture. This is the "snap at launch and that's it"
+/// pixel-grid lock: rounding the center to the nearest *integer capture
+/// pixel* makes the capture pixel under the magnified cursor an exact
+/// integer, so the cursor's texels coincide with the screen's texels (both
+/// lattices share the viewport center as a common point and have the same
+/// period `RENDER_SCALE × zoom`) — permanently, at every zoom, with the
+/// cursor fixed at the dead center and nothing ever adjusting itself
+/// afterwards. The cost is that the content can only slide in whole-texel
+/// steps (one capture px = one magnified block), which is exactly what makes
+/// the alignment stable: sub-texel panning is what kept breaking the phase.
+/// Clamping after the round keeps the "cursor can always reach the exact
+/// edge and never leaves the capture" invariant (see `clamp_to_capture`).
+fn quantize_center_to_pixel_grid(center: (f64, f64), capture: (f64, f64)) -> (f64, f64) {
+    (
+        center.0.round().clamp(0.0, capture.0),
+        center.1.round().clamp(0.0, capture.1),
+    )
+}
+
+/// The minimap rectangle in logical viewport px: a small, aspect-correct
+/// overview pinned to the bottom-right corner with `margin` px of breathing
+/// room. The width is ~22 % of the viewport (clamped to a sane range); the
+/// height follows the capture's aspect ratio.
+/// Half-size (capture px) of the region scrubbed around the launch pointer
+/// position when building the minimap base: the frozen frame can contain the
+/// launching app's *own* cursor graphic (XWayland / software cursors are
+/// rendered into the app's surface and cannot be excluded by the screencopy's
+/// `overlay_cursor = 0`), and scrubbing it before the downscale keeps the
+/// minimap free of a stray miniature cursor next to the marker dot. The
+/// scrub only affects the minimap base, never the magnified view itself.
+const CURSOR_BAKE_HALF: i32 = 24;
+/// Minimum width/height (minimap px) for the amber visible-region outline to
+/// be drawn: below this it would hide behind the marker dot (whose outer
+/// diameter is ~8 px), leaving only stray corner pixels poking out — the
+/// "single pixel following the cursor" artifact at deep zoom.
+const MINIMAP_MARKER_MIN_EDGE: i32 = 12;
+/// Length (minimap px) of each leg of the amber corner brackets marking the
+/// visible region. The brackets are short L-shapes at the four corners of
+/// the region (like camera viewfinder brackets), not full solid edges —
+/// less obtrusive. On very small regions they shrink to half the edge.
+const MINIMAP_CORNER_TICK: i32 = 7;
+
+fn minimap_layout(
+    viewport: (f64, f64),
+    capture: (f64, f64),
+    margin: f64,
+    corner: crate::osd::Corner,
+) -> (f64, f64, f64, f64) {
+    let w = (viewport.0 * 0.22).round().clamp(140.0, 360.0);
+    let h = (w * capture.1 / capture.0.max(1.0)).round().max(40.0);
+    let (x, y) = corner.position(
+        viewport.0 as i32,
+        viewport.1 as i32,
+        w as i32,
+        h as i32,
+        margin as i32,
+    );
+    (x as f64, y as f64, w, h)
+}
+
+/// The visible magnified region in capture px (the source rect of the view,
+/// which may extend past the capture edges near the screen — the marker is
+/// clamped to the capture in the drawing code). `None` when the zoom is
+/// degenerate (0 or negative), so no outline is drawn.
+fn minimap_marker_rect(
+    center: (f64, f64),
+    zoom: f64,
+    viewport: (f64, f64),
+) -> Option<(f64, f64, f64, f64)> {
+    if zoom <= 0.0 {
+        return None;
+    }
+    let vw = viewport.0 / zoom;
+    let vh = viewport.1 / zoom;
+    Some((
+        center.0 - vw / 2.0,
+        center.1 - vh / 2.0,
+        center.0 + vw / 2.0,
+        center.1 + vh / 2.0,
+    ))
+}
+
+/// Box-average downscale of a capture into a `dst_w x dst_h` buffer, each
+/// channel dimmed by `dim` (0.0..1.0) — the "toned down" minimap base.
+fn downscale_dimmed(src: &RgbaBuffer, dst_w: i32, dst_h: i32, dim: f32) -> RgbaBuffer {
+    let mut out = RgbaBuffer::new(dst_w, dst_h);
+    let (sw, sh) = (src.width as f64, src.height as f64);
+    let dim = dim as f64;
+    for y in 0..dst_h {
+        let sy0 = (y as f64 * sh / dst_h as f64) as usize;
+        let sy1 = (((y + 1) as f64 * sh / dst_h as f64).ceil() as usize).min(src.height as usize);
+        for x in 0..dst_w {
+            let sx0 = (x as f64 * sw / dst_w as f64) as usize;
+            let sx1 =
+                (((x + 1) as f64 * sw / dst_w as f64).ceil() as usize).min(src.width as usize);
+            let mut acc = [0u64; 3];
+            let mut n = 0u64;
+            for sy in sy0..sy1 {
+                let row = sy * src.width as usize;
+                for sx in sx0..sx1 {
+                    let i = (row + sx) * 4;
+                    acc[0] += src.data[i] as u64;
+                    acc[1] += src.data[i + 1] as u64;
+                    acc[2] += src.data[i + 2] as u64;
+                    n += 1;
+                }
+            }
+            let i = (y as usize * dst_w as usize + x as usize) * 4;
+            out.data[i] = ((acc[0] / n.max(1)) as f64 * dim) as u8;
+            out.data[i + 1] = ((acc[1] / n.max(1)) as f64 * dim) as u8;
+            out.data[i + 2] = ((acc[2] / n.max(1)) as f64 * dim) as u8;
+            out.data[i + 3] = 255;
+        }
+    }
+    out
+}
+
+/// Fill the square region of `capture` centered on `(cx, cy)` (capture px,
+/// half-size [`CURSOR_BAKE_HALF`]) with the average color of the 1 px ring
+/// just outside it, returning the scrubbed copy. Used to remove the
+/// launching app's own baked-in cursor graphic from the minimap overview
+/// before downscaling — the ring-average fill blends into the surrounding
+/// content, and the marker dot is drawn on top of it anyway.
+fn inpaint_cursor_region(capture: &RgbaBuffer, cx: f64, cy: f64, half: i32) -> RgbaBuffer {
+    let mut out = capture.clone();
+    let (w, h) = (capture.width, capture.height);
+    let (x0, y0) = (cx as i32 - half, cy as i32 - half);
+    let (x1, y1) = (cx as i32 + half, cy as i32 + half);
+    // Average the ring just outside the region (clamped to the frame).
+    let mut acc = [0u64; 3];
+    let mut n = 0u64;
+    for y in (y0 - 1).max(0)..(y1 + 1).min(h) {
+        for x in (x0 - 1).max(0)..(x1 + 1).min(w) {
+            if x >= x0 && x < x1 && y >= y0 && y < y1 {
+                continue;
+            }
+            let i = (y as usize * w as usize + x as usize) * 4;
+            acc[0] += out.data[i] as u64;
+            acc[1] += out.data[i + 1] as u64;
+            acc[2] += out.data[i + 2] as u64;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return out;
+    }
+    let col = [(acc[0] / n) as u8, (acc[1] / n) as u8, (acc[2] / n) as u8];
+    for y in y0.max(0)..y1.min(h) {
+        for x in x0.max(0)..x1.min(w) {
+            let i = (y as usize * w as usize + x as usize) * 4;
+            out.data[i] = col[0];
+            out.data[i + 1] = col[1];
+            out.data[i + 2] = col[2];
+        }
+    }
+    out
+}
+
+/// Build the minimap sprite for one frame.
+///
+/// Returns `(sprite, new_base)`: the sprite to draw (`None` when the minimap
+/// is hidden) and the (possibly rebuilt) cached base buffer the caller must
+/// store back. The base — chrome + dimmed downscale, no marker — is reused
+/// across frames; only the marker (view outline + cursor dot) is redrawn
+/// each frame into a clone, keeping per-frame cost to a small buffer copy.
+/// `scale` multiplies the sprite rect (RENDER_SCALE on the GPU path so the
+/// rect spans the scaled surface while the buffer stays at logical
+/// resolution; 1.0 on the CPU path); the base buffer itself is
+/// scale-independent and shared between the paths.
+#[allow(clippy::too_many_arguments)]
+fn build_minimap_sprite(
+    capture: &RgbaBuffer,
+    view_center: (f64, f64),
+    zoom: f64,
+    viewport: (f64, f64),
+    scale: f64,
+    corner: crate::osd::Corner,
+    bake_pos: Option<(f64, f64)>,
+    base: Option<RgbaBuffer>,
+) -> (Option<OsdSprite>, Option<RgbaBuffer>) {
+    let (mm_x, mm_y, mm_w, mm_h) = minimap_layout(
+        viewport,
+        (capture.width as f64, capture.height as f64),
+        14.0,
+        corner,
+    );
+    let buf_w = mm_w.round() as i32;
+    let buf_h = mm_h.round() as i32;
+    // Rebuild the base when it is missing or the size changed (e.g. the
+    // viewport resized since the last build).
+    let base = match base {
+        Some(b) if b.width == buf_w && b.height == buf_h => b,
+        _ => {
+            let mut b = RgbaBuffer::new(buf_w, buf_h);
+            // Three concentric square borders, each 2 px wide — outer white,
+            // middle black, inner white — with sharp corners. The interior is
+            // filled with a translucent dark backdrop, then the dimmed image
+            // is blitted inside it (inset by 6 px = 3 borders x 2 px).
+            let border_white = [235, 235, 240, 255];
+            let border_black = [18, 18, 20, 255];
+            for y in 0..buf_h {
+                for x in 0..buf_w {
+                    let i = (y as usize * buf_w as usize + x as usize) * 4;
+                    let in_black = x >= 2 && y >= 2 && x < buf_w - 2 && y < buf_h - 2;
+                    let in_white = x >= 4 && y >= 4 && x < buf_w - 4 && y < buf_h - 4;
+                    let in_interior = x >= 6 && y >= 6 && x < buf_w - 6 && y < buf_h - 6;
+                    let col = if !in_black {
+                        border_white
+                    } else if !in_white {
+                        border_black
+                    } else if !in_interior {
+                        border_white
+                    } else {
+                        [10, 10, 12, 200] // translucent dark interior
+                    };
+                    b.data[i..i + 4].copy_from_slice(&col);
+                }
+            }
+            // Dimmed image inset by 6 px (inside the three 2-px borders),
+            // scrubbed of the baked-in launch cursor when its position is
+            // known (XWayland / software cursors can't be excluded by
+            // `overlay_cursor = 0`, so remove them here instead — the scrub
+            // never touches the magnified view, only the minimap base).
+            let inset = 6;
+            let iw = (buf_w - inset * 2).max(1);
+            let ih = (buf_h - inset * 2).max(1);
+            let src = match bake_pos {
+                Some((cx, cy)) => inpaint_cursor_region(capture, cx, cy, CURSOR_BAKE_HALF),
+                None => capture.clone(),
+            };
+            let img = downscale_dimmed(&src, iw, ih, 0.45);
+            for y in 0..ih {
+                let s = y as usize * iw as usize * 4;
+                let d = ((y + inset) as usize * buf_w as usize + inset as usize) * 4;
+                b.data[d..d + (iw as usize * 4)]
+                    .copy_from_slice(&img.data[s..s + (iw as usize * 4)]);
+            }
+            b
+        }
+    };
+
+    let mut frame = base.clone();
+    // Map a capture-px coordinate to the minimap image area (which starts at
+    // inset=6 px inside the buffer, below the three 2-px borders).
+    let inset = 6.0;
+    let (cw, ch) = (capture.width as f64, capture.height as f64);
+    let img_w = (buf_w as f64 - inset * 2.0).max(1.0);
+    let img_h = (buf_h as f64 - inset * 2.0).max(1.0);
+    let to_mm = |px: f64, total: f64, img: f64| inset + (px / total.max(1.0)) * img;
+    // Marker: the visible region outline (clamped to the capture), amber so
+    // it stands out against the dimmed overview.
+    if let Some((rx0, ry0, rx1, ry1)) = minimap_marker_rect(view_center, zoom, viewport) {
+        let x0 = to_mm(rx0.clamp(0.0, cw), cw, img_w).round() as i32;
+        let x1 = to_mm(rx1.clamp(0.0, cw), cw, img_w).round() as i32;
+        let y0 = to_mm(ry0.clamp(0.0, ch), ch, img_h).round() as i32;
+        let y1 = to_mm(ry1.clamp(0.0, ch), ch, img_h).round() as i32;
+        // Keep the outline at least 1 px wide/tall without ever inverting or
+        // collapsing it: the low corner never exceeds high-1 and the high
+        // corner never drops below low+1 (rounding can otherwise collapse a
+        // very small rect — or, with `.max` on the low corner, collapse *any*
+        // rect down to a single pixel).
+        let (x0, x1) = (x0.min(x1 - 1), x1.max(x0 + 1));
+        let (y0, y1) = (y0.min(y1 - 1), y1.max(y0 + 1));
+        // Skip the outline when the visible region is smaller than the marker
+        // dot: it would sit hidden behind the dot with only stray corner
+        // pixels poking out (a "single pixel" artifact at deep zoom). The
+        // dot alone marks the position then.
+        if (x1 - x0) >= MINIMAP_MARKER_MIN_EDGE && (y1 - y0) >= MINIMAP_MARKER_MIN_EDGE {
+            // Short L-shaped brackets at the four corners of the visible
+            // region (camera-viewfinder style) instead of solid edges — the
+            // corners convey the extent without the busy full rectangle.
+            // Each leg is `tick` px long, shrinking to half the edge on
+            // small regions so opposite brackets never overlap.
+            let tick = MINIMAP_CORNER_TICK
+                .min((x1 - x0) / 2)
+                .min((y1 - y0) / 2)
+                .max(1);
+            let outline = [255, 200, 70, 255];
+            // Top-left corner.
+            fill_px(
+                &mut frame.data,
+                buf_w,
+                buf_h,
+                x0,
+                x0 + tick,
+                y0,
+                y0 + 1,
+                outline,
+            );
+            fill_px(
+                &mut frame.data,
+                buf_w,
+                buf_h,
+                x0,
+                x0 + 1,
+                y0,
+                y0 + tick,
+                outline,
+            );
+            // Top-right corner.
+            fill_px(
+                &mut frame.data,
+                buf_w,
+                buf_h,
+                x1 - tick,
+                x1,
+                y0,
+                y0 + 1,
+                outline,
+            );
+            fill_px(
+                &mut frame.data,
+                buf_w,
+                buf_h,
+                x1 - 1,
+                x1,
+                y0,
+                y0 + tick,
+                outline,
+            );
+            // Bottom-left corner.
+            fill_px(
+                &mut frame.data,
+                buf_w,
+                buf_h,
+                x0,
+                x0 + tick,
+                y1 - 1,
+                y1,
+                outline,
+            );
+            fill_px(
+                &mut frame.data,
+                buf_w,
+                buf_h,
+                x0,
+                x0 + 1,
+                y1 - tick,
+                y1,
+                outline,
+            );
+            // Bottom-right corner.
+            fill_px(
+                &mut frame.data,
+                buf_w,
+                buf_h,
+                x1 - tick,
+                x1,
+                y1 - 1,
+                y1,
+                outline,
+            );
+            fill_px(
+                &mut frame.data,
+                buf_w,
+                buf_h,
+                x1 - 1,
+                x1,
+                y1 - tick,
+                y1,
+                outline,
+            );
+        }
+    }
+    // Cursor marker: a filled red circle with a 1 px black outline, at the
+    // view center (where the magnified cursor sprite always sits). Filled
+    // per scanline so the shape is a real circle at any size.
+    let dx = to_mm(view_center.0.clamp(0.0, cw), cw, img_w).round() as i32;
+    let dy = to_mm(view_center.1.clamp(0.0, ch), ch, img_h).round() as i32;
+    let (r_in, r_out) = (2.5f64, 3.5f64); // red fill + 1 px black outline
+    let (red, black) = ([255, 60, 60, 255], [0, 0, 0, 255]);
+    // Rows are only iterated while the radius actually covers them (never
+    // beyond `r_out`), and rows whose half-width is below a pixel are
+    // skipped — so no degenerate 1 px spikes at the top/bottom of the circle.
+    for py in (dy - r_out as i32)..=(dy + r_out as i32) {
+        let dyr = (py as f64 - dy as f64).abs();
+        let half = ((r_out * r_out - dyr * dyr).max(0.0)).sqrt();
+        if half < 0.5 {
+            continue;
+        }
+        let x_lo = (dx as f64 - half).floor() as i32;
+        let x_hi = (dx as f64 + half).ceil() as i32;
+        // Outline: the whole row within the outer radius.
+        fill_px(
+            &mut frame.data,
+            buf_w,
+            buf_h,
+            x_lo,
+            x_hi + 1,
+            py,
+            py + 1,
+            black,
+        );
+        if dyr <= r_in {
+            let half_in = ((r_in * r_in - dyr * dyr).max(0.0)).sqrt();
+            let xi_lo = (dx as f64 - half_in).ceil() as i32;
+            let xi_hi = (dx as f64 + half_in).floor() as i32;
+            fill_px(
+                &mut frame.data,
+                buf_w,
+                buf_h,
+                xi_lo,
+                xi_hi + 1,
+                py,
+                py + 1,
+                red,
+            );
+        }
+    }
+
+    let sprite = OsdSprite {
+        buffer: frame,
+        x: (mm_x * scale).round() as i32,
+        y: (mm_y * scale).round() as i32,
+        width: (mm_w * scale).round() as i32,
+        height: (mm_h * scale).round() as i32,
+    };
+    (Some(sprite), Some(base))
 }
 
 /// Snap a capture-px position to the nearest whole capture pixel. The
@@ -711,13 +1216,23 @@ fn upscale_nearest(src: &[u8], w: u32, h: u32, scale: f64) -> (Vec<u8>, u32, u32
     (out, nw, nh)
 }
 
-/// Alpha-blend a screenshot overlay buffer (tightly packed `width*4` rows)
-/// into an RGBA canvas in place (the CPU fallback path; on the GPU path the
-/// overlay is uploaded as a texture and the sprite shader blends it).
-fn blend_overlay_into(canvas: &mut [u8], stride: i32, overlay: &[u8], width: i32, height: i32) {
+/// Alpha-blend an overlay buffer (tightly packed `width*4` rows) into an RGBA
+/// canvas in place at offset `(ox, oy)` (the CPU fallback path; on the GPU
+/// path overlays are uploaded as textures and the sprite shader blends
+/// them). Used for the fullscreen screenshot overlay (offset 0) and the
+/// corner minimap sprite.
+fn blend_overlay_into(
+    canvas: &mut [u8],
+    stride: i32,
+    overlay: &[u8],
+    width: i32,
+    height: i32,
+    ox: i32,
+    oy: i32,
+) {
     for y in 0..height {
         for x in 0..width {
-            let di = (y as usize * stride as usize + x as usize) * 4;
+            let di = (((y + oy) as usize) * (stride as usize) + (x + ox) as usize) * 4;
             let si = (y as usize * width as usize + x as usize) * 4;
             let a = overlay[si + 3] as f32 / 255.0;
             if a <= 0.0 {
@@ -981,6 +1496,12 @@ pub struct MagnifierWindow {
     /// applied with the real capture scale once the capture exists (the
     /// enter can arrive before the screencopy completes).
     launch_position: Option<(f64, f64)>,
+    /// The launch pointer position in capture px — where the launching app's
+    /// own cursor graphic (XWayland / software cursors, which `overlay_cursor
+    /// = 0` cannot exclude) is baked into the frozen frame. The minimap base
+    /// scrubs this region so no stray miniature cursor appears next to its
+    /// marker dot.
+    cursor_bake_capture_pos: Option<(f64, f64)>,
     view_center: Option<(f64, f64)>,
     /// Wall-clock time of the last pointer-motion event, driving the offset
     /// correction's time constant (only real motion corrects — never
@@ -989,6 +1510,12 @@ pub struct MagnifierWindow {
     /// A motion-driven redraw was throttled and is waiting for the next
     /// [`MOTION_REDRAW_INTERVAL`] deadline (see [`MagnifierWindow::request_motion_redraw`]).
     redraw_pending: bool,
+    /// A settle redraw is pending: armed on pointer motion, fired once the
+    /// pointer has been still for [`CURSOR_SETTLE_DELAY`], so the frozen
+    /// screen's sampling origin snaps onto the cursor's lattice (see
+    /// [`MagnifierWindow::draw_frame_if_settle_due`]). The cursor itself
+    /// never moves.
+    settle_pending: bool,
     /// When the last motion-driven redraw happened; used to cap the redraw
     /// rate so high-frequency pointer events cannot flood the compositor.
     last_draw_at: Option<std::time::Instant>,
@@ -1004,6 +1531,16 @@ pub struct MagnifierWindow {
     magnified_cursor: Option<crate::cursor::MagnifiedCursor>,
     blank_cursor_surface: Option<wl_surface::WlSurface>,
     cursor_pool: Option<SlotPool>,
+    /// The `zwp_pointer_constraints_v1` global (when the compositor provides
+    /// it). Used to confine the pointer to the layer surface so it can never
+    /// leave into other surfaces (shell hot corners, panels) — the compositor
+    /// then always keeps the blank cursor in effect and the OS cursor never
+    /// shows, and the delivered position at the screen edges is clamped
+    /// instead of oscillating sub-pixel-wise.
+    pointer_constraints: PointerConstraintsState,
+    /// The active pointer confinement on the layer surface (persistent
+    /// lifetime, whole-surface region), kept alive for the app's lifetime.
+    confinement: Option<ZwpConfinedPointerV1>,
     /// A cursor surface showing the real system cursor (from the loaded theme)
     /// at its native size, used while the Configuration window is open so the
     /// UI is operated with a visible pointer. The hotspot is stored alongside.
@@ -1086,6 +1623,15 @@ pub struct MagnifierWindow {
     /// further motion events are delivered — the exact case where a
     /// per-event evaluation missed the final shortfall.
     last_motion_delta: Option<(f64, f64)>,
+    /// Whether the minimap overlay (a dimmed overview of the frozen screen
+    /// with the visible-region marker) is shown in the viewport corner
+    /// (toggled with the `minimap` key, default `M`).
+    minimap_visible: bool,
+    /// Cached minimap base buffer (dimmed downscale of the capture + chrome),
+    /// without the per-frame view marker. Rebuilt only when the capture or
+    /// the minimap size changes; each frame the marker is drawn into a clone
+    /// of this.
+    minimap_base: Option<RgbaBuffer>,
 }
 
 struct ScreencastManagerData;
@@ -1389,6 +1935,53 @@ impl LayerShellHandler for MagnifierWindow {
         }
 
         self.layer.commit();
+    }
+}
+
+impl PointerConstraintsHandler for MagnifierWindow {
+    // The confinement is persistent, so nothing needs to be done on
+    // activation or deactivation — the compositor re-engages it on every
+    // pointer enter into the layer surface.
+    fn confined(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &ZwpConfinedPointerV1,
+        _: &wl_surface::WlSurface,
+        _: &wl_pointer::WlPointer,
+    ) {
+    }
+
+    fn unconfined(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &ZwpConfinedPointerV1,
+        _: &wl_surface::WlSurface,
+        _: &wl_pointer::WlPointer,
+    ) {
+    }
+
+    fn locked(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wayland_protocols::wp::pointer_constraints::zv1::client::
+            zwp_locked_pointer_v1::ZwpLockedPointerV1,
+        _: &wl_surface::WlSurface,
+        _: &wl_pointer::WlPointer,
+    ) {
+    }
+
+    fn unlocked(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wayland_protocols::wp::pointer_constraints::zv1::client::
+            zwp_locked_pointer_v1::ZwpLockedPointerV1,
+        _: &wl_surface::WlSurface,
+        _: &wl_pointer::WlPointer,
+    ) {
     }
 }
 
@@ -1736,6 +2329,11 @@ impl KeyboardHandler for MagnifierWindow {
                 self.state.toggle_osd();
                 self.draw_frame(qh);
                 return;
+            } else if keysym_str == self.state.config.keybindings.minimap {
+                // The minimap stays toggleable in Screenshot Mode too.
+                self.minimap_visible = !self.minimap_visible;
+                self.draw_frame(qh);
+                return;
             } else {
                 self.handle_screenshot_key(event.keysym, &keysym_str);
                 self.draw_frame(qh);
@@ -1824,6 +2422,10 @@ impl KeyboardHandler for MagnifierWindow {
             self.state.toggle_cursor();
             self.draw_frame(qh);
             tracing::info!("Magnified cursor visible: {}", self.state.cursor_visible);
+        } else if keysym_str == config_key.minimap {
+            self.minimap_visible = !self.minimap_visible;
+            self.draw_frame(qh);
+            tracing::info!("Minimap visible: {}", self.minimap_visible);
         } else if keysym_str == config_key.reset_zoom {
             let default_zoom = self.state.config.default_zoom.unwrap_or(3.0);
             self.set_zoom(default_zoom, self.runtime_min_zoom());
@@ -1991,6 +2593,9 @@ impl SeatHandler for MagnifierWindow {
                 self.blank_cursor_surface = Some(cursor_surface);
                 self.cursor_pool = Some(cursor_pool);
             }
+            // Confine the pointer to the layer surface (best effort — the
+            // compositor may not provide pointer constraints).
+            self.ensure_confinement(qh);
         }
     }
 
@@ -2014,6 +2619,9 @@ impl SeatHandler for MagnifierWindow {
             self.config_cursor_surface.take();
             self.config_cursor_pool.take();
             self.config_cursor_hotspot.take();
+            if let Some(confinement) = self.confinement.take() {
+                confinement.destroy();
+            }
         }
     }
 
@@ -2079,6 +2687,38 @@ impl wayland_client::Dispatch<wl_region::WlRegion, ()> for MagnifierWindow {
 }
 
 impl MagnifierWindow {
+    /// Confine the pointer to the layer surface via `zwp_pointer_constraints_v1`
+    /// (persistent lifetime, NULL region = the whole surface input region), so
+    /// it can never leave the magnifier into other surfaces. The compositor
+    /// then always keeps the blank cursor in effect (the OS cursor never shows
+    /// at hot corners or edges) and clamps the delivered position at the
+    /// screen edges instead of letting it oscillate sub-pixel-wise. No-op when
+    /// the compositor does not provide the protocol.
+    fn ensure_confinement(&mut self, qh: &QueueHandle<Self>) {
+        if self.confinement.is_some() {
+            return;
+        }
+        let Some(pointer) = &self.pointer else {
+            return;
+        };
+        let surface = self.layer.wl_surface().clone();
+        // NULL region = the whole surface input region (the fullscreen
+        // overlay). Persistent lifetime re-engages the confinement on every
+        // pointer re-enter. Best effort: compositors without the protocol
+        // (or without a pointer) simply leave the pointer unconfined.
+        let Ok(confinement) = self.pointer_constraints.confine_pointer(
+            &surface,
+            pointer,
+            None,
+            Lifetime::Persistent,
+            qh,
+        ) else {
+            return;
+        };
+        tracing::info!("Pointer confined to the layer surface");
+        self.confinement = Some(confinement);
+    }
+
     /// Request a screencopy of the current output. Returns `false` (without
     /// retrying) when the capture cannot be issued yet — e.g. no output is
     /// known — so callers can retry later instead of leaving the overlay
@@ -2399,6 +3039,24 @@ impl MagnifierWindow {
         }
     }
 
+    /// After a timed wait, redraw if the pointer has been still long enough
+    /// for the settle (armed by motion, fired once [`CURSOR_SETTLE_DELAY`]
+    /// of stillness has passed). A single redraw applies the
+    /// cursor-lattice-aligned sampling origin; further motion re-arms it.
+    fn draw_frame_if_settle_due(&mut self, qh: &QueueHandle<Self>) {
+        if !self.settle_pending {
+            return;
+        }
+        let due = match self.last_motion_at {
+            None => true,
+            Some(last) => last.elapsed() >= CURSOR_SETTLE_DELAY,
+        };
+        if due {
+            self.settle_pending = false;
+            self.draw_frame(qh);
+        }
+    }
+
     /// The poll bound for the event loop: the earliest of the nudge-repeat
     /// deadline and the pending motion-redraw deadline. Returns `None` when
     /// neither is pending, so the loop blocks indefinitely (idle behaviour
@@ -2412,6 +3070,17 @@ impl MagnifierWindow {
                     let elapsed = std::time::Instant::now().duration_since(last);
                     MOTION_REDRAW_INTERVAL.saturating_sub(elapsed)
                 }
+            };
+            best = Some(match best {
+                None => wait,
+                Some(b) => b.min(wait),
+            });
+        }
+        if self.settle_pending {
+            let wait = match self.last_motion_at {
+                None => CURSOR_SETTLE_DELAY,
+                Some(last) => CURSOR_SETTLE_DELAY
+                    .saturating_sub(std::time::Instant::now().duration_since(last)),
             };
             best = Some(match best {
                 None => wait,
@@ -2628,15 +3297,40 @@ impl MagnifierWindow {
         let margin_y = reach_margin(peak_y);
         let reach_x = EdgeReach::new(self.width as f64, bounds.0, sx);
         let reach_y = EdgeReach::new(self.height as f64, bounds.1, sy);
+        let (px, py) = self.pointer_position_f;
         let result = (
-            reach_x.apply(center.0, lx, self.pointer_position_f.0, margin_x),
+            if wall_hold(
+                center.0,
+                bounds.0,
+                px,
+                self.width as f64,
+                margin_x,
+                WALL_HOLD_EPS,
+            ) {
+                bounds.0
+            } else if wall_hold(center.0, 0.0, px, 0.0, margin_x, WALL_HOLD_EPS) {
+                0.0
+            } else {
+                reach_x.apply(center.0, lx, px, margin_x)
+            },
             if self.hold_to_zoom_active {
                 // The y-lock owns the view y during hold-to-zoom: never snap
                 // it to a wall (the anchor content under the cursor must stay
                 // glued while the hand travels to zoom).
                 center.1
+            } else if wall_hold(
+                center.1,
+                bounds.1,
+                py,
+                self.height as f64,
+                margin_y,
+                WALL_HOLD_EPS,
+            ) {
+                bounds.1
+            } else if wall_hold(center.1, 0.0, py, 0.0, margin_y, WALL_HOLD_EPS) {
+                0.0
             } else {
-                reach_y.apply(center.1, ly, self.pointer_position_f.1, margin_y)
+                reach_y.apply(center.1, ly, py, margin_y)
             },
         );
         // Diagnostic (run with `RUST_LOG=maggie=debug`): near the surface
@@ -2703,7 +3397,12 @@ impl MagnifierWindow {
         }
         if let Some(position) = self.launch_position.take() {
             let (sx, sy) = self.capture_scale();
-            self.view_center = Some(self.clamp_to_capture((position.0 * sx, position.1 * sy)));
+            let center = self.clamp_to_capture((position.0 * sx, position.1 * sy));
+            self.view_center = Some(center);
+            // The baked cursor graphic sits at the same spot the view centers
+            // on; scrub it out of the (possibly already built) minimap base.
+            self.cursor_bake_capture_pos = Some(center);
+            self.minimap_base = None;
             self.launch_centered = true;
         }
     }
@@ -2724,6 +3423,7 @@ impl MagnifierWindow {
                     config_key.screenshot_scale_toggle,
                     self.effective_screenshot_scale().name()
                 ),
+                format!("{}  toggle minimap", config_key.minimap),
             ];
         }
         let config_key = &self.state.config.keybindings;
@@ -2748,10 +3448,24 @@ impl MagnifierWindow {
             format!("{}  window selection", config_key.screenshot_window),
             format!("{}  config window", config_key.config_window),
             format!("{}  toggle cursor", config_key.toggle_cursor),
+            format!("{}  toggle minimap", config_key.minimap),
             format!("hold {} + move  smooth zoom", config_key.hold_to_zoom),
             format!("MMB / {}  reset zoom", config_key.reset_zoom),
             "Q / Esc / RMB  quit".to_string(),
         ];
+        // The magnified cursor always sits at the viewport center, and the
+        // view center in capture px is exactly what is under it. The frozen
+        // frame is the output at its native resolution, so capture px are the
+        // real physical screen pixels under the cursor (no scaling or
+        // logical-coordinate fudging). Only shown once the first capture
+        // (and its launch centering) has settled the view center — never a
+        // placeholder.
+        if let Some((cx, cy)) = self.view_center {
+            lines.insert(
+                1,
+                format!("pos {}x{}", cx.round() as i64, cy.round() as i64),
+            );
+        }
         // A transient notice (e.g. the path of the last saved screenshot) is
         // shown for a few seconds after the event.
         if let Some((message, at)) = &self.screenshot_notice
@@ -3094,6 +3808,17 @@ impl MagnifierWindow {
         // direction. The result is written back so the next motion event
         // pans from the reached position.
         let (center_x, center_y) = self.apply_edge_reach((center_x, center_y));
+        // Pixel-grid lock: quantize the view center to the nearest integer
+        // capture pixel and keep it there forever (see
+        // [`quantize_center_to_pixel_grid`]). The magnified cursor sits at
+        // the dead center on a fixed lattice; rounding the center — the
+        // capture pixel under the cursor — to an exact integer makes the
+        // cursor's texels and the screen's texels coincide permanently: the
+        // launch snap the user asked for, applied once and then held for
+        // every subsequent pan and zoom. Nothing moves on its own; the
+        // cursor never leaves the center.
+        let (center_x, center_y) =
+            quantize_center_to_pixel_grid((center_x, center_y), (source_w as f64, source_h as f64));
         self.view_center = Some((center_x, center_y));
         let src_x = center_x - view_w / 2.0;
         let src_y = center_y - view_h / 2.0;
@@ -3128,19 +3853,28 @@ impl MagnifierWindow {
             None
         };
 
-        // The OSD ring marks the magnified cursor (always at the viewport
-        // center); fall back to the hand position when no magnified cursor is
-        // drawn.
-        let osd_ring = cursor_logical
-            .map(|(cx, cy)| (cx as i32, cy as i32))
-            .unwrap_or(self.state.pointer_position);
-        // In Screenshot Mode the legend moves to a fixed top-left corner so
-        // it never overlaps the area being selected; otherwise it follows the
-        // cursor ring as usual.
-        let osd_anchor = if self.screenshot_active {
-            (16, 16)
+        // OSD placement: configured corner (default top-left), or always
+        // top-left in Screenshot Mode so it never overlaps the selection.
+        let osd_corner = if self.screenshot_active {
+            crate::osd::Corner::TopLeft
         } else {
-            osd_ring
+            self.state.config.osd_corner
+        };
+        // Minimap placement: configured corner (default bottom-right). If it
+        // shares a corner with the OSD, push it to the opposite corner so
+        // the two never overlap.
+        let minimap_corner = {
+            let desired = self.state.config.minimap_corner;
+            if desired == osd_corner {
+                match desired {
+                    crate::osd::Corner::TopLeft => crate::osd::Corner::BottomRight,
+                    crate::osd::Corner::TopRight => crate::osd::Corner::BottomLeft,
+                    crate::osd::Corner::BottomLeft => crate::osd::Corner::TopRight,
+                    crate::osd::Corner::BottomRight => crate::osd::Corner::TopLeft,
+                }
+            } else {
+                desired
+            }
         };
         // The screenshot selection rectangle mapped into logical (viewport)
         // px, and the configured border color — computed here (before the
@@ -3177,10 +3911,7 @@ impl MagnifierWindow {
             let osd = if self.state.osd_visible || notice_fresh {
                 crate::osd::build_osd_sprite(
                     &lines,
-                    (
-                        osd_anchor.0 * crate::gpu::RENDER_SCALE,
-                        osd_anchor.1 * crate::gpu::RENDER_SCALE,
-                    ),
+                    osd_corner,
                     self.width as i32 * crate::gpu::RENDER_SCALE,
                     self.height as i32 * crate::gpu::RENDER_SCALE,
                 )
@@ -3242,38 +3973,78 @@ impl MagnifierWindow {
                 self.screenshot_overlay_state = Some(overlay_state);
             }
             let overlay = self.screenshot_overlay.as_ref();
-            // The GPU buffer is RENDER_SCALE x the logical size, so both the
-            // cursor sprite, its hotspot and its position must be scaled to
-            // match.
+            // The GPU buffer is RENDER_SCALE x the logical size, so the
+            // cursor sprite origin is scaled to match. The cursor never
+            // moves on its own: its origin is always the dead-center hotspot
+            // position (viewport center minus the scaled hotspot offset),
+            // rounded to the surface pixel grid so the sprite's own texel
+            // edges are crisp. In Screenshot Mode the cursor tracks the
+            // live pointer (the aim position) instead.
             let cursor = cursor_logical.map(|(cx, cy)| {
                 let (buf, (hx, hy)) = self
                     .magnified_cursor
                     .as_mut()
                     .expect("magnified cursor present")
                     .sprite(crate::gpu::RENDER_SCALE as f64);
-                (
-                    (
-                        (cx * crate::gpu::RENDER_SCALE as f64) as i32,
-                        (cy * crate::gpu::RENDER_SCALE as f64) as i32,
-                    ),
-                    buf,
-                    (hx, hy),
-                )
+                let origin_x = (cx * crate::gpu::RENDER_SCALE as f64 - hx).round() as i32;
+                let origin_y = (cy * crate::gpu::RENDER_SCALE as f64 - hy).round() as i32;
+                ((origin_x, origin_y), buf, (hx, hy))
             });
+            // The minimap overlay (dimmed overview + view marker), rebuilt
+            // per frame from the cached base while visible; the sprite rect
+            // is in RENDER_SCALE surface coordinates, the buffer stays at
+            // logical resolution (LINEAR-upscaled by the GPU).
+            let minimap = if self.minimap_visible {
+                let (sprite, base) = build_minimap_sprite(
+                    &captured.buffer,
+                    (center_x, center_y),
+                    zoom,
+                    (self.width as f64, self.height as f64),
+                    crate::gpu::RENDER_SCALE as f64,
+                    minimap_corner,
+                    self.cursor_bake_capture_pos,
+                    self.minimap_base.take(),
+                );
+                self.minimap_base = base;
+                sprite
+            } else {
+                None
+            };
             if zoom > 0.0 {
+                // The view center is quantized to integer capture px (see
+                // `draw_frame`), so the sampling origin already keeps every
+                // texel boundary on an exact pixel boundary: capture pixel
+                // `C == center` starts exactly at the viewport center, where
+                // the cursor hotspot sits — the cursor's and the screen's
+                // blocks share one lattice. No separate origin snap is
+                // needed (it would shift the phase and break the lock).
                 let uv = (
                     src_x / source_w as f64,
                     src_y / source_h as f64,
                     view_w.min(source_w as f64) / source_w as f64,
                     view_h.min(source_h as f64) / source_h as f64,
                 );
-                gpu.draw(Some(uv), osd.as_ref(), cursor.as_ref(), overlay, rebuild);
+                gpu.draw(
+                    Some(uv),
+                    osd.as_ref(),
+                    cursor.as_ref(),
+                    overlay,
+                    rebuild,
+                    minimap.as_ref(),
+                );
             } else {
                 // 0 % zoom: the magnified view collapses to nothing — draw a
                 // plain black view (src = None clears the buffer) while the
                 // magnified cursor and OSD legend stay visible so the user
                 // can still navigate back in.
-                gpu.draw(None, osd.as_ref(), cursor.as_ref(), overlay, rebuild);
+                gpu.draw(
+                    None,
+                    osd.as_ref(),
+                    cursor.as_ref(),
+                    overlay,
+                    rebuild,
+                    minimap.as_ref(),
+                );
             }
             if self.animating {
                 self.request_frame_callback(qh);
@@ -3281,6 +4052,31 @@ impl MagnifierWindow {
             return;
         }
 
+        // CPU fallback: same texel-grid lock as the GPU branch, but the
+        // canvas is at logical resolution, so one capture texel spans `zoom`
+        // canvas px. The cursor sprite is built first so its origin can serve
+        // as the settle anchor for the sampling origin below (mirroring the
+        // GPU settle: while the pointer rests, the origin snaps onto the
+        // cursor's lattice so the screen's blocks and the cursor's blocks
+        // coincide with the cursor at the dead center).
+        let cursor_buf = cursor_logical.map(|(cx, cy)| {
+            let (buf, (hx, hy)) = self
+                .magnified_cursor
+                .as_mut()
+                .expect("magnified cursor present")
+                .sprite(1.0);
+            // Dead center origin (or the live pointer in Screenshot Mode), on
+            // the canvas pixel grid. The cursor never moves on its own.
+            let origin_x = (cx - hx).round() as i32;
+            let origin_y = (cy - hy).round() as i32;
+            (
+                (origin_x, origin_y),
+                buf,
+                (hx.round() as i32, hy.round() as i32),
+            )
+        });
+        // Same pixel-grid lock as the GPU branch: the quantized center keeps
+        // the texel grid on the cursor's lattice at logical resolution too.
         let scaled =
             self.state
                 .renderer
@@ -3290,20 +4086,6 @@ impl MagnifierWindow {
         // always shows the legend briefly.
         let show_osd = self.state.osd_visible || notice_fresh;
         let osd_lines = self.osd_lines();
-        let osd_cursor = osd_ring; // Precompute the cursor sprite up front: the fill closure below cannot
-        // borrow `self` while `render_frame` holds `&mut self`.
-        let cursor_buf = cursor_logical.map(|(cx, cy)| {
-            let (buf, (hx, hy)) = self
-                .magnified_cursor
-                .as_mut()
-                .expect("magnified cursor present")
-                .sprite(1.0);
-            (
-                (cx as i32, cy as i32),
-                buf,
-                (hx.round() as i32, hy.round() as i32),
-            )
-        });
         // The screenshot overlay at logical resolution, blended into the
         // canvas inside the render closure (which cannot borrow `self`).
         // Cached like the GPU path: rebuilt only when the mode/selection
@@ -3350,6 +4132,25 @@ impl MagnifierWindow {
             .screenshot_overlay
             .as_ref()
             .map(|b| (b.data.clone(), b.width, b.height));
+        // The minimap for the CPU path: the same base-cached sprite, at
+        // logical resolution, blended into the canvas at its corner position
+        // inside the render closure (which cannot borrow `self`).
+        let minimap_cpu: Option<(RgbaBuffer, i32, i32)> = if self.minimap_visible {
+            let (sprite, base) = build_minimap_sprite(
+                &captured.buffer,
+                (center_x, center_y),
+                zoom,
+                (self.width as f64, self.height as f64),
+                1.0,
+                minimap_corner,
+                self.cursor_bake_capture_pos,
+                self.minimap_base.take(),
+            );
+            self.minimap_base = base;
+            sprite.map(|s| (s.buffer, s.x, s.y))
+        } else {
+            None
+        };
 
         self.render_frame(qh, |canvas, width, height, stride| {
             canvas.fill(0);
@@ -3361,40 +4162,46 @@ impl MagnifierWindow {
                     .copy_from_slice(&src_row[..(dest_w as usize) * 4]);
             }
             if let Some((ref overlay, ow, oh)) = screenshot_overlay_cpu {
-                blend_overlay_into(canvas, stride, overlay, ow, oh);
+                blend_overlay_into(canvas, stride, overlay, ow, oh, 0, 0);
             }
             if let Some((cursor_pos, ref cursor_sprite, hotspot)) = cursor_buf {
                 Self::draw_cursor_at(canvas, stride, cursor_pos, cursor_sprite, hotspot);
             }
+            if let Some((ref mm, mm_x, mm_y)) = minimap_cpu {
+                blend_overlay_into(canvas, stride, &mm.data, mm.width, mm.height, mm_x, mm_y);
+            }
             if show_osd {
-                crate::osd::draw_osd(canvas, width, height, &osd_lines, osd_cursor);
+                crate::osd::draw_osd(canvas, width, height, &osd_lines, osd_corner);
             }
         });
     }
 
-    /// Blit a magnified-cursor sprite so its hotspot lands exactly on `pos`.
-    /// `stride` is the byte stride of a canvas row (width * 4); the usable
-    /// pixel width of each row is stride / 4.
+    /// Blit a magnified-cursor sprite at its sprite origin `pos` (top-left
+    /// corner). The engine computes the origin so the cursor's hotspot pixel
+    /// starts at the same canvas-pixel boundary as the screen texel at the
+    /// viewport center — the two grids share one lattice, and the hotspot
+    /// lands where the cursor tip should be. `stride` is the byte stride of a
+    /// canvas row (width * 4); the usable pixel width of each row is
+    /// stride / 4.
     fn draw_cursor_at(
         canvas: &mut [u8],
         stride: i32,
         pos: (i32, i32),
         cursor: &RgbaBuffer,
-        hotspot: (i32, i32),
+        _hotspot: (i32, i32),
     ) {
         let (cursor_w, cursor_h) = (cursor.width, cursor.height);
         let (pos_x, pos_y) = pos;
-        let (hot_x, hot_y) = hotspot;
         let canvas_w = stride / 4;
         let canvas_h = canvas.len() as i32 / stride;
 
         for y in 0..cursor_h {
-            let dest_y = pos_y - hot_y + y;
+            let dest_y = pos_y + y;
             if dest_y < 0 || dest_y >= canvas_h {
                 continue;
             }
             for x in 0..cursor_w {
-                let dest_x = pos_x - hot_x + x;
+                let dest_x = pos_x + x;
                 if dest_x < 0 || dest_x >= canvas_w {
                     continue;
                 }
@@ -3416,7 +4223,7 @@ impl MagnifierWindow {
 
     fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
         if let Some(gpu) = &mut self.gpu {
-            gpu.draw(None, None, None, None, false);
+            gpu.draw(None, None, None, None, false, None);
             return;
         }
         self.render_frame(qh, |canvas, _width, _height, _stride| {
@@ -3504,6 +4311,12 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         .bind::<ZwlrScreencopyManagerV1, _, _>(&qh, 1..=3, ScreencastManagerData)
         .ok();
 
+    // Pointer constraints (zwp_pointer_constraints_v1): confine the pointer
+    // to the layer surface so it can never leave into other surfaces (shell
+    // hot corners etc.) and the blank cursor always stays in effect. Not all
+    // compositors provide it — without it the app behaves exactly as before.
+    let pointer_constraints = PointerConstraintsState::bind(&globals, &qh);
+
     let mut event_queue = event_queue;
 
     let surface = compositor.create_surface(&qh);
@@ -3540,6 +4353,7 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         config.screenshot_path.clone(),
         config.screenshot_filename_pattern.clone(),
     );
+    let minimap_on_launch = config.minimap_visible;
     let state = MagnifierState::new(config, initial_zoom);
     let start_zoom = state.zoom;
 
@@ -3552,6 +4366,7 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         layer,
         compositor_state: compositor,
         screencast_manager,
+        pointer_constraints,
         screencast_pool: None,
         screencast_buffer: None,
         screencast_width: None,
@@ -3568,9 +4383,11 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         first_configure: true,
         launch_centered: false,
         launch_position: None,
+        cursor_bake_capture_pos: None,
         view_center: None,
         last_motion_at: None,
         redraw_pending: false,
+        settle_pending: false,
         last_draw_at: None,
         animating: false,
         frame_callback: None,
@@ -3584,6 +4401,7 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         magnified_cursor: Some(crate::cursor::MagnifiedCursor::new(start_zoom)),
         blank_cursor_surface: None,
         cursor_pool: None,
+        confinement: None,
         config_cursor_surface: None,
         config_cursor_pool: None,
         config_cursor_hotspot: None,
@@ -3604,6 +4422,8 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         hold_floor_dead_travel: 0.0,
         reach_travel: TravelHistory::new(),
         last_motion_delta: None,
+        minimap_visible: minimap_on_launch,
+        minimap_base: None,
     };
 
     tracing::info!(
@@ -3634,6 +4454,10 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         // so panning stays smooth at a capped rate without flooding the
         // compositor with per-event commits.
         window.draw_frame_if_motion_pending(&qh);
+        // And a cursor settle may have come due while the pointer rested:
+        // fire it so the cursor snaps into grid alignment without needing a
+        // further event.
+        window.draw_frame_if_settle_due(&qh);
     }
 
     Ok(())
@@ -3819,6 +4643,27 @@ mod tests {
         }
         assert!(seen_left_edge, "view must reach the exact left edge");
         assert!(seen_right_edge, "view must reach the exact right edge");
+    }
+
+    #[test]
+    fn wall_hold_pins_the_view_on_a_wall_at_the_edge() {
+        // Pointer parked at the right edge (within the reach margin) with the
+        // view on/near the wall -> held exactly on the wall, so sub-pixel
+        // pointer jitter can never leak into the readout (the old 3199/3200
+        // flicker at rest).
+        assert!(wall_hold(3200.0, 3200.0, 1829.0, 1829.0, 8.0, 3.0));
+        assert!(wall_hold(3199.2, 3200.0, 1828.9, 1829.0, 8.0, 3.0));
+        // Low wall.
+        assert!(wall_hold(0.5, 0.0, 0.3, 0.0, 8.0, 3.0));
+        // View on the wall with the pointer inside the margin is held.
+        assert!(wall_hold(3200.0, 3200.0, 1821.0, 1829.0, 8.0, 3.0));
+        // A deliberate pan away (view more than EPS off the wall) releases
+        // the hold immediately — no magnetic wall.
+        assert!(!wall_hold(3195.0, 3200.0, 1828.9, 1829.0, 8.0, 3.0));
+        // Pointer away from the edge: the hold must not fire even when the
+        // view happens to sit near the wall (the view tracks the hand content
+        // in steady state, so this only occurs transiently).
+        assert!(!wall_hold(3199.5, 3200.0, 1800.0, 1829.0, 8.0, 3.0));
     }
 
     #[test]
@@ -4520,6 +5365,337 @@ mod tests {
     }
 
     #[test]
+    fn snap_render_origin_locks_texel_boundaries_to_pixel_boundaries() {
+        // One capture texel spans 4 buffer px (zoom 2 on the GPU path). With
+        // the phase locked to half a texel, texel boundary i lands at buffer
+        // px `(i - origin) * 4 - 0.5`, which must be an integer for every
+        // texel — i.e. the magnified block edges sit exactly on physical
+        // pixels.
+        let f = 4.0;
+        let origin = snap_render_origin(123.456, f);
+        for i in 100..110 {
+            let boundary = (i as f64 - origin) * f - 0.5;
+            assert!(
+                (boundary - boundary.round()).abs() < 1e-9,
+                "texel {i} boundary {boundary} not on a pixel boundary"
+            );
+        }
+        // An already-aligned origin is left untouched.
+        assert_eq!(snap_render_origin(-149.875, f), -149.875);
+        // The snap never moves the origin by more than half a texel.
+        for probe in [0.0, 0.123, 77.7, -50.25, 1e6 + 0.999] {
+            let snapped = snap_render_origin(probe, f);
+            assert!(
+                ((snapped - probe) * f).abs() <= 0.5 + 1e-9,
+                "snap moved origin {probe} -> {snapped} by more than half a texel"
+            );
+        }
+        // Degenerate factors fall through to the input unchanged.
+        assert_eq!(snap_render_origin(10.0, 0.0), 10.0);
+        assert_eq!(snap_render_origin(10.0, f64::NAN), 10.0);
+    }
+
+    #[test]
+    fn snap_render_origin_keeps_phase_half_a_texel() {
+        // The lock condition is `fract(origin * px_per_texel) == 0.5` for any
+        // input, at any integral pixel-per-texel factor.
+        for f in [1.0, 2.0, 4.0, 6.0, 10.0] {
+            for probe in [-100.0, -3.7, 0.0, 0.25, 42.9, 999.99] {
+                let snapped = snap_render_origin(probe, f);
+                let phase = (snapped * f).fract();
+                let phase = (phase - phase.round()).abs();
+                assert!(
+                    (phase - 0.5).abs() < 1e-9,
+                    "phase of snap({probe}, {f}) = {phase}, want 0.5"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snap_src_to_cursor_lattice_aligns_screen_blocks_with_cursor_blocks() {
+        // The settle snaps the sampling origin so the capture-texel lattice
+        // coincides with the cursor's fixed lattice (whose sprite origin is
+        // `cursor_origin`) — like two layers in a bitmap editor — while the
+        // cursor itself stays at the dead center. Verify: crisp integer texel
+        // boundaries, texel start positions that lie exactly on the cursor's
+        // block lattice, and a content shift of at most half a capture pixel.
+        let factor: f64 = 6.0; // zoom 3 on the GPU path
+        let center = 1600.5;
+        let raw_src = center - 1829.0 / 3.0 / 2.0;
+        // Dead-center cursor sprite origin: W = viewport center surface px,
+        // hotspot offset hx = 5 * factor.
+        let w: f64 = 1829.0;
+        let cursor_origin = (w - 5.0 * factor).round();
+        let src = snap_src_to_cursor_lattice(raw_src, cursor_origin, factor);
+
+        // The settle never moves the content by more than half a capture px.
+        assert!(
+            (src - raw_src).abs() <= 0.5 + 1e-9,
+            "settle shifted origin by {:.3} capture px",
+            src - raw_src
+        );
+        // Texel boundaries are integers (crisp blocks).
+        let b0 = -src * factor - 0.5;
+        assert!(
+            (b0 - b0.round()).abs() < 1e-9,
+            "texel boundary {b0} not on a pixel boundary"
+        );
+        // The texel lattice lies on the cursor's block lattice: every texel
+        // start is cursor_origin + k * factor for integer k.
+        for j in 0..16 {
+            let texel_start = (b0 + j as f64 * factor).round();
+            let k = (texel_start - cursor_origin) / factor;
+            assert!(
+                (k - k.round()).abs() < 1e-9,
+                "texel {j} start {texel_start} not on the cursor lattice"
+            );
+        }
+    }
+
+    #[test]
+    fn snap_src_to_cursor_lattice_keeps_blocks_crisp_at_any_rest_position() {
+        // At any arbitrary rest position the settle must produce the same
+        // guarantees (integer texel boundaries on the cursor lattice), with
+        // the shift bounded to half a capture px.
+        let factor: f64 = 4.0; // zoom 2, GPU path
+        let w: f64 = 1829.0;
+        let cursor_origin = (w - 3.0 * factor).round();
+        for center in [0.25, 33.7, 100.0, 777.777, 1600.5, 3199.999] {
+            let raw_src = center - 1829.0 / 2.0 / 2.0;
+            let src = snap_src_to_cursor_lattice(raw_src, cursor_origin, factor);
+            assert!((src - raw_src).abs() <= 0.5 + 1e-9);
+            let b0 = -src * factor - 0.5;
+            assert!(
+                (b0 - b0.round()).abs() < 1e-9,
+                "center {center}: texel boundary {b0} not integer"
+            );
+            for j in 0..8 {
+                let texel_start = (b0 + j as f64 * factor).round();
+                let k = (texel_start - cursor_origin) / factor;
+                assert!(
+                    (k - k.round()).abs() < 1e-9,
+                    "center {center}: texel {j} start {texel_start} off the cursor lattice"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quantize_center_rounds_to_integer_capture_pixels_and_clamps() {
+        // The launch snap: any center quantizes to a whole capture pixel
+        // (never a fractional one), and stays inside the capture.
+        assert_eq!(
+            quantize_center_to_pixel_grid((123.4, 55.6), (3200.0, 2000.0)),
+            (123.0, 56.0)
+        );
+        assert_eq!(
+            quantize_center_to_pixel_grid((123.5, 55.5), (3200.0, 2000.0)),
+            (124.0, 56.0)
+        );
+        // Walls: rounding can never push the cursor out of the capture, and
+        // the exact edges stay reachable.
+        assert_eq!(
+            quantize_center_to_pixel_grid((-0.4, -0.6), (3200.0, 2000.0)),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            quantize_center_to_pixel_grid((3199.6, 1999.6), (3200.0, 2000.0)),
+            (3200.0, 2000.0)
+        );
+        assert_eq!(
+            quantize_center_to_pixel_grid((6400.0, 3.0), (3200.0, 2000.0)),
+            (3200.0, 3.0)
+        );
+    }
+
+    #[test]
+    fn quantized_center_locks_cursor_texels_to_screen_texels() {
+        // With the view center quantized to an integer capture pixel, the
+        // capture texel under the magnified cursor starts exactly at the
+        // viewport center — so the cursor's hotspot texel and that capture
+        // texel occupy the same block, and the two lattices coincide for
+        // every texel (both are `viewport_center + m * px_per_texel`).
+        let w: f64 = 1829.0; // logical viewport width
+        let rs: f64 = 2.0; // RENDER_SCALE
+        let zoom: f64 = 3.0;
+        let view_w = w / zoom; // capture px visible across the viewport
+        let px_per_texel = zoom * rs;
+        // Integer center: texel `C == center` starts at the viewport center.
+        let center: f64 = 1234.0;
+        let src = center - view_w / 2.0;
+        let texel_start = (center - src) * px_per_texel;
+        assert!(
+            (texel_start - w * rs / 2.0).abs() < 1e-9,
+            "texel start {texel_start}"
+        );
+        // Fractional center (what the quantization eliminates): the texel
+        // under the cursor starts short of the viewport center, so the
+        // cursor hotspot straddles two texels — misaligned.
+        let center_f: f64 = 1234.4;
+        let src_f = center_f - view_w / 2.0;
+        let texel_start_f = (center_f.floor() - src_f) * px_per_texel;
+        assert!(texel_start_f < w * rs / 2.0 - 1e-9);
+        // The lattice property holds for every integer center and zoom.
+        for zoom in [1.0_f64, 1.33, 2.0, 3.5, 8.0] {
+            let view_w = w / zoom;
+            for center in [0.0_f64, 1.0, 640.0, 1599.0] {
+                let src = center - view_w / 2.0;
+                let texel_start = (center - src) * (zoom * rs);
+                assert!(
+                    (texel_start - w * rs / 2.0).abs() < 1e-9,
+                    "zoom {zoom} center {center}: texel start {texel_start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn minimap_layout_pins_configured_corner_with_capture_aspect() {
+        let (x, y, w, h) = minimap_layout(
+            (1400.0, 900.0),
+            (3200.0, 2000.0),
+            14.0,
+            crate::osd::Corner::BottomRight,
+        );
+        // Width is ~22 % of the viewport (inside the 140..360 clamp range).
+        assert!((w - 1400.0 * 0.22).abs() < 1.0, "w = {w}");
+        // Height follows the capture aspect (16:10).
+        assert!((h - w * 2000.0 / 3200.0).abs() < 1.0, "h = {h}");
+        // Pinned to the bottom-right corner with the margin.
+        assert!((x + w + 14.0 - 1400.0).abs() < 1.0, "x = {x}");
+        assert!((y + h + 14.0 - 900.0).abs() < 1.0, "y = {y}");
+        // Wide viewports clamp the width (never a huge minimap).
+        let (x, y, w, _h) = minimap_layout(
+            (4000.0, 2000.0),
+            (3200.0, 2000.0),
+            14.0,
+            crate::osd::Corner::BottomRight,
+        );
+        assert_eq!(w, 360.0);
+        assert!(x > 0.0 && y > 0.0);
+        // Top-left placement.
+        let (x, y, _w, _h) = minimap_layout(
+            (1400.0, 900.0),
+            (3200.0, 2000.0),
+            14.0,
+            crate::osd::Corner::TopLeft,
+        );
+        assert!((x - 14.0).abs() < 1.0, "x = {x}");
+        assert!((y - 14.0).abs() < 1.0, "y = {y}");
+    }
+
+    #[test]
+    fn minimap_marker_tracks_the_visible_region_and_center() {
+        // A zoomed-in view centered on the capture: the visible region is the
+        // viewport size divided by the zoom, centered on the cursor.
+        let rect = minimap_marker_rect((1600.0, 1000.0), 2.0, (800.0, 500.0)).unwrap();
+        assert_eq!(rect, (1400.0, 875.0, 1800.0, 1125.0));
+        // At fit zoom the whole capture is visible.
+        let rect = minimap_marker_rect((1600.0, 1000.0), 0.5, (800.0, 500.0)).unwrap();
+        assert_eq!(rect, (800.0, 500.0, 2400.0, 1500.0));
+        // Degenerate zoom draws no outline.
+        assert_eq!(minimap_marker_rect((0.0, 0.0), 0.0, (800.0, 500.0)), None);
+    }
+
+    #[test]
+    fn minimap_marker_has_no_stray_pixels_at_deep_zoom() {
+        // At deep zoom the visible-region outline is smaller than the marker
+        // dot and must be skipped entirely — otherwise its corner pixels poke
+        // out from behind the dot (the "single pixel following the cursor"
+        // artifact). The circle must also have no degenerate 1 px spikes.
+        let mut cap = RgbaBuffer::new(3200, 2000);
+        for px in cap.data.chunks_exact_mut(4) {
+            px.copy_from_slice(&[100, 100, 100, 255]);
+        }
+        let (sprite, _base) = build_minimap_sprite(
+            &cap,
+            (1600.0, 1000.0),
+            20.0,
+            (1829.0, 1143.0),
+            1.0,
+            crate::osd::Corner::BottomRight,
+            None,
+            None,
+        );
+        let buf = sprite.unwrap().buffer;
+        let mut amber = 0;
+        let mut black_rows = std::collections::BTreeMap::<i32, i32>::new();
+        for y in 0..buf.height {
+            for x in 0..buf.width {
+                let i = (y as usize * buf.width as usize + x as usize) * 4;
+                let c = [buf.data[i], buf.data[i + 1], buf.data[i + 2]];
+                if c == [255, 200, 70] {
+                    amber += 1;
+                } else if c == [0, 0, 0] {
+                    *black_rows.entry(y).or_insert(0) += 1;
+                }
+            }
+        }
+        assert_eq!(
+            amber, 0,
+            "no visible-region outline may survive at deep zoom"
+        );
+        for (y, n) in &black_rows {
+            assert!(
+                *n >= 3,
+                "black outline row {y} has only {n} px (degenerate spike)"
+            );
+        }
+        // At a moderate zoom the outline IS drawn (it is useful and larger
+        // than the dot).
+        let (sprite, _base) = build_minimap_sprite(
+            &cap,
+            (1600.0, 1000.0),
+            3.0,
+            (1829.0, 1143.0),
+            1.0,
+            crate::osd::Corner::BottomRight,
+            None,
+            None,
+        );
+        let buf = sprite.unwrap().buffer;
+        let amber = buf
+            .data
+            .chunks_exact(4)
+            .filter(|px| px[0] == 255 && px[1] == 200 && px[2] == 70)
+            .count();
+        // Four corner brackets (7 px legs, one shared pixel each) — present,
+        // but far fewer pixels than a full solid perimeter (~200), so the
+        // outline is the unobtrusive bracket style, not solid lines.
+        assert!(
+            (40..=80).contains(&amber),
+            "expected corner brackets at moderate zoom, got {amber} px"
+        );
+    }
+
+    #[test]
+    fn inpaint_cursor_region_scrubs_the_baked_cursor() {
+        // A 100x100 frame with a bright region (the "baked cursor") at the
+        // center and a flat gray surround.
+        let mut buf = RgbaBuffer::new(100, 100);
+        for px in buf.data.chunks_exact_mut(4) {
+            px.copy_from_slice(&[128, 128, 128, 255]);
+        }
+        let (cx, cy) = (50.0, 50.0);
+        for y in (cy as i32 - 8)..(cy as i32 + 8) {
+            for x in (cx as i32 - 8)..(cx as i32 + 8) {
+                let i = (y as usize * 100 + x as usize) * 4;
+                buf.data[i..i + 3].copy_from_slice(&[255, 0, 0]);
+            }
+        }
+        // A distant corner pixel keeps its own color: the fill is bounded.
+        buf.data[4..7].copy_from_slice(&[0, 0, 255]);
+        let scrubbed = inpaint_cursor_region(&buf, cx, cy, 10);
+        // The region is gone (flat gray again)…
+        let mid = (50usize * 100 + 50) * 4;
+        assert_eq!(&scrubbed.data[mid..mid + 3], &[128, 128, 128]);
+        // …the original buffer is untouched, and the corner keeps its color.
+        assert_eq!(&buf.data[mid..mid + 3], &[255, 0, 0]);
+        assert_eq!(&scrubbed.data[4..7], &[0, 0, 255]);
+    }
+
+    #[test]
     fn screenshot_rect_normalization_flips_and_clamps() {
         // Dragging up/left yields a normalized rect regardless of drag order.
         let rect = normalize_screenshot_rect((10.0, 20.0), (4.0, 6.0), (320.0, 200.0));
@@ -4896,7 +6072,7 @@ mod tests {
         ov[i_border..i_border + 4].copy_from_slice(&[255, 153, 0, 255]);
         let i_scrim = 0; // pixel (0,0)
         ov[i_scrim..i_scrim + 4].copy_from_slice(&[0, 0, 0, 128]);
-        blend_overlay_into(&mut canvas, 4, &ov, 4, 4);
+        blend_overlay_into(&mut canvas, 4, &ov, 4, 4, 0, 0);
         let border_px = &canvas[i_border..i_border + 4];
         assert_eq!(border_px, [255, 153, 0, 255]);
         let scrim_px = &canvas[0..4];
@@ -4966,6 +6142,12 @@ mod tests {
         let i = y as usize * stride as usize + x as usize * 4;
         Some([canvas[i], canvas[i + 1], canvas[i + 2], canvas[i + 3]])
     }
+    /// `draw_cursor_at` takes the sprite origin (top-left corner); this
+    /// helper computes the origin that lands the sprite's hotspot on `target`.
+    fn origin_for_hotspot_at(target: (i32, i32), hotspot: (i32, i32)) -> (i32, i32) {
+        (target.0 - hotspot.0, target.1 - hotspot.1)
+    }
+
     #[test]
     fn draw_cursor_at_blits_ring_and_center_unmirrored() {
         let mut canvas = vec![0u8; 64 * 64 * 4];
@@ -4973,7 +6155,10 @@ mod tests {
         let (sprite, (hx, hy)) = crate::cursor::MagnifiedCursor::from_reticle(1.0).sprite(1.0);
         let hotspot = (hx.round() as i32, hy.round() as i32);
 
-        MagnifierWindow::draw_cursor_at(&mut canvas, stride, (32, 32), &sprite, hotspot);
+        // Place the origin so the reticle's center (its hotspot) lands on
+        // (32, 32) — the same visual result as before.
+        let origin = origin_for_hotspot_at((32, 32), hotspot);
+        MagnifierWindow::draw_cursor_at(&mut canvas, stride, origin, &sprite, hotspot);
 
         // Black center lands at the requested spot (reticle hotspot is center).
         assert_eq!(canvas_at(&canvas, stride, 32, 32), Some([0, 0, 0, 255]));
@@ -4996,7 +6181,8 @@ mod tests {
         let (sprite, (hx, hy)) = crate::cursor::MagnifiedCursor::from_reticle(1.0).sprite(1.0);
         let hotspot = (hx.round() as i32, hy.round() as i32);
 
-        MagnifierWindow::draw_cursor_at(&mut canvas, stride, (40, 32), &sprite, hotspot);
+        let origin = origin_for_hotspot_at((40, 32), hotspot);
+        MagnifierWindow::draw_cursor_at(&mut canvas, stride, origin, &sprite, hotspot);
         // Center moved +8 in x: the pixel at 40 must be the black center, and
         // the mirrored destination (24) must stay untouched.
         assert_eq!(canvas_at(&canvas, stride, 40, 32), Some([0, 0, 0, 255]));
@@ -5004,7 +6190,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_cursor_at_places_hotspot_at_pos() {
+    fn draw_cursor_at_places_hotspot_at_target_origin() {
         let mut canvas = vec![0u8; 64 * 64 * 4];
         let stride = 64 * 4;
         // A synthetic 2x2 sprite with a green pixel at (0, 0) and a red
@@ -5016,8 +6202,12 @@ mod tests {
         let (sprite, (hx, hy)) = cursor.sprite(1.0);
         let hotspot = (hx.round() as i32, hy.round() as i32);
 
-        MagnifierWindow::draw_cursor_at(&mut canvas, stride, (50, 50), &sprite, hotspot);
-        // The hotspot pixel of the sprite lands exactly on pos.
+        // Origin = target - hotspot: the sprite is drawn with its top-left
+        // corner at the origin, so the hotspot pixel lands exactly on target.
+        let origin = origin_for_hotspot_at((50, 50), hotspot);
+        assert_eq!(origin, (49, 49));
+        MagnifierWindow::draw_cursor_at(&mut canvas, stride, origin, &sprite, hotspot);
+        // The hotspot pixel of the sprite lands exactly on the target.
         assert_eq!(canvas_at(&canvas, stride, 50, 50), Some([255, 0, 0, 255]));
         // The rest of the sprite extends up-left of the hotspot.
         assert_eq!(canvas_at(&canvas, stride, 49, 49), Some([0, 255, 0, 255]));

@@ -445,6 +445,10 @@ fn config_section(
             ui.checkbox(&mut config.show_osd, "");
             ui.end_row();
 
+            ui.label("Show minimap at start");
+            ui.checkbox(&mut config.minimap_visible, "");
+            ui.end_row();
+
             ui.label("Hold-to-zoom speed");
             ui.horizontal(|ui| {
                 ui.add(
@@ -516,6 +520,52 @@ fn config_section(
     }
 
     ui.add_space(10.0);
+
+    ui.strong("Layout");
+    ui.add_space(4.0);
+    egui::Grid::new("layout_grid")
+        .num_columns(2)
+        .spacing([16.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("OSD legend corner");
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("osd_corner")
+                    .selected_text(config.osd_corner.to_string())
+                    .show_ui(ui, |ui| {
+                        for corner in [
+                            crate::osd::Corner::TopLeft,
+                            crate::osd::Corner::TopRight,
+                            crate::osd::Corner::BottomLeft,
+                            crate::osd::Corner::BottomRight,
+                        ] {
+                            ui.selectable_value(&mut config.osd_corner, corner, corner.to_string());
+                        }
+                    });
+            });
+            ui.end_row();
+            ui.label("Minimap corner");
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("minimap_corner")
+                    .selected_text(config.minimap_corner.to_string())
+                    .show_ui(ui, |ui| {
+                        for corner in [
+                            crate::osd::Corner::TopLeft,
+                            crate::osd::Corner::TopRight,
+                            crate::osd::Corner::BottomLeft,
+                            crate::osd::Corner::BottomRight,
+                        ] {
+                            ui.selectable_value(
+                                &mut config.minimap_corner,
+                                corner,
+                                corner.to_string(),
+                            );
+                        }
+                    });
+            });
+            ui.end_row();
+        });
+
+    ui.add_space(10.0);
     ui.separator();
     ui.add_space(10.0);
     ui.strong("Keybindings");
@@ -557,6 +607,7 @@ fn config_section(
                 "Toggle magnified cursor",
                 &mut config.keybindings.toggle_cursor,
             );
+            key_row(ui, "Toggle minimap", &mut config.keybindings.minimap);
             key_row(
                 ui,
                 "Hold-to-zoom modifier",

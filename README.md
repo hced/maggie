@@ -27,6 +27,7 @@ Here's what Maggie can do today:
 - **Cursor-following:** `snap` (instant, default), `ease` (smooth exponential), or `inertia` (with momentum glide), tracked at sub-pixel precision and clamped at the capture edges.
 - **GPU rendering:** EGL + OpenGL ES 2 with nearest-neighbor sampling at 2× buffer scale; automatic, permanent CPU fallback (bilinear) if GPU init fails.
 - **OSD key legend:** `K` toggles an on-screen legend that stays in the corner farthest from the cursor.
+- **Minimap:** shown by default (toggle with `M`) — a dimmed overview of the whole screen in the corner, with a marker for the visible region and cursor position.
 - **Fullscreen screenshot:** `F` saves the frozen frame as a PNG (default `~/Pictures/maggie_%Y%m%d_%H%M%S.png`).
 - **Configuration:** RON file at `~/.config/maggie/config.ron`.
 - **CLI:** `-z/--zoom <level>` initial zoom, `-d/--debug` verbose logging, `--help`, `--version`.

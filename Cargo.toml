@@ -1,10 +1,11 @@
 [package]
 name = "maggie"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 
 [dependencies]
 wayland-client = { version = "0.31", features = ["log"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 rustix = { version = "1.1", features = ["event"] }
 xcursor = "0.3"
 smithay-client-toolkit = "0.21"

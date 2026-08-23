@@ -112,6 +112,7 @@ pub struct GpuRenderer {
     osd_tex: GLuint,
     cursor_tex: GLuint,
     overlay_tex: GLuint,
+    minimap_tex: GLuint,
     a_pos_loc: GLint,
     u_src_loc: GLint,
     u_rect_loc: GLint,
@@ -257,6 +258,7 @@ impl GpuRenderer {
         let mut osd_tex = 0;
         let mut cursor_tex = 0;
         let mut overlay_tex = 0;
+        let mut minimap_tex = 0;
         unsafe {
             gles2::GenVertexArraysOES(1, &mut vao);
             gles2::BindVertexArrayOES(vao);
@@ -344,6 +346,32 @@ impl GpuRenderer {
                 gles2::TEXTURE_WRAP_T,
                 gles2::CLAMP_TO_EDGE as GLint,
             );
+            // Minimap texture: a small dimmed overview of the frozen screen
+            // (with a visible-region marker), uploaded per frame while the
+            // minimap is visible. LINEAR filtering so the logical-resolution
+            // buffer upscales smoothly to the RENDER_SCALE surface.
+            gles2::GenTextures(1, &mut minimap_tex);
+            gles2::BindTexture(gles2::TEXTURE_2D, minimap_tex);
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_MIN_FILTER,
+                gles2::LINEAR as GLint,
+            );
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_MAG_FILTER,
+                gles2::LINEAR as GLint,
+            );
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_WRAP_S,
+                gles2::CLAMP_TO_EDGE as GLint,
+            );
+            gles2::TexParameteri(
+                gles2::TEXTURE_2D,
+                gles2::TEXTURE_WRAP_T,
+                gles2::CLAMP_TO_EDGE as GLint,
+            );
             // Screenshot-mode overlay texture (selection scrim + border),
             // uploaded per frame only while Screenshot Mode is active.
             gles2::GenTextures(1, &mut overlay_tex);
@@ -391,6 +419,7 @@ impl GpuRenderer {
             osd_tex,
             cursor_tex,
             overlay_tex,
+            minimap_tex,
             a_pos_loc,
             u_src_loc,
             u_rect_loc,
@@ -521,8 +550,8 @@ impl GpuRenderer {
 
     /// Draw one frame: the magnified view (source rect in normalized texture
     /// coordinates) optionally overlaid with the screenshot selection overlay
-    /// (a fullscreen scrim + border sprite), an OSD sprite and the magnified
-    /// cursor, then present.
+    /// (a fullscreen scrim + border sprite), an OSD sprite, the magnified
+    /// cursor and the minimap sprite, then present.
     ///
     /// `src` is `(x, y, w, h)` in texture space (0.0..1.0) — it may extend
     /// outside that square when the view reaches past the capture edge (the
@@ -534,7 +563,10 @@ impl GpuRenderer {
     /// are re-uploaded to the texture this frame: the engine only rebuilds
     /// the overlay when the selection changed and passes `false` otherwise,
     /// so plain pointer motion in Screenshot Mode never re-uploads the
-    /// full-screen buffer (which made the mouse laggy).
+    /// full-screen buffer (which made the mouse laggy). `minimap` is a
+    /// sprite drawn last (on top of everything) at its `x, y, width, height`
+    /// rect, which are in RENDER_SCALE surface coordinates; the texture
+    /// buffer itself stays at logical resolution and is LINEAR-upscaled.
     pub fn draw(
         &mut self,
         src: Option<(f64, f64, f64, f64)>,
@@ -542,6 +574,7 @@ impl GpuRenderer {
         cursor: Option<CursorSprite>,
         overlay: Option<&RgbaBuffer>,
         upload_overlay: bool,
+        minimap: Option<&OsdSprite>,
     ) {
         unsafe {
             gles2::Viewport(0, 0, self.width, self.height);
@@ -623,7 +656,7 @@ impl GpuRenderer {
                 gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
             }
 
-            if let Some((pos, cursor_buf, (hx, hy))) = cursor {
+            if let Some((pos, cursor_buf, (_hx, _hy))) = cursor {
                 gles2::Enable(gles2::BLEND);
                 gles2::BlendFunc(gles2::SRC_ALPHA, gles2::ONE_MINUS_SRC_ALPHA);
                 gles2::ActiveTexture(gles2::TEXTURE0);
@@ -640,14 +673,15 @@ impl GpuRenderer {
                     gles2::UNSIGNED_BYTE,
                     cursor_buf.data.as_ptr() as *const GLvoid,
                 );
-                // Place the sprite so its hotspot lands exactly on the pointer
-                // position (the tip of the arrow, like the real cursor).
-                let cx = pos.0 as f32;
-                let cy = pos.1 as f32;
-                let x0 = (cx - *hx as f32) / self.width as f32;
-                let y0 = (cy - *hy as f32) / self.height as f32;
-                let x1 = (cx + cursor_buf.width as f32 - *hx as f32) / self.width as f32;
-                let y1 = (cy + cursor_buf.height as f32 - *hy as f32) / self.height as f32;
+                // The engine computes the cursor sprite origin so the
+                // cursor's hotspot pixel starts at the same surface-pixel
+                // boundary as the screen texel at the viewport center — the
+                // two grids are on one shared lattice. We place the sprite at
+                // that origin directly (no hotspot subtraction needed).
+                let x0 = pos.0 as f32 / self.width as f32;
+                let y0 = pos.1 as f32 / self.height as f32;
+                let x1 = (pos.0 as f32 + cursor_buf.width as f32) / self.width as f32;
+                let y1 = (pos.1 as f32 + cursor_buf.height as f32) / self.height as f32;
                 // Unit quad: the sprite shader computes screen = u_rect.xy +
                 // a_pos * u_rect.zw, so the rect lives entirely in u_rect.
                 let verts: [GLfloat; 12] =
@@ -697,6 +731,83 @@ impl GpuRenderer {
                 gles2::Disable(gles2::BLEND);
             }
 
+            // Minimap sprite, drawn last so it always sits on top of the
+            // frame, overlay and OSD. The texture buffer is at logical
+            // resolution (small); its rect spans the RENDER_SCALE surface and
+            // the LINEAR filter upscales it smoothly.
+            if let Some(sprite) = minimap {
+                gles2::Enable(gles2::BLEND);
+                gles2::BlendFunc(gles2::SRC_ALPHA, gles2::ONE_MINUS_SRC_ALPHA);
+                gles2::ActiveTexture(gles2::TEXTURE0);
+                gles2::BindTexture(gles2::TEXTURE_2D, self.minimap_tex);
+                gles2::UseProgram(self.sprite_program);
+                gles2::TexImage2D(
+                    gles2::TEXTURE_2D,
+                    0,
+                    gles2::RGBA as GLint,
+                    sprite.buffer.width,
+                    sprite.buffer.height,
+                    0,
+                    gles2::RGBA,
+                    gles2::UNSIGNED_BYTE,
+                    sprite.buffer.data.as_ptr() as *const GLvoid,
+                );
+                let x0 = sprite.x as GLfloat / self.width as GLfloat;
+                let y0 = sprite.y as GLfloat / self.height as GLfloat;
+                let x1 = (sprite.x + sprite.width) as GLfloat / self.width as GLfloat;
+                let y1 = (sprite.y + sprite.height) as GLfloat / self.height as GLfloat;
+                let verts: [GLfloat; 12] =
+                    [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+                gles2::BufferData(
+                    gles2::ARRAY_BUFFER,
+                    size_of_val(&verts) as GLsizeiptr,
+                    verts.as_ptr() as *const GLvoid,
+                    gles2::STREAM_DRAW,
+                );
+                gles2::Uniform4f(self.u_rect_loc, x0, y0, x1 - x0, y1 - y0);
+                gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
+                gles2::Disable(gles2::BLEND);
+            }
+
+            // Minimap sprite, drawn last so it always sits on top of the
+            // frame, overlay and OSD. The texture buffer stays at logical
+            // resolution (small, cheap to rebuild per frame); its rect spans
+            // the RENDER_SCALE surface and the LINEAR filter upscales it
+            // smoothly.
+            if let Some(sprite) = minimap {
+                gles2::Enable(gles2::BLEND);
+                gles2::BlendFunc(gles2::SRC_ALPHA, gles2::ONE_MINUS_SRC_ALPHA);
+                gles2::ActiveTexture(gles2::TEXTURE0);
+                gles2::BindTexture(gles2::TEXTURE_2D, self.minimap_tex);
+                gles2::UseProgram(self.sprite_program);
+                gles2::TexImage2D(
+                    gles2::TEXTURE_2D,
+                    0,
+                    gles2::RGBA as GLint,
+                    sprite.buffer.width,
+                    sprite.buffer.height,
+                    0,
+                    gles2::RGBA,
+                    gles2::UNSIGNED_BYTE,
+                    sprite.buffer.data.as_ptr() as *const GLvoid,
+                );
+                let x0 = sprite.x as GLfloat / self.width as GLfloat;
+                let y0 = sprite.y as GLfloat / self.height as GLfloat;
+                let x1 = (sprite.x + sprite.width) as GLfloat / self.width as GLfloat;
+                let y1 = (sprite.y + sprite.height) as GLfloat / self.height as GLfloat;
+                let verts: [GLfloat; 12] =
+                    [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+                gles2::BufferData(
+                    gles2::ARRAY_BUFFER,
+                    size_of_val(&verts) as GLsizeiptr,
+                    verts.as_ptr() as *const GLvoid,
+                    gles2::STREAM_DRAW,
+                );
+                gles2::Uniform4f(self.u_rect_loc, x0, y0, x1 - x0, y1 - y0);
+                gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
+                gles2::Disable(gles2::BLEND);
+            }
+
             check_gl_error("draw");
         }
         self.egl
@@ -714,6 +825,7 @@ impl Drop for GpuRenderer {
             gles2::DeleteTextures(1, &self.frame_tex);
             gles2::DeleteTextures(1, &self.osd_tex);
             gles2::DeleteTextures(1, &self.cursor_tex);
+            gles2::DeleteTextures(1, &self.minimap_tex);
             gles2::DeleteProgram(self.program);
             gles2::DeleteProgram(self.sprite_program);
         }

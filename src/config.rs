@@ -26,6 +26,16 @@ fn default_reset_zoom() -> String {
     "r".to_string()
 }
 
+/// Default screen corner for the OSD legend.
+fn default_osd_corner() -> crate::osd::Corner {
+    crate::osd::Corner::TopLeft
+}
+
+/// Default screen corner for the minimap.
+fn default_minimap_corner() -> crate::osd::Corner {
+    crate::osd::Corner::BottomRight
+}
+
 /// Default key that toggles the magnified cursor inside the viewport.
 fn default_toggle_cursor() -> String {
     "c".to_string()
@@ -34,6 +44,17 @@ fn default_toggle_cursor() -> String {
 /// Default modifier key held to smooth-zoom with vertical mouse motion.
 fn default_hold_to_zoom() -> String {
     "Super".to_string()
+}
+
+/// Default key that toggles the minimap overlay (a dimmed overview of the
+/// frozen screen with the visible-region marker) in the viewport corner.
+fn default_minimap() -> String {
+    "m".to_string()
+}
+
+/// Default for whether the minimap overlay is visible at launch.
+fn default_minimap_visible() -> bool {
+    true
 }
 
 /// Default key that toggles the effective screenshot scale (real size vs
@@ -85,6 +106,20 @@ pub struct MagnifierConfig {
     pub screenshot_scale: ScreenshotScale,
     #[serde(default)]
     pub show_osd: bool,
+    /// Screen corner where the OSD legend is placed (default "top-left").
+    /// With the centered cursor scheme the OSD no longer relocates
+    /// dynamically — it stays in the configured corner.
+    #[serde(default = "default_osd_corner")]
+    pub osd_corner: crate::osd::Corner,
+    /// Screen corner where the minimap overview is placed (default
+    /// "bottom-right"). If the minimap's corner coincides with the OSD's
+    /// corner, the minimap is automatically offset to avoid overlap.
+    #[serde(default = "default_minimap_corner")]
+    pub minimap_corner: crate::osd::Corner,
+    /// Whether the minimap overlay is visible at launch (default true; the
+    /// `minimap` key still toggles it at runtime).
+    #[serde(default = "default_minimap_visible")]
+    pub minimap_visible: bool,
 }
 
 /// What the saved screenshot represents: the real pixels of the selected
@@ -161,6 +196,11 @@ pub struct Keybindings {
     /// Screenshot Mode. Defaults to "v".
     #[serde(default = "default_screenshot_scale_toggle")]
     pub screenshot_scale_toggle: String,
+    /// Toggle the minimap overlay (a dimmed overview of the frozen screen
+    /// with a marker for the visible region / cursor position). Defaults to
+    /// "m" for config files written before it existed.
+    #[serde(default = "default_minimap")]
+    pub minimap: String,
 }
 
 impl Default for Keybindings {
@@ -192,12 +232,16 @@ impl Default for MagnifierConfig {
                 toggle_cursor: "c".to_string(),
                 hold_to_zoom: "Super".to_string(),
                 screenshot_scale_toggle: "v".to_string(),
+                minimap: "m".to_string(),
             },
             screenshot_scale: ScreenshotScale::Real,
             screenshot_path: "~/Pictures".to_string(),
             screenshot_filename_pattern: "maggie_%Y%m%d_%H%M%S.png".to_string(),
             screenshot_selection_color: [255, 153, 0],
             show_osd: true,
+            osd_corner: crate::osd::Corner::TopLeft,
+            minimap_corner: crate::osd::Corner::BottomRight,
+            minimap_visible: true,
         }
     }
 }
@@ -301,6 +345,30 @@ mod tests {
         normalize_config(&mut config);
         assert_eq!(config.keybindings.config_window, "Tab");
         assert_eq!(config.keybindings.toggle_cursor, "c");
+    }
+
+    #[test]
+    fn minimap_default_is_m() {
+        // The minimap toggle default is "m"; config files written before the
+        // key existed get it via the serde default (the struct-update below
+        // exercises the same fill-in path the migration tests rely on).
+        assert_eq!(MagnifierConfig::default().keybindings.minimap, "m");
+        let keybindings = Keybindings {
+            ..Keybindings::default()
+        };
+        assert_eq!(keybindings.minimap, "m");
+    }
+
+    #[test]
+    fn minimap_visible_defaults_to_true() {
+        // The minimap shows by default; config files written before the field
+        // existed get it via the serde default, and the `minimap` key still
+        // toggles it at runtime.
+        assert!(MagnifierConfig::default().minimap_visible);
+        let config = MagnifierConfig {
+            ..MagnifierConfig::default()
+        };
+        assert!(config.minimap_visible);
     }
 
     #[test]
