@@ -57,6 +57,24 @@ fn default_minimap_visible() -> bool {
     true
 }
 
+/// Default for whether panning is locked to the capture's pixel grid (the
+/// cursor's texels and the screen's texels stay flush, at the cost of
+/// whole-texel pan steps).
+fn default_pixel_locked_panning() -> bool {
+    true
+}
+
+/// Default pan-tuning exponent: the pan distance per mouse pixel is scaled
+/// by `zoom^-tuning`, so at high zoom you move the mouse further to pan
+/// from one magnified pixel to the next (and below 1× a short nudge travels
+/// further). `0` (the default) disables the scaling: a slower-than-hand pan
+/// makes the far wall unreachable in a single sweep (the mouse hits the
+/// physical edge before the view catches up), so it is opt-in rather than
+/// on by default.
+fn default_pan_tuning() -> f64 {
+    0.0
+}
+
 /// Default key that toggles the effective screenshot scale (real size vs
 /// magnified) while in Screenshot Mode.
 fn default_screenshot_scale_toggle() -> String {
@@ -120,6 +138,23 @@ pub struct MagnifierConfig {
     /// `minimap` key still toggles it at runtime).
     #[serde(default = "default_minimap_visible")]
     pub minimap_visible: bool,
+    /// Whether the view center is locked to the capture's pixel grid
+    /// (default true): the magnified cursor's texels and the screen's texels
+    /// stay flush at every zoom, with panning moving in whole magnified
+    /// blocks (one capture pixel per step). When off, panning is smooth and
+    /// continuous but the screen's block phase drifts relative to the fixed
+    /// cursor, so the blocks can be offset by up to one block width.
+    #[serde(default = "default_pixel_locked_panning")]
+    pub pixel_locked_panning: bool,
+    /// Pan-tuning exponent (default 0.5, range 0..=1): the pan distance per
+    /// mouse pixel is scaled by `zoom^-tuning`, so the more you zoom in the
+    /// more mouse travel is needed to pan from one magnified pixel to the
+    /// next, and below 1× a short nudge travels further ("vice versa"). `0`
+    /// disables the scaling (constant pan speed). The view intentionally
+    /// lags the hand's content while this is active; pushing into a screen
+    /// edge glides the view to the wall so the exact edges stay reachable.
+    #[serde(default = "default_pan_tuning")]
+    pub pan_tuning: f64,
 }
 
 /// What the saved screenshot represents: the real pixels of the selected
@@ -242,6 +277,8 @@ impl Default for MagnifierConfig {
             osd_corner: crate::osd::Corner::TopLeft,
             minimap_corner: crate::osd::Corner::BottomRight,
             minimap_visible: true,
+            pixel_locked_panning: true,
+            pan_tuning: 0.0,
         }
     }
 }
@@ -280,6 +317,11 @@ pub(crate) fn normalize_config(config: &mut MagnifierConfig) {
         } else {
             0.02
         };
+    config.pan_tuning = if config.pan_tuning.is_finite() {
+        config.pan_tuning.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     // A default zoom of exactly 0 % requires 0 % zoom to be reachable, so the
     // allow-zero setting is forced on while it stays at 0 (the Configuration
     // window mirrors this and locks the checkbox).
@@ -369,6 +411,35 @@ mod tests {
             ..MagnifierConfig::default()
         };
         assert!(config.minimap_visible);
+    }
+
+    #[test]
+    fn pixel_locked_panning_defaults_to_true() {
+        // Panning locks to the capture pixel grid by default (flush texels,
+        // whole-block steps); config files written before the field existed
+        // get it via the serde default.
+        assert!(MagnifierConfig::default().pixel_locked_panning);
+        let config = MagnifierConfig {
+            ..MagnifierConfig::default()
+        };
+        assert!(config.pixel_locked_panning);
+    }
+
+    #[test]
+    fn pan_tuning_defaults_to_off() {
+        // Pan-tuning is off by default (0); config files written before the
+        // field existed get it via the serde default, and normalization
+        // clamps out-of-range values.
+        assert_eq!(MagnifierConfig::default().pan_tuning, 0.0);
+        let mut config = MagnifierConfig {
+            ..MagnifierConfig::default()
+        };
+        config.pan_tuning = 5.0;
+        normalize_config(&mut config);
+        assert_eq!(config.pan_tuning, 1.0);
+        config.pan_tuning = f64::NAN;
+        normalize_config(&mut config);
+        assert_eq!(config.pan_tuning, 0.0);
     }
 
     #[test]

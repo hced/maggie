@@ -135,6 +135,80 @@ fn clamp_to_capture_bounds(pos: (f64, f64), bounds: (f64, f64)) -> (f64, f64) {
     (pos.0.clamp(0.0, bounds.0), pos.1.clamp(0.0, bounds.1))
 }
 
+/// How close (capture px) the view must already be to a wall for the
+/// wall-hold to engage, and how close (logical px) the pointer must be to
+/// the corresponding physical screen edge. Both are deliberately tiny and
+/// **constant** (not speed-scaled), so the hold only fires while the user
+/// is physically parked at the very edge — it never grabs the view from a
+/// distance, unlike the removed speed-scaled magnetic reach. It suppresses
+/// the sub-pixel shiver at the **right/bottom** edges: there the resting
+/// delivered pointer position oscillates *below* the surface edge, which
+/// (scaled up by the capture scale) made the quantized integer view center
+/// flip between `wall` and `wall−1`, jittering the magnified content and
+/// the cursor/OSD position while the user keeps pushing into the edge.
+const WALL_HOLD_EPS: f64 = 2.0;
+const WALL_HOLD_MARGIN_LOGICAL: f64 = 4.0;
+
+/// Non-magnetic edge-hold with **hysteresis** for one axis. It pins the view
+/// to the *capture edge* (0 on the low edge, `capture` on the high edge)
+/// while the pointer is parked there and the view is already within
+/// [`WALL_HOLD_EPS`] of it. Pinning to the capture edge (not `capture − 1`)
+/// makes the content's edge — the beyond-capture boundary, which renders
+/// exactly at the viewport center — land flush on the magnified cursor's
+/// apex when pushed to the limit, so the screen edge and the cursor tip are
+/// perfectly aligned at every wall. Crucially the hold is **latched**
+/// via `held` (the side currently latched, or `None`): once engaged it stays
+/// put until the pointer actually moves more than
+/// [`WALL_HOLD_MARGIN_LOGICAL`] px *away* from that edge. Without the latch,
+/// a parked pointer's micro-wobble pans the view from the pinned position by
+/// a fraction of a pixel, which the integer quantization turns into a hop
+/// from the last real pixel to `capture − 2` — just outside the epsilon
+/// band — so the hold disengages and the view flip-flops (the bottom/right
+/// shiver). The latch prevents exactly that. Releasing (moving the pointer
+/// off the edge) returns it to `None` so normal panning resumes; it never
+/// grabs the view from a distance (engage still requires the view to already
+/// be within [`WALL_HOLD_EPS`] of the edge).
+fn edge_hold_axis(
+    view: f64,
+    pointer: f64,
+    surface: f64,
+    capture: f64,
+    held: Option<bool>,
+) -> (f64, Option<bool>) {
+    let at_high = (pointer - surface).abs() <= WALL_HOLD_MARGIN_LOGICAL;
+    let at_low = pointer.abs() <= WALL_HOLD_MARGIN_LOGICAL;
+    match held {
+        // Latched high: keep pinning until the pointer leaves the high edge;
+        // leaving releases (Option -> None) so normal panning resumes.
+        Some(true) => {
+            if at_high {
+                (capture, Some(true))
+            } else {
+                (view, None)
+            }
+        }
+        // Latched low: symmetric to the high edge.
+        Some(false) => {
+            if at_low {
+                (0.0, Some(false))
+            } else {
+                (view, None)
+            }
+        }
+        // Not latched: engage when the pointer is parked at an edge AND the
+        // view is already near it (never a grab-from-a-distance).
+        None => {
+            if at_high && (view - capture).abs() <= WALL_HOLD_EPS {
+                (capture, Some(true))
+            } else if at_low && view.abs() <= WALL_HOLD_EPS {
+                (0.0, Some(false))
+            } else {
+                (view, None)
+            }
+        }
+    }
+}
+
 /// One correction step for the residual view-vs-hand offset (view minus
 /// hand content; hold-to-zoom, a pointer re-enter or a launch quirk can
 /// leave one). The correction is driven by real pointer motion only
@@ -156,8 +230,7 @@ fn clamp_to_capture_bounds(pos: (f64, f64), bounds: (f64, f64)) -> (f64, f64) {
 /// later bounded heal left it momentarily stuck). The residual is erased
 /// only by the toward-content catch-up; both walls stay reachable
 /// regardless (the plain pan clamps the view to the capture at the far
-/// edge, and the hand-edge reach snaps it there exactly). Returns the
-/// remaining offset.
+/// edge). Returns the remaining offset.
 fn offset_correction_step(
     offset: (f64, f64),
     dt: f64,
@@ -207,56 +280,6 @@ fn correct_toward_hand(view: (f64, f64), target: (f64, f64), bounds: (f64, f64))
     let fx = if pinned_x { view.0 } else { target.0 };
     let fy = if pinned_y { view.1 } else { target.1 };
     clamp_to_capture_bounds((fx, fy), bounds)
-}
-
-/// The edge-reach margin scales with the pointer's recent *peak* travel
-/// (see [`TravelHistory`] and [`reach_margin`]): when the pointer is moved
-/// fast, its delivered position can stop short of the physical edge — the
-/// gap is the travel the hand covered *after* the last delivered sample,
-/// which was accumulated at the **peak** speed of the flick, frames before
-/// the hand decelerates. Sizing the margin from the current event's own
-/// (decelerating) travel therefore under-covers the gap exactly when the
-/// pointer reaches the edge region, which is why fast flicks stopped
-/// “arbitrarily” short while slow motion always reached. The margin is
-/// `peak × REACH_DELTA_FACTOR + REACH_FLOOR_LOGICAL`: small while moving
-/// slowly (no magnetic wall — parking stays precise) and large exactly
-/// when the delivery gap is large (the wall is always reachable, at any
-/// speed). Capped so an extreme flick can never magnetize a huge area.
-const REACH_DELTA_FACTOR: f64 = 1.5;
-/// Floor (logical px): even a sub-pixel crawl to the edge lands the view
-/// exactly on the wall, so the exact border is always reachable.
-const REACH_FLOOR_LOGICAL: f64 = 8.0;
-/// Cap (logical px) on the reach margin: bounds the magnetic zone even for
-/// an extreme motion burst.
-const REACH_MAX_LOGICAL: f64 = 200.0;
-/// Extra view-side slack (logical px) beyond the reach margin: the view may
-/// still sit slightly short of the wall from a still-healing residual; the
-/// slack lets the reach close that too without teleporting across a large
-/// residual.
-const REACH_VIEW_SLACK_LOGICAL: f64 = 8.0;
-/// How many of the most recent per-event pointer travels are kept per axis
-/// to estimate the approach speed for the edge reach. Long enough to cover
-/// a delivery staleness of a few frames, short enough that a slow crawl
-/// right after a fast phase loses the inflated margin within a few events.
-const REACH_HISTORY_LEN: usize = 4;
-/// Wall-hold band (capture px): while the pointer rests at a physical edge
-/// and the view is within this band of the wall, the view is held **exactly
-/// on the wall** even if sub-pixel pointer jitter would pull it off by up to
-/// this much. The delivered position near an edge oscillates (the hand can
-/// never hold the mouse perfectly still), and scaled up by the capture
-/// scale it crosses rounding boundaries — the OSD position readout and the
-/// magnified content used to shiver between wall and wall-1 (worst at the
-/// right/bottom walls, where the resting delivered position sits below the
-/// edge). In steady state the view tracks the hand content, so the hold
-/// only fires while the pointer is within ~EPS/scale px of the edge; a
-/// deliberate pan away releases it immediately (no magnetic wall).
-const WALL_HOLD_EPS: f64 = 3.0;
-
-/// Whether the view should be held exactly on a wall: the pointer rests at
-/// the corresponding physical edge (within `margin` logical px) and the
-/// view is within `eps` capture px of the wall. See [`WALL_HOLD_EPS`].
-fn wall_hold(view: f64, wall: f64, pointer: f64, edge: f64, margin: f64, eps: f64) -> bool {
-    (view - wall).abs() <= eps && (pointer - edge).abs() <= margin
 }
 
 /// App-side key repeat for held Screenshot-Mode nudge keys: the delay before
@@ -326,13 +349,6 @@ fn snap_src_to_cursor_lattice(src: f64, cursor_origin: f64, px_per_texel: f64) -
         delta += 1.0;
     }
     src + delta
-}
-
-/// The reach margin (logical px) for one axis, sized from the pointer's
-/// recent peak travel: `peak × REACH_DELTA_FACTOR + REACH_FLOOR_LOGICAL`,
-/// capped at [`REACH_MAX_LOGICAL`].
-fn reach_margin(peak: f64) -> f64 {
-    (peak * REACH_DELTA_FACTOR + REACH_FLOOR_LOGICAL).min(REACH_MAX_LOGICAL)
 }
 
 /// Next zoom for the scroll wheel in `Levels` mode. Walks the same discrete
@@ -457,6 +473,20 @@ fn quantize_center_to_pixel_grid(center: (f64, f64), capture: (f64, f64)) -> (f6
         center.0.round().clamp(0.0, capture.0),
         center.1.round().clamp(0.0, capture.1),
     )
+}
+
+/// The pan-tuning gain applied to pointer-motion deltas: `zoom^-tuning`
+/// (`1.0` when tuning is 0 or the zoom is degenerate). At high zoom the
+/// gain is small — you move the mouse further to pan from one magnified
+/// pixel (texel) to the next — and below 1× the gain exceeds 1, so a short
+/// nudge travels further when zoomed out (the "vice versa" the user asked
+/// for). See `pan_tuning` in the config.
+fn pan_tuning_gain(zoom: f64, tuning: f64) -> f64 {
+    if tuning <= 0.0 || zoom <= 0.0 {
+        1.0
+    } else {
+        zoom.powf(-tuning)
+    }
 }
 
 /// The minimap rectangle in logical viewport px: a small, aspect-correct
@@ -1252,101 +1282,6 @@ fn blend_overlay_into(
     }
 }
 
-/// Rolling window of the most recent per-axis pointer travels (logical px
-/// per event), used to size the edge-reach margin. The compositor's last
-/// delivered pointer position can lag the hand's true stop by up to a few
-/// frames — a gap accumulated at the *peak* speed of a flick, before the
-/// hand decelerates — so the margin tracks the recent **peak** travel, not
-/// the current (decelerating) event's travel: the wall stays reachable
-/// through the whole approach. Because the window is short and is flushed
-/// after a pause, a slow crawl never inherits an inflated margin (no
-/// magnetic wall while parking).
-#[derive(Clone, Copy)]
-struct TravelHistory {
-    buf: [(f64, f64); REACH_HISTORY_LEN],
-    next: usize,
-    filled: usize,
-}
-
-impl TravelHistory {
-    fn new() -> Self {
-        Self {
-            buf: [(0.0, 0.0); REACH_HISTORY_LEN],
-            next: 0,
-            filled: 0,
-        }
-    }
-
-    /// Record one event's travel (logical px per axis).
-    fn push(&mut self, d: (f64, f64)) {
-        self.buf[self.next] = d;
-        self.next = (self.next + 1) % REACH_HISTORY_LEN;
-        self.filled = (self.filled + 1).min(REACH_HISTORY_LEN);
-    }
-
-    /// The largest |travel| per axis in the window. Zero until the first
-    /// event is pushed (gliding never inflates the margin).
-    fn peak(&self) -> (f64, f64) {
-        let mut px: f64 = 0.0;
-        let mut py: f64 = 0.0;
-        for &(x, y) in &self.buf[..self.filled] {
-            px = px.max(x.abs());
-            py = py.max(y.abs());
-        }
-        (px, py)
-    }
-}
-
-/// Per-axis geometry for the hand-edge reach: the surface (pointer
-/// coordinate range) size in logical px, the capture bound in px, and the
-/// capture-per-logical-pixel scale.
-#[derive(Clone, Copy)]
-struct EdgeReach {
-    surface: f64,
-    bounds: f64,
-    scale: f64,
-}
-
-impl EdgeReach {
-    fn new(surface: f64, bounds: f64, scale: f64) -> Self {
-        Self {
-            surface,
-            bounds,
-            scale,
-        }
-    }
-
-    /// Reach the exact capture edge when the user pushes into it. The view
-    /// pans with the hand's *movement*, so its reach is bounded by the
-    /// hand's delivered travel — and when the pointer is moved fast, the
-    /// last delivered position can stop short of the surface edge, leaving
-    /// the view short of the wall. This closes that gap: `margin` is sized
-    /// by the caller from the pointer's recent **peak** travel (see
-    /// [`TravelHistory`] / [`reach_margin`]), because the delivery gap was
-    /// accumulated at the peak speed of the flick, before the hand
-    /// decelerated. So a slow push near the edge keeps a small margin (no
-    /// magnetic wall — you can park anywhere), while a fast flick toward
-    /// the edge gets a margin large enough to bridge the gap and land the
-    /// view **exactly** on the wall, at any speed. The view must already be
-    /// within the (scaled) margin of the wall so it never teleports across
-    /// a large still-healing residual. Pushing away, gliding
-    /// (`delta_logical == 0`), or being away from the edge never triggers
-    /// it, and the result never leaves the capture. `view` is in capture
-    /// px; `pointer` is in logical px.
-    fn apply(self, view: f64, delta_logical: f64, pointer: f64, margin: f64) -> f64 {
-        let view_margin = (margin + REACH_VIEW_SLACK_LOGICAL) * self.scale;
-        if delta_logical > 0.0
-            && pointer >= self.surface - margin
-            && view >= self.bounds - view_margin
-        {
-            self.bounds
-        } else if delta_logical < 0.0 && pointer <= margin && view <= view_margin {
-            0.0
-        } else {
-            view
-        }
-    }
-}
 /// Linux input event code for the left mouse button (draws the screenshot
 /// selection rectangle in Screenshot Mode).
 const BTN_LEFT: u32 = 0x110;
@@ -1613,16 +1548,12 @@ pub struct MagnifierWindow {
     /// above it, so zoom-in from the floor is ignored until this passes
     /// [`HTZ_FLOOR_DEADZONE`] (see [`htz_floor_zoom`]).
     hold_floor_dead_travel: f64,
-    /// Recent per-event pointer travels, sizing the edge-reach margin (see
-    /// [`TravelHistory`]).
-    reach_travel: TravelHistory,
-    /// The (per-axis) pointer travel of the most recent motion event. The
-    /// edge reach (see [`MagnifierWindow::apply_edge_reach`]) uses this
-    /// stored direction instead of the current event's delta, so it also
-    /// fires when the pointer has stopped short of the physical edge and no
-    /// further motion events are delivered — the exact case where a
-    /// per-event evaluation missed the final shortfall.
-    last_motion_delta: Option<(f64, f64)>,
+    /// Non-magnetic edge-hold latch per axis (`(x, y)`): which side (high /
+    /// low) of each axis is currently held onto its capture edge, or `None`.
+    /// See [`edge_hold_axis`] — the latch gives the edge-hold hysteresis so
+    /// a parked pointer's micro-wobble can't make the quantized view hop
+    /// between the edge and `capture − 2`.
+    edge_hold: (Option<bool>, Option<bool>),
     /// Whether the minimap overlay (a dimmed overview of the frozen screen
     /// with the visible-region marker) is shown in the viewport corner
     /// (toggled with the `minimap` key, default `M`).
@@ -2079,22 +2010,6 @@ impl PointerHandler for MagnifierWindow {
                         let dy = position.1 - self.pointer_position_f.1;
                         self.pointer_position_f = position;
                         self.state.pointer_position = (position.0 as i32, position.1 as i32);
-                        // Track the recent peak travel for the edge reach (see
-                        // [`TravelHistory`] / [`MagnifierWindow::apply_edge_reach`]):
-                        // the delivery gap is accumulated at the *peak* speed
-                        // of a flick, so the reach margin must outlive the fast
-                        // phase through the deceleration. A pause (a new burst
-                        // of motion after a stop) flushes the window so an old
-                        // flick can never make a later slow crawl magnetic.
-                        if dt > 0.1 {
-                            self.reach_travel = TravelHistory::new();
-                        }
-                        self.reach_travel.push((dx, dy));
-                        // The edge reach itself is applied per rendered frame
-                        // in [`MagnifierWindow::apply_edge_reach`] (draw_frame
-                        // is the single choke point after any state change),
-                        // using this stored direction.
-                        self.last_motion_delta = Some((dx, dy));
                         // The view pans with the hand's *movement* (relative
                         // deltas), never by re-centering on the hand's
                         // absolute position — the magnified cursor sits at
@@ -2133,10 +2048,12 @@ impl PointerHandler for MagnifierWindow {
                                 self.set_zoom(new_zoom, min_zoom);
                             }
                             if let Some((cx, cy)) = self.view_center {
-                                let nx = self.clamp_to_capture((cx + dx * sx, cy)).0;
-                                // The x edge reach is applied by the per-frame
-                                // [`MagnifierWindow::apply_edge_reach`] on the
-                                // next draw.
+                                // Pan-tuning applies to the horizontal pan
+                                // during hold-to-zoom too, so the feel is
+                                // consistent.
+                                let tuning = self.state.config.pan_tuning.clamp(0.0, 1.0);
+                                let gain = pan_tuning_gain(self.state.zoom, tuning);
+                                let nx = self.clamp_to_capture((cx + dx * sx * gain, cy)).0;
                                 self.view_center = Some((nx, cy));
                             }
                         } else if let Some((cx, cy)) = self.view_center {
@@ -2147,53 +2064,54 @@ impl PointerHandler for MagnifierWindow {
                             // edge always lands the view *exactly* on the
                             // capture edge (never in the black beyond-capture
                             // fill), and every captured pixel stays reachable.
-                            let (nx, ny) = self.clamp_to_capture((cx + dx * sx, cy + dy * sy));
-                            // The view-vs-hand offset (view minus hand
-                            // content; hold-to-zoom locks the view y while the
-                            // hand travels to zoom, and a launch quirk or
-                            // resize can leave a residual). Left alone it
-                            // shifts the reachable pan range and creates
-                            // invisible limits, so it is corrected by real
-                            // pointer motion only, every event: each motion
-                            // pulls the view a small fraction of the remaining
-                            // offset toward the hand content, so navigation is
-                            // always fully restored without any jump or
-                            // self-animation. The correction never fights a
-                            // wall: an axis already pinned to a capture edge is
-                            // left untouched, so the view always reaches — and
-                            // glides along — the exact edges, regardless of
-                            // pointer speed. In steady state the offset is zero
-                            // (the view pans 1:1 with the hand), so this is
-                            // dormant.
-                            let hand = (
-                                self.pointer_position_f.0 * sx,
-                                self.pointer_position_f.1 * sy,
-                            );
-                            let offset = (nx - hand.0, ny - hand.1);
-                            let (fx, fy) = if offset.0.hypot(offset.1) > 0.5 {
-                                let (rox, roy) =
-                                    offset_correction_step(offset, dt, (dx, dy), (sx, sy));
-                                correct_toward_hand((nx, ny), (hand.0 + rox, hand.1 + roy), bounds)
-                            } else {
+                            // Pan-tuning scales the pan distance per mouse
+                            // pixel with the zoom (see `pan_tuning`); while it
+                            // is active the view intentionally lags the hand's
+                            // content, so the offset correction below is
+                            // suspended — it would read the intentional lag as
+                            // a residual and erase it on the next toward-motion.
+                            let tuning = self.state.config.pan_tuning.clamp(0.0, 1.0);
+                            let gain = pan_tuning_gain(self.state.zoom, tuning);
+                            let (nx, ny) =
+                                self.clamp_to_capture((cx + dx * sx * gain, cy + dy * sy * gain));
+                            let (fx, fy) = if tuning > 0.0 {
                                 (nx, ny)
+                            } else {
+                                // The view-vs-hand offset (view minus hand
+                                // content; hold-to-zoom locks the view y while
+                                // the hand travels to zoom, and a launch quirk
+                                // or resize can leave a residual). Left alone
+                                // it shifts the reachable pan range and
+                                // creates invisible limits, so it is corrected
+                                // by real pointer motion only, every event:
+                                // each motion pulls the view a small fraction
+                                // of the remaining offset toward the hand
+                                // content, so navigation is always fully
+                                // restored without any jump or self-animation.
+                                // The correction never fights a wall: an axis
+                                // already pinned to a capture edge is left
+                                // untouched, so the view always reaches — and
+                                // glides along — the exact edges, regardless
+                                // of pointer speed. In steady state the offset
+                                // is zero (the view pans 1:1 with the hand),
+                                // so this is dormant.
+                                let hand = (
+                                    self.pointer_position_f.0 * sx,
+                                    self.pointer_position_f.1 * sy,
+                                );
+                                let offset = (nx - hand.0, ny - hand.1);
+                                if offset.0.hypot(offset.1) > 0.5 {
+                                    let (rox, roy) =
+                                        offset_correction_step(offset, dt, (dx, dy), (sx, sy));
+                                    correct_toward_hand(
+                                        (nx, ny),
+                                        (hand.0 + rox, hand.1 + roy),
+                                        bounds,
+                                    )
+                                } else {
+                                    (nx, ny)
+                                }
                             };
-                            // Reach the exact edge when the hand reaches the
-                            // physical edge: the compositor's last delivered
-                            // pointer position can lag the hand's true stop
-                            // by up to one event's travel when it is moved
-                            // fast (the delivered position is sampled before
-                            // the hand actually stops), which made the view
-                            // stop short of the walls at speed while slow
-                            // motion always reached. The reach margin scales
-                            // with this event's own travel so it always
-                            // bridges the gap at any speed (see
-                            // [`EdgeReach::apply`]). The correction above can
-                            // never fight this, and the view never leaves the
-                            // capture.
-                            // The edge reach is applied by the per-frame
-                            // [`MagnifierWindow::apply_edge_reach`] on the
-                            // next draw, using the stored last-motion
-                            // direction.
                             self.view_center = Some((fx, fy));
                         }
                         self.request_motion_redraw(qh);
@@ -2289,7 +2207,6 @@ impl KeyboardHandler for MagnifierWindow {
         // key-release for a held hold-to-zoom modifier may never arrive, so
         // disarm here to avoid an unexpectedly armed state on the next motion.
         self.hold_to_zoom_active = false;
-        self.reach_travel = TravelHistory::new();
     }
 
     fn press_key(
@@ -2510,13 +2427,8 @@ impl KeyboardHandler for MagnifierWindow {
             if was_active {
                 // Fresh baseline so the first correction step after the
                 // release never dumps the whole offset (a pause before the
-                // next motion would otherwise make dt huge). Also flush the
-                // reach-travel history: hold-to-zoom's vertical travel would
-                // otherwise inflate the y-reach margin for the next few
-                // events and could snap the view to a wall from further away
-                // than the user's actual push speed justifies.
+                // next motion would otherwise make dt huge).
                 self.last_motion_at = Some(std::time::Instant::now());
-                self.reach_travel = TravelHistory::new();
                 self.draw_frame(qh);
             }
         }
@@ -3263,131 +3175,6 @@ impl MagnifierWindow {
         }
     }
 
-    /// Snap the view center exactly onto a capture edge when the user pushes
-    /// into it (see [`EdgeReach`]). Evaluated on every `draw_frame` call —
-    /// the single choke point after any state change — using the **stored
-    /// direction of the last motion event** (see
-    /// [`MagnifierWindow::last_motion_delta`]) rather than the current
-    /// event's delta, so the reach is applied consistently with whatever the
-    /// render sees. It never fires before the first motion event, so the
-    /// launch centering on the pointer's position is preserved even when that
-    /// position sits near an edge. While hold-to-zoom is active the reach is
-    /// applied to the **x axis only**: the view y is locked to the anchor
-    /// content under the cursor (the y-lock invariant), so it must never be
-    /// snapped to a wall by the reach.
-    ///
-    /// The reach margin scales with the pointer's recent **peak** travel:
-    /// fast flicks (whose delivered position can lag the hand's true stop)
-    /// get a margin large enough to bridge the gap, while a slow crawl keeps
-    /// a small margin so the edge is never magnetic. The view must already be
-    /// within the (scaled + slack) margin of the wall, so the snap is always
-    /// the size of a delivery gap, never a teleport across a large residual.
-    /// `center` must already be clamped to the capture.
-    fn apply_edge_reach(&self, center: (f64, f64)) -> (f64, f64) {
-        let Some((lx, ly)) = self.last_motion_delta else {
-            return center;
-        };
-        let Some(captured) = &self.captured else {
-            return center;
-        };
-        let bounds = (captured.buffer.width as f64, captured.buffer.height as f64);
-        let (sx, sy) = self.capture_scale();
-        let (peak_x, peak_y) = self.reach_travel.peak();
-        let margin_x = reach_margin(peak_x);
-        let margin_y = reach_margin(peak_y);
-        let reach_x = EdgeReach::new(self.width as f64, bounds.0, sx);
-        let reach_y = EdgeReach::new(self.height as f64, bounds.1, sy);
-        let (px, py) = self.pointer_position_f;
-        let result = (
-            if wall_hold(
-                center.0,
-                bounds.0,
-                px,
-                self.width as f64,
-                margin_x,
-                WALL_HOLD_EPS,
-            ) {
-                bounds.0
-            } else if wall_hold(center.0, 0.0, px, 0.0, margin_x, WALL_HOLD_EPS) {
-                0.0
-            } else {
-                reach_x.apply(center.0, lx, px, margin_x)
-            },
-            if self.hold_to_zoom_active {
-                // The y-lock owns the view y during hold-to-zoom: never snap
-                // it to a wall (the anchor content under the cursor must stay
-                // glued while the hand travels to zoom).
-                center.1
-            } else if wall_hold(
-                center.1,
-                bounds.1,
-                py,
-                self.height as f64,
-                margin_y,
-                WALL_HOLD_EPS,
-            ) {
-                bounds.1
-            } else if wall_hold(center.1, 0.0, py, 0.0, margin_y, WALL_HOLD_EPS) {
-                0.0
-            } else {
-                reach_y.apply(center.1, ly, py, margin_y)
-            },
-        );
-        // Diagnostic (run with `RUST_LOG=maggie=debug`): near the surface
-        // edges, log the raw geometry every draw so the wall-reach behaviour
-        // can be verified against the compositor's delivered pointer
-        // positions. `view_before` vs `view_after` shows whether the reach
-        // fired; `hand_content` and the margins discriminate a delivery-gap
-        // shortfall (view tracks the hand, pointer short of the surface
-        // edge) from a residual shortfall (view lags the hand content).
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let (px, py) = self.pointer_position_f;
-            let near_edge = px < 200.0
-                || px > self.width as f64 - 200.0
-                || py < 200.0
-                || py > self.height as f64 - 200.0;
-            if near_edge {
-                let hand_content = (px * sx, py * sy);
-                tracing::debug!(
-                    pointer = ?self.pointer_position_f,
-                    surface = ?(self.width, self.height),
-                    view_before = ?center,
-                    view_after = ?result,
-                    hand_content = ?hand_content,
-                    last_delta = ?self.last_motion_delta,
-                    peak_travel = ?(peak_x, peak_y),
-                    reach_margin = ?(margin_x, margin_y),
-                    zoom = self.state.zoom,
-                    "near-edge draw"
-                ); // A greppable marker for the exact failure under
-                // investigation: pushing toward an edge with the pointer
-                // already inside the (speed-scaled) reach margin while the
-                // view is still short of the wall after the reach — i.e. the
-                // delivery gap or residual exceeded what the margin could
-                // bridge (a normal approach never trips it: the reach either
-                // fires or the pointer is still outside the margin).
-                let short_x =
-                    (lx > 0.0 && px > self.width as f64 - margin_x && result.0 < bounds.0 - 0.5)
-                        || (lx < 0.0 && px < margin_x && result.0 > 0.5);
-                let short_y =
-                    (ly > 0.0 && py > self.height as f64 - margin_y && result.1 < bounds.1 - 0.5)
-                        || (ly < 0.0 && py < margin_y && result.1 > 0.5);
-                if short_x || short_y {
-                    tracing::debug!(
-                        pointer = ?self.pointer_position_f,
-                        surface = ?(self.width, self.height),
-                        view = ?result,
-                        hand_content = ?hand_content,
-                        peak_travel = ?(peak_x, peak_y),
-                        reach_margin = ?(margin_x, margin_y),
-                        "SETTLED SHORTFALL: view short of a wall while pushing into the edge zone"
-                    );
-                }
-            }
-        }
-        result
-    }
-
     /// Center the view on the launch pointer's content once, using the real
     /// capture scale. Requires both the launch position (first enter) and the
     /// capture; the enter can arrive before the screencopy completes.
@@ -3461,9 +3248,27 @@ impl MagnifierWindow {
         // (and its launch centering) has settled the view center — never a
         // placeholder.
         if let Some((cx, cy)) = self.view_center {
+            // When the edge-hold is latched on an axis (meaning the user has
+            // pushed to the very edge), display the capture dimension — the
+            // user expects to see the full width/height at the edge.
+            let display_x = match self.edge_hold.0 {
+                Some(true) => self.captured.as_ref().map_or(cx, |c| c.buffer.width as f64),
+                _ => cx,
+            };
+            let display_y = match self.edge_hold.1 {
+                Some(true) => self
+                    .captured
+                    .as_ref()
+                    .map_or(cy, |c| c.buffer.height as f64),
+                _ => cy,
+            };
             lines.insert(
                 1,
-                format!("pos {}x{}", cx.round() as i64, cy.round() as i64),
+                format!(
+                    "pos {}x{}",
+                    display_x.round() as i64,
+                    display_y.round() as i64
+                ),
             );
         }
         // A transient notice (e.g. the path of the last saved screenshot) is
@@ -3551,7 +3356,6 @@ impl MagnifierWindow {
         // Never enter hold-to-zoom inside the window (the modifier would be
         // forwarded to egui anyway).
         self.hold_to_zoom_active = false;
-        self.reach_travel = TravelHistory::new();
         // Keyboard focus stays `on-demand` (set at startup): niri grants it
         // to layer surfaces at map time (pointer over the surface) and again
         // on every click, so the UI's text fields receive keys after the
@@ -3802,12 +3606,6 @@ impl MagnifierWindow {
         // pixel stays reachable. Only the magnified screen moves when the
         // mouse moves; the cursor sprite stays still in the exact center.
         let (center_x, center_y) = self.clamp_to_capture((center_x, center_y));
-        // The edge reach runs on every draw (see
-        // [`MagnifierWindow::apply_edge_reach`]), landing the view exactly on
-        // a wall when the user pushes into it, using the stored last-motion
-        // direction. The result is written back so the next motion event
-        // pans from the reached position.
-        let (center_x, center_y) = self.apply_edge_reach((center_x, center_y));
         // Pixel-grid lock: quantize the view center to the nearest integer
         // capture pixel and keep it there forever (see
         // [`quantize_center_to_pixel_grid`]). The magnified cursor sits at
@@ -3816,9 +3614,42 @@ impl MagnifierWindow {
         // cursor's texels and the screen's texels coincide permanently: the
         // launch snap the user asked for, applied once and then held for
         // every subsequent pan and zoom. Nothing moves on its own; the
-        // cursor never leaves the center.
-        let (center_x, center_y) =
-            quantize_center_to_pixel_grid((center_x, center_y), (source_w as f64, source_h as f64));
+        // cursor never leaves the center. Configurable: with
+        // `pixel_locked_panning` off the center stays continuous and the
+        // render paths fall back to their per-origin crispness snap (the
+        // smooth-panning trade-off — see the GPU/CPU branches).
+        let (center_x, center_y) = if self.state.config.pixel_locked_panning {
+            quantize_center_to_pixel_grid((center_x, center_y), (source_w as f64, source_h as f64))
+        } else {
+            (center_x, center_y)
+        };
+        // Edge-hold with hysteresis (see [`edge_hold_axis`]): pin each axis
+        // to the capture edge (0 on the left/top, `capture` on the
+        // right/bottom) while the pointer is parked at that edge, latched so
+        // a parked pointer's micro-wobble can't make the quantized view hop
+        // between the edge and capture − 2 (the bottom/right shiver).
+        // Pinning to the capture edge (not `capture − 1`) makes the
+        // beyond-capture boundary render exactly at the viewport center —
+        // flush on the magnified cursor's apex — so the screen edge and the
+        // cursor tip align perfectly at every wall (the earlier `capture − 1`
+        // target left the boundary a full magnified texel past the apex,
+        // which the user saw as the edge and cursor not lining up).
+        let (px, py) = self.pointer_position_f;
+        let (center_x, held_x) = edge_hold_axis(
+            center_x,
+            px,
+            self.width as f64,
+            source_w as f64,
+            self.edge_hold.0,
+        );
+        let (center_y, held_y) = edge_hold_axis(
+            center_y,
+            py,
+            self.height as f64,
+            source_h as f64,
+            self.edge_hold.1,
+        );
+        self.edge_hold = (held_x, held_y);
         self.view_center = Some((center_x, center_y));
         let src_x = center_x - view_w / 2.0;
         let src_y = center_y - view_h / 2.0;
@@ -4011,13 +3842,26 @@ impl MagnifierWindow {
                 None
             };
             if zoom > 0.0 {
-                // The view center is quantized to integer capture px (see
-                // `draw_frame`), so the sampling origin already keeps every
-                // texel boundary on an exact pixel boundary: capture pixel
-                // `C == center` starts exactly at the viewport center, where
-                // the cursor hotspot sits — the cursor's and the screen's
-                // blocks share one lattice. No separate origin snap is
-                // needed (it would shift the phase and break the lock).
+                // Pixel-locked panning: the view center is quantized to
+                // integer capture px (see `draw_frame`), so the sampling
+                // origin already keeps every texel boundary on an exact
+                // pixel boundary — capture pixel `C == center` starts
+                // exactly at the viewport center, where the cursor hotspot
+                // sits, and the cursor's and the screen's blocks share one
+                // lattice. No separate origin snap is needed (it would
+                // shift the phase and break the lock). Smooth panning:
+                // keep each texel individually crisp on the buffer's pixel
+                // grid instead (`snap_render_origin`), accepting that the
+                // phase drifts with the continuous pan.
+                let (src_x, src_y) = if self.state.config.pixel_locked_panning {
+                    (src_x, src_y)
+                } else {
+                    let factor = zoom * crate::gpu::RENDER_SCALE as f64;
+                    (
+                        snap_render_origin(src_x, factor),
+                        snap_render_origin(src_y, factor),
+                    )
+                };
                 let uv = (
                     src_x / source_w as f64,
                     src_y / source_h as f64,
@@ -4075,8 +3919,18 @@ impl MagnifierWindow {
                 (hx.round() as i32, hy.round() as i32),
             )
         });
-        // Same pixel-grid lock as the GPU branch: the quantized center keeps
-        // the texel grid on the cursor's lattice at logical resolution too.
+        // Same pixel-grid behavior as the GPU branch: with pixel-locked
+        // panning the quantized center keeps the texel grid on the cursor's
+        // lattice at logical resolution; with smooth panning the origin is
+        // snapped so each texel stays crisp on the canvas pixel grid.
+        let (src_x, src_y) = if self.state.config.pixel_locked_panning {
+            (src_x, src_y)
+        } else {
+            (
+                snap_render_origin(src_x, zoom),
+                snap_render_origin(src_y, zoom),
+            )
+        };
         let scaled =
             self.state
                 .renderer
@@ -4420,8 +4274,8 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         hold_to_zoom_active: false,
         hold_zoom_last_y: 0.0,
         hold_floor_dead_travel: 0.0,
-        reach_travel: TravelHistory::new(),
-        last_motion_delta: None,
+
+        edge_hold: (None, None),
         minimap_visible: minimap_on_launch,
         minimap_base: None,
     };
@@ -4582,321 +4436,60 @@ mod tests {
     }
 
     #[test]
-    fn view_round_trips_reach_both_edges_exactly_with_residual_offset() {
-        // Simulate the full pipeline (pan + hard clamp + wall-aware offset
-        // correction in the motion handler, then the hand-edge reach applied
-        // on the draw stage with the stored per-event direction) with a
-        // leftover view-vs-hand offset AND a pointer whose delivered position
-        // stops short of the surface edge (edge clamping / fast-stop lag).
-        // Repeated full left-right panning must always land the view
-        // *exactly* on both edges — the wall wins — and the offset must decay
-        // away during free motion.
-        let scale = 1.5;
-        let capture = 3000.0;
-        let surface = capture / scale; // the hand's logical coordinate range
-        // The hand's delivered travel stops 3 capture px short of the right
-        // edge, which used to make the view stop short of the wall.
-        let (hand_min, hand_max) = (0.0, (capture - 3.0) / scale);
-        // Residual offset: view 300 capture px ahead of the hand.
-        let mut view: f64 = 300.0;
-        let mut seen_left_edge = false;
-        let mut seen_right_edge = false;
-        for _ in 0..30 {
-            // Pan left to the wall, then right to the wall, several times.
-            for (dir, target_hand) in [(-1.0, hand_min), (1.0, hand_max)] {
-                let mut hand: f64 = if dir < 0.0 { hand_max } else { hand_min };
-                while hand != target_hand {
-                    let step = (target_hand - hand).abs().min(16.0) * dir;
-                    hand += step;
-                    // Pan + hard clamp: the wall wins, exactly as in the
-                    // motion handler.
-                    let nx = (view + step * scale).clamp(0.0, capture);
-                    let hand_content = hand * scale;
-                    let offset = nx - hand_content;
-                    let corrected = if offset.abs() > 0.5 {
-                        let (rox, _) = offset_correction_step(
-                            (offset, 0.0),
-                            0.016,
-                            (step, 0.0),
-                            (scale, scale),
-                        );
-                        // Wall-aware correction: a pinned axis never moves.
-                        let pinned = nx <= 0.0 || nx >= capture;
-                        if pinned {
-                            nx
-                        } else {
-                            (hand_content + rox).clamp(0.0, capture)
-                        }
-                    } else {
-                        nx
-                    };
-                    let reach = EdgeReach::new(surface, capture, scale);
-                    view = reach.apply(corrected, step, hand, reach_margin(step));
-                }
-                if view == 0.0 {
-                    seen_left_edge = true;
-                }
-                if view == capture {
-                    seen_right_edge = true;
-                }
-            }
-        }
-        assert!(seen_left_edge, "view must reach the exact left edge");
-        assert!(seen_right_edge, "view must reach the exact right edge");
+    fn pan_tuning_gain_scales_with_zoom() {
+        // Disabled (0) or a degenerate zoom -> no effect.
+        assert_eq!(pan_tuning_gain(12.0, 0.0), 1.0);
+        assert_eq!(pan_tuning_gain(0.0, 0.5), 1.0);
+        // Neutral at 1x; slower at high zoom (more mouse travel per texel);
+        // faster below 1x (the "vice versa").
+        assert!((pan_tuning_gain(1.0, 0.5) - 1.0).abs() < 1e-9);
+        assert!((pan_tuning_gain(4.0, 0.5) - 0.5).abs() < 1e-9);
+        assert!((pan_tuning_gain(12.0, 0.5) - 12.0_f64.powf(-0.5)).abs() < 1e-9);
+        assert!(pan_tuning_gain(0.25, 0.5) > 1.0);
+        // Stronger tuning -> even more mouse travel at high zoom.
+        assert!(pan_tuning_gain(8.0, 1.0) < pan_tuning_gain(8.0, 0.5));
     }
 
     #[test]
-    fn wall_hold_pins_the_view_on_a_wall_at_the_edge() {
-        // Pointer parked at the right edge (within the reach margin) with the
-        // view on/near the wall -> held exactly on the wall, so sub-pixel
-        // pointer jitter can never leak into the readout (the old 3199/3200
-        // flicker at rest).
-        assert!(wall_hold(3200.0, 3200.0, 1829.0, 1829.0, 8.0, 3.0));
-        assert!(wall_hold(3199.2, 3200.0, 1828.9, 1829.0, 8.0, 3.0));
-        // Low wall.
-        assert!(wall_hold(0.5, 0.0, 0.3, 0.0, 8.0, 3.0));
-        // View on the wall with the pointer inside the margin is held.
-        assert!(wall_hold(3200.0, 3200.0, 1821.0, 1829.0, 8.0, 3.0));
-        // A deliberate pan away (view more than EPS off the wall) releases
-        // the hold immediately — no magnetic wall.
-        assert!(!wall_hold(3195.0, 3200.0, 1828.9, 1829.0, 8.0, 3.0));
-        // Pointer away from the edge: the hold must not fire even when the
-        // view happens to sit near the wall (the view tracks the hand content
-        // in steady state, so this only occurs transiently).
-        assert!(!wall_hold(3199.5, 3200.0, 1800.0, 1829.0, 8.0, 3.0));
-    }
-
-    #[test]
-    fn reach_margin_scales_with_event_travel() {
-        // The reach margin is proportional to the pointer's recent peak
-        // travel: a fast flick whose delivered position stops well short of
-        // the surface edge still lands the view exactly on the wall, while a
-        // slow push keeps a small margin so the edge is never magnetic.
-        let scale = 1.5;
-        let surface = 2133.0;
-        let bounds = 3200.0;
-        let reach = EdgeReach::new(surface, bounds, scale);
-        // Fast flick: 60 logical px short of the edge, peak travel 40 px
-        // (margin = 68 px) -> the gap is bridged, view lands on the wall.
+    fn edge_hold_pins_the_edge_with_hysteresis_against_wobble() {
+        let surf = 1829.0;
+        let cap = 3200.0;
+        // Not near the edge, pointer parked there: no grab-from-a-distance.
         assert_eq!(
-            reach.apply(3150.0, 40.0, surface - 60.0, reach_margin(40.0)),
-            bounds
+            edge_hold_axis(3190.0, 1828.9, surf, cap, None),
+            (3190.0, None)
         );
-        // The same shortfall at slow speed (travel 1 px, margin ~9.5 px)
-        // does not bridge it: the view stays put (no magnetic wall).
+        // Engage at the high edge when the view is within EPS: pin to cap
+        // (the capture edge), and the hold latches (Some(true)).
+        let (v, held) = edge_hold_axis(3199.0, 1828.9, surf, cap, None);
+        assert_eq!((v, held), (3200.0, Some(true)));
+        // While latched, even a view that would quantize to cap-2 (a parked
+        // pointer's micro-wobble panning the view) stays pinned to cap —
+        // no 3198/3196 flip-flop.
+        let (v, held) = edge_hold_axis(3197.0, 1828.4, surf, cap, Some(true));
+        assert_eq!((v, held), (3200.0, Some(true)));
         assert_eq!(
-            reach.apply(3150.0, 1.0, surface - 60.0, reach_margin(1.0)),
-            3150.0
+            edge_hold_axis(3197.0, 1828.4, surf, cap, Some(true)),
+            (3200.0, Some(true))
         );
-        // Pushing away from the edge never triggers, however large the
-        // travel (here: pushing left while the pointer sits near the right
-        // edge).
+        // Releasing: the pointer moves > margin away from the edge -> the
+        // hold drops and the view pans freely.
         assert_eq!(
-            reach.apply(3150.0, -40.0, surface - 10.0, reach_margin(40.0)),
-            3150.0
+            edge_hold_axis(3199.0, 1820.0, surf, cap, Some(true)),
+            (3199.0, None)
         );
-        // A view far from the wall never triggers (no teleports).
+        // Low edge engages to 0 and latches; pointer leaving low edge releases.
         assert_eq!(
-            reach.apply(2500.0, 40.0, surface - 60.0, reach_margin(40.0)),
-            2500.0
+            edge_hold_axis(1.0, 0.7, surf, cap, None),
+            (0.0, Some(false))
         );
-    }
-
-    #[test]
-    fn reach_margin_is_capped() {
-        // The margin is capped (REACH_MAX_LOGICAL) so an extreme motion
-        // burst cannot create a huge magnetic zone: a pointer far short of
-        // the edge never triggers even with extreme travel.
-        let reach = EdgeReach::new(2133.0, 3200.0, 1.5);
         assert_eq!(
-            reach.apply(3100.0, 500.0, 2133.0 - 250.0, reach_margin(500.0)),
-            3100.0
+            edge_hold_axis(2.5, 0.7, surf, cap, Some(false)),
+            (0.0, Some(false))
         );
-        // Within the cap (margin = 200 px), the reach still fires.
         assert_eq!(
-            reach.apply(3150.0, 1000.0, 2133.0 - 100.0, reach_margin(1000.0)),
-            3200.0
-        );
-    }
-
-    #[test]
-    fn reach_wall_edge_lands_on_the_wall_when_the_hand_reaches_the_edge() {
-        let scale = 1.5;
-        let surface = 2133.0;
-        let bounds = 3200.0;
-        let reach = EdgeReach::new(surface, bounds, scale);
-        // The exact failure the user reported: the pointer's delivered
-        // position stops short of the surface edge when moved fast, so the
-        // view settles short of the wall. The hand being pushed into the
-        // edge (delivered position within the reach margin of the surface
-        // edge) must land the view exactly on the wall.
-        assert_eq!(reach.apply(3180.0, 5.0, 2120.0, reach_margin(13.0)), bounds);
-        // Pushing left into the left edge lands on 0.
-        assert_eq!(reach.apply(20.0, -5.0, 5.0, reach_margin(0.0)), 0.0);
-        // Pushing away from an edge never triggers.
-        assert_eq!(
-            reach.apply(3180.0, -5.0, 2120.0, reach_margin(100.0)),
-            3180.0
-        );
-        // Hand mid-screen never triggers.
-        assert_eq!(
-            reach.apply(3180.0, 5.0, 1000.0, reach_margin(100.0)),
-            3180.0
-        );
-        // A view too far from the wall never triggers (no teleports).
-        assert_eq!(
-            reach.apply(2800.0, 5.0, 2120.0, reach_margin(100.0)),
-            2800.0
-        );
-        // Gliding (no movement this event) never triggers.
-        assert_eq!(reach.apply(3180.0, 0.0, 2120.0, reach_margin(0.0)), 3180.0);
-    }
-
-    #[test]
-    fn reach_wall_edge_is_speed_and_direction_safe() {
-        let scale = 1.5;
-        let surface = 2133.0;
-        let bounds = 3200.0;
-        let reach = EdgeReach::new(surface, bounds, scale);
-        // Even a tiny push while the hand is jammed at the edge lands on the
-        // wall (this is what slow crawling needed before).
-        assert_eq!(reach.apply(3199.0, 0.1, 2130.0, reach_margin(0.0)), bounds);
-        // The hand within the margin but not pushing: untouched.
-        assert_eq!(
-            reach.apply(3190.0, 0.0, 2120.0, reach_margin(100.0)),
-            3190.0
-        );
-        // Pushing toward the edge with the hand just outside the margin:
-        // untouched (the margin bounds the magnetic feel).
-        assert_eq!(reach.apply(3190.0, 5.0, 2100.0, reach_margin(5.0)), 3190.0);
-    }
-
-    #[test]
-    fn reach_fires_from_stored_direction_after_motion_stops() {
-        // The staged design: the motion handler pans/clamps/corrects the
-        // view and stores the last per-axis travel; the edge reach is applied
-        // on every draw (frame callbacks included) with that *stored*
-        // direction. So even if the pointer stops short of the physical edge
-        // and no further motion events are delivered, the next draw still
-        // lands the view exactly on the wall — the failure mode where a
-        // per-event evaluation could miss the final shortfall.
-        let scale = 1.5;
-        let surface = 2133.0;
-        let bounds = 3200.0;
-        let reach = EdgeReach::new(surface, bounds, scale);
-        // Fast flick right: the last delivered position is 40 logical px
-        // short of the edge, but the view must land on the wall on the next
-        // draw, driven by the stored (rightward) delta.
-        assert_eq!(
-            reach.apply(3150.0, 25.0, surface - 40.0, reach_margin(40.0)),
-            bounds
-        );
-        // The stored direction is the *last* one: if the pointer then moved
-        // away (leftward stored delta), the same geometry must NOT snap.
-        assert_eq!(
-            reach.apply(3150.0, -25.0, surface - 40.0, reach_margin(40.0)),
-            3150.0
-        );
-        // Before any motion the stored delta is None (mapped to 0.0 here):
-        // no snap, so launch centering on a near-edge pointer position is
-        // preserved.
-        assert_eq!(
-            reach.apply(3150.0, 0.0, surface - 40.0, reach_margin(40.0)),
-            3150.0
-        );
-    }
-
-    #[test]
-    fn travel_history_peak_keeps_the_margin_large_through_a_decelerating_flick() {
-        // A fast flick to the right edge decelerates: the last delivered
-        // events have small travel, but the delivery gap was accumulated at
-        // the peak speed frames earlier. The margin must stay large through
-        // the whole approach, so it is sized from the recent *peak* travel,
-        // not the current event's travel.
-        let scale = 1.5;
-        let surface = 2133.0;
-        let bounds = 3200.0;
-        let reach = EdgeReach::new(surface, bounds, scale);
-        // The flick's recent history: fast (100 px/event), then decelerating
-        // to 2 px/event. The delivered position stops 90 logical px short of
-        // the edge.
-        let mut hist = TravelHistory::new();
-        for _ in 0..2 {
-            hist.push((100.0, 0.0));
-        }
-        for _ in 0..2 {
-            hist.push((2.0, 0.0));
-        }
-        let (peak_x, _) = hist.peak();
-        assert_eq!(peak_x, 100.0);
-        // Sized from the peak, the margin (158 px) bridges the 90 px gap...
-        let margin = reach_margin(peak_x);
-        assert!(margin > 90.0, "margin {margin} must cover the 90 px gap");
-        assert_eq!(reach.apply(3150.0, 2.0, surface - 90.0, margin), bounds);
-        // ...whereas the old per-event margin (11 px) could not.
-        let old_margin = reach_margin(2.0);
-        assert!(old_margin < 90.0, "old margin {old_margin} too small");
-        assert_eq!(reach.apply(3150.0, 2.0, surface - 90.0, old_margin), 3150.0);
-    }
-
-    #[test]
-    fn travel_history_current_event_always_in_window_covers_long_deceleration() {
-        // A long deceleration (more events than the window) flushes the peak,
-        // but the gap shrinks with the hand's speed: the delivery gap is at
-        // most the travel of the final frame, which IS the current event's
-        // travel — always present in the window. So a long deceleration still
-        // lands the wall: the margin covers the current event's travel, and
-        // the fast-phase peak only adds headroom for multi-frame staleness.
-        let scale = 1.5;
-        let surface = 2133.0;
-        let bounds = 3200.0;
-        let reach = EdgeReach::new(surface, bounds, scale);
-        // Fast phase, then 10 slow events (the fast phase has left the
-        // window; the peak is now the current 2 px/event travel).
-        let mut hist = TravelHistory::new();
-        for _ in 0..REACH_HISTORY_LEN {
-            hist.push((100.0, 0.0));
-        }
-        for _ in 0..10 {
-            hist.push((2.0, 0.0));
-        }
-        let (peak_x, _) = hist.peak();
-        assert_eq!(peak_x, 2.0);
-        // The gap the decelerated hand can leave (<= its own final travel,
-        // 2 px, margin 11) is still bridged: the current event is in the
-        // window, so the margin always covers at least the current speed.
-        assert_eq!(
-            reach.apply(3194.0, 2.0, surface - 8.0, reach_margin(peak_x)),
-            bounds
-        );
-        // A stale gap larger than the current speed can no longer be bridged
-        // once the fast phase flushed — that is the documented limit of the
-        // window (the fast phase must be recent for multi-frame staleness).
-        assert_eq!(
-            reach.apply(3150.0, 2.0, surface - 90.0, reach_margin(peak_x)),
-            3150.0
-        );
-    }
-
-    #[test]
-    fn travel_history_peak_decays_once_the_fast_phase_passes() {
-        // After the fast phase leaves the window, the peak drops and the
-        // edge stops being magnetic: a slow crawl far from the edge is
-        // untouched even while pushing toward it.
-        let mut hist = TravelHistory::new();
-        for _ in 0..REACH_HISTORY_LEN {
-            hist.push((100.0, 0.0));
-        }
-        for _ in 0..REACH_HISTORY_LEN {
-            hist.push((1.0, 0.0));
-        }
-        let (peak_x, _) = hist.peak();
-        assert_eq!(peak_x, 1.0);
-        let reach = EdgeReach::new(2133.0, 3200.0, 1.5);
-        // Crawl 60 logical px short of the edge with a tiny margin: untouched.
-        assert_eq!(
-            reach.apply(3150.0, 1.0, 2133.0 - 60.0, reach_margin(peak_x)),
-            3150.0
+            edge_hold_axis(1.0, 6.0, surf, cap, Some(false)),
+            (1.0, None)
         );
     }
 
@@ -5157,8 +4750,7 @@ mod tests {
             } else {
                 nx
             };
-            let reach = EdgeReach::new(surface, capture, scale);
-            view = reach.apply(corrected, step, hand, reach_margin(step));
+            view = corrected;
             if view == capture {
                 reached_wall = true;
                 break;

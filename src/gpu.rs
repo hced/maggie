@@ -67,12 +67,24 @@ void main() {
 /// anchored view reaches past the frozen capture, the region beyond the frame
 /// is either black (this branch) or stretched edge pixels (CLAMP_TO_EDGE).
 const FRAGMENT_SHADER: &str = r#"
+// The OOB comparison below must be exact: at the right/bottom walls the
+// beyond-capture boundary lands exactly at the viewport center (under the
+// magnified cursor's hotspot), and mediump rounding of the boundary fragment
+// to exactly 1.0 used to make the last capture texel bleed one buffer column
+// (half a logical pixel) past the boundary — a visible "excess" between the
+// end of the magnified pixels and the cursor tip. Use highp where available
+// (f32; guaranteed exact here) and treat exactly-1.0 as out-of-bounds so
+// precision can never stretch content past the boundary.
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
 precision mediump float;
+#endif
 varying vec2 v_uv;
 uniform sampler2D u_tex;
 uniform float u_oob_black;
 void main() {
-    if (u_oob_black > 0.5 && (v_uv.x < 0.0 || v_uv.x > 1.0 || v_uv.y < 0.0 || v_uv.y > 1.0)) {
+    if (u_oob_black > 0.5 && (v_uv.x < 0.0 || v_uv.x >= 1.0 || v_uv.y < 0.0 || v_uv.y >= 1.0)) {
         gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
     } else {
         gl_FragColor = texture2D(u_tex, v_uv);

@@ -449,6 +449,20 @@ fn config_section(
             ui.checkbox(&mut config.minimap_visible, "");
             ui.end_row();
 
+            ui.label("Pixel-locked panning");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut config.pixel_locked_panning, "");
+                ui.label("(cursor & screen texels stay flush; pans in whole magnified blocks — off for smooth panning)");
+            });
+            ui.end_row();
+
+            ui.label("Pan tuning");
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut config.pan_tuning).range(0.0..=1.0).speed(0.05));
+                ui.label("(0 = off (default); higher = more mouse travel per pixel when zoomed in, less when zoomed out)");
+            });
+            ui.end_row();
+
             ui.label("Hold-to-zoom speed");
             ui.horizontal(|ui| {
                 ui.add(
