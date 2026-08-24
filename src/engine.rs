@@ -382,7 +382,7 @@ fn wheel_levels_next(zoom: f64, min_zoom: f64, max_zoom: f64, steps: f64) -> f64
     };
     let idx = idx_f.round();
     let on_level = (idx_f - idx).abs() < 1e-6;
-    let next = if on_level {
+    let mut next = if on_level {
         // Exactly on a level: step to the neighbour in the wheel direction.
         if steps > 0.0 {
             (idx + 1.0).min(LEVELS)
@@ -395,6 +395,17 @@ fn wheel_levels_next(zoom: f64, min_zoom: f64, max_zoom: f64, steps: f64) -> f64
     } else {
         idx_f.floor().max(0.0)
     };
+    // When max/LEVELS equals min_zoom (e.g. max=9, min=1 → level 0 and
+    // level 1 are both 1×), stepping from level 0 to level 1 produces the
+    // same zoom and the "no-change" guard blocks the wheel. Skip levels
+    // that don't actually change the zoom until one does (capped at LEVELS).
+    if steps > 0.0 {
+        let mut candidate = next;
+        while candidate <= LEVELS && (max_zoom * candidate / LEVELS - zoom).abs() < 1e-9 {
+            candidate += 1.0;
+        }
+        next = candidate.min(LEVELS);
+    }
     if next == 0.0 {
         min_zoom
     } else {
@@ -1310,6 +1321,8 @@ pub struct MagnifierState {
     pub cursor_visible: bool,
     pub renderer: Renderer,
     pub pointer_position: (i32, i32),
+    /// Deadline after which the launch hint ("K: help") disappears.
+    pub launch_hint_deadline: Option<std::time::Instant>,
 }
 
 impl MagnifierState {
@@ -1317,7 +1330,7 @@ impl MagnifierState {
         let max_zoom = config.max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
         let min_zoom = config.min_zoom();
         let zoom = initial_zoom
-            .unwrap_or_else(|| config.default_zoom.unwrap_or(3.0))
+            .unwrap_or_else(|| config.default_zoom.unwrap_or(1.0))
             .clamp(min_zoom, max_zoom);
         let renderer = Renderer::new(zoom);
 
@@ -1331,6 +1344,9 @@ impl MagnifierState {
             cursor_visible: true,
             renderer,
             pointer_position: (0, 0),
+            launch_hint_deadline: Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(4),
+            ),
         }
     }
 
@@ -1376,7 +1392,7 @@ impl MagnifierState {
         let default_zoom = self
             .config
             .default_zoom
-            .unwrap_or(3.0)
+            .unwrap_or(1.0)
             .clamp(min_zoom, max_zoom);
         self.zoom = default_zoom;
         self.renderer.update_scale_factor(default_zoom);
@@ -2127,7 +2143,7 @@ impl PointerHandler for MagnifierWindow {
                     // runtime minimum applies, so a default of 0 % lands on
                     // the fully-zoomed-out view.
                     if button == BTN_MIDDLE {
-                        let default_zoom = self.state.config.default_zoom.unwrap_or(3.0);
+                        let default_zoom = self.state.config.default_zoom.unwrap_or(1.0);
                         self.set_zoom(default_zoom, self.runtime_min_zoom());
                         self.draw_frame(qh);
                     }
@@ -2344,7 +2360,7 @@ impl KeyboardHandler for MagnifierWindow {
             self.draw_frame(qh);
             tracing::info!("Minimap visible: {}", self.minimap_visible);
         } else if keysym_str == config_key.reset_zoom {
-            let default_zoom = self.state.config.default_zoom.unwrap_or(3.0);
+            let default_zoom = self.state.config.default_zoom.unwrap_or(1.0);
             self.set_zoom(default_zoom, self.runtime_min_zoom());
             self.draw_frame(qh);
         }
@@ -3749,6 +3765,27 @@ impl MagnifierWindow {
             } else {
                 None
             };
+            // Launch hint: a single dim line shown for a few seconds after
+            // startup so the user knows how to open the key legend.
+            let hint = if !self.state.osd_visible
+                && self
+                    .state
+                    .launch_hint_deadline
+                    .is_some_and(|d| std::time::Instant::now() < d)
+            {
+                let key = &self.state.config.keybindings.toggle_osd;
+                crate::osd::build_hint_sprite(
+                    &[format!("{key}: help")],
+                    osd_corner,
+                    self.width as i32 * crate::gpu::RENDER_SCALE,
+                    self.height as i32 * crate::gpu::RENDER_SCALE,
+                    [0x80, 0x80, 0x80],
+                )
+            } else {
+                // Clear the deadline once expired so we stop checking.
+                self.state.launch_hint_deadline = None;
+                None
+            };
             // The screenshot selection overlay (scrim + colored border) at
             // the RENDER_SCALE buffer resolution, uploaded as a fullscreen
             // sprite on the GPU. It is **cached**: only rebuilt (and only
@@ -3871,6 +3908,7 @@ impl MagnifierWindow {
                 gpu.draw(
                     Some(uv),
                     osd.as_ref(),
+                    hint.as_ref(),
                     cursor.as_ref(),
                     overlay,
                     rebuild,
@@ -3884,6 +3922,7 @@ impl MagnifierWindow {
                 gpu.draw(
                     None,
                     osd.as_ref(),
+                    hint.as_ref(),
                     cursor.as_ref(),
                     overlay,
                     rebuild,
@@ -3940,6 +3979,22 @@ impl MagnifierWindow {
         // always shows the legend briefly.
         let show_osd = self.state.osd_visible || notice_fresh;
         let osd_lines = self.osd_lines();
+        // Launch hint (CPU path).
+        let hint_lines: Vec<String> = if !self.state.osd_visible
+            && self
+                .state
+                .launch_hint_deadline
+                .is_some_and(|d| std::time::Instant::now() < d)
+        {
+            self.state.launch_hint_deadline = None;
+            vec![format!(
+                "{}: help",
+                self.state.config.keybindings.toggle_osd
+            )]
+        } else {
+            self.state.launch_hint_deadline = None;
+            vec![]
+        };
         // The screenshot overlay at logical resolution, blended into the
         // canvas inside the render closure (which cannot borrow `self`).
         // Cached like the GPU path: rebuilt only when the mode/selection
@@ -4027,6 +4082,16 @@ impl MagnifierWindow {
             if show_osd {
                 crate::osd::draw_osd(canvas, width, height, &osd_lines, osd_corner);
             }
+            if !hint_lines.is_empty() {
+                crate::osd::draw_osd_colored(
+                    canvas,
+                    width,
+                    height,
+                    &hint_lines,
+                    osd_corner,
+                    [0x80, 0x80, 0x80],
+                );
+            }
         });
     }
 
@@ -4077,7 +4142,7 @@ impl MagnifierWindow {
 
     fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
         if let Some(gpu) = &mut self.gpu {
-            gpu.draw(None, None, None, None, false, None);
+            gpu.draw(None, None, None, None, None, false, None);
             return;
         }
         self.render_frame(qh, |canvas, _width, _height, _stride| {
@@ -4925,6 +4990,17 @@ mod tests {
         assert_eq!(wheel_levels_next(1.2, 1.0, 12.0, -1.0), 1.0); // snaps down to min
         // A zoom beyond the current max snaps to the top level, not backwards.
         assert_eq!(wheel_levels_next(13.0, 1.0, 12.0, -1.0), 12.0 * 8.0 / 9.0);
+    }
+
+    #[test]
+    fn wheel_levels_scroll_up_from_floor_when_max_equals_nine_times_min() {
+        // Regression: when max=9 and min=1, level 0 and level 1 both map to
+        // 1×. Scrolling up from level 0 used to produce 1× (same as current)
+        // so the no-change guard blocked the wheel. The fix skips levels that
+        // don't change the zoom.
+        assert_eq!(wheel_levels_next(1.0, 1.0, 9.0, 1.0), 9.0 * 2.0 / 9.0);
+        // Scrolling down from level 1 stays at the floor.
+        assert_eq!(wheel_levels_next(1.0, 1.0, 9.0, -1.0), 1.0);
     }
 
     #[test]

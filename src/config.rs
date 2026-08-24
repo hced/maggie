@@ -247,7 +247,7 @@ impl Default for Keybindings {
 impl Default for MagnifierConfig {
     fn default() -> Self {
         MagnifierConfig {
-            default_zoom: Some(2.0),
+            default_zoom: Some(1.0),
             max_zoom: 9.0,
             hold_to_zoom_speed: 0.02,
             scroll_zoom_mode: ScrollZoomMode::Levels,
@@ -273,7 +273,7 @@ impl Default for MagnifierConfig {
             screenshot_path: "~/Pictures".to_string(),
             screenshot_filename_pattern: "maggie_%Y%m%d_%H%M%S.png".to_string(),
             screenshot_selection_color: [255, 153, 0],
-            show_osd: true,
+            show_osd: false,
             osd_corner: crate::osd::Corner::TopLeft,
             minimap_corner: crate::osd::Corner::BottomRight,
             minimap_visible: true,

@@ -244,7 +244,28 @@ pub fn draw_osd(canvas: &mut [u8], canvas_w: i32, canvas_h: i32, lines: &[String
     let Some(sprite) = build_osd_sprite(lines, corner, canvas_w, canvas_h) else {
         return;
     };
+    blit_sprite(canvas, canvas_w, canvas_h, &sprite);
+}
 
+/// Like [`draw_osd`] but with a caller-specified text color — used for
+/// the dim launch hint so it renders quieter than the normal legend.
+pub fn draw_osd_colored(
+    canvas: &mut [u8],
+    canvas_w: i32,
+    canvas_h: i32,
+    lines: &[String],
+    corner: Corner,
+    text_color: [u8; 3],
+) {
+    let Some(sprite) = build_hint_sprite(lines, corner, canvas_w, canvas_h, text_color) else {
+        return;
+    };
+    blit_sprite(canvas, canvas_w, canvas_h, &sprite);
+}
+
+/// Composite an [`OsdSprite`] onto a canvas buffer, skipping fully
+/// transparent source pixels.
+fn blit_sprite(canvas: &mut [u8], canvas_w: i32, canvas_h: i32, sprite: &OsdSprite) {
     for y in sprite.y..(sprite.y + sprite.height) {
         if y < 0 || y >= canvas_h {
             continue;
@@ -342,6 +363,54 @@ pub fn build_osd_sprite(
         );
     }
 
+    Some(OsdSprite {
+        buffer,
+        x: box_x,
+        y: box_y,
+        width: box_w,
+        height: box_h,
+    })
+}
+
+/// A small, dim hint sprite rendered briefly on launch to tell the user
+/// how to access the key legend. Uses a caller-specified text color
+/// (typically a low-alpha gray) so it stays visually quiet.
+pub fn build_hint_sprite(
+    lines: &[String],
+    corner: Corner,
+    screen_w: i32,
+    screen_h: i32,
+    text_color: [u8; 3],
+) -> Option<OsdSprite> {
+    if lines.is_empty() || screen_w <= 0 || screen_h <= 0 {
+        return None;
+    }
+    let widest = lines
+        .iter()
+        .map(|line| line.chars().count() as i32 * GLYPH_ADVANCE)
+        .max()
+        .unwrap_or(0);
+    let box_w = widest + BOX_PADDING;
+    let box_h = lines.len() as i32 * LINE_HEIGHT + BOX_PADDING;
+    let (box_x, box_y) = corner.position(screen_w, screen_h, box_w, box_h, BOX_MARGIN);
+    let mut buffer = crate::render::RgbaBuffer {
+        width: box_w,
+        height: box_h,
+        data: vec![0u8; (box_w as usize * box_h as usize) * 4],
+    };
+    // No background box — the hint floats as bare text for minimal intrusion.
+    let pad = BOX_PADDING / 2;
+    for (index, line) in lines.iter().enumerate() {
+        draw_text(
+            &mut buffer.data,
+            box_w,
+            box_h,
+            pad,
+            pad + index as i32 * LINE_HEIGHT,
+            line,
+            text_color,
+        );
+    }
     Some(OsdSprite {
         buffer,
         x: box_x,
