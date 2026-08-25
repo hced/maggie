@@ -592,8 +592,6 @@ fn minimap_angular_gradient_color(x: i32, y: i32, w: f64, h: f64, speed: f64) ->
     ]
 }
 
-/// Alpha for the marching ants scheme: alternating colored and transparent
-/// segments that travel around the outline. Each dash and gap is shorter
 /// Perimeter parameter (0.0..1.0) for a point near a rounded rectangle's
 /// boundary. The parameter increases clockwise and is linear in arc/edge
 /// length, so equal increments correspond to equal distances along the
@@ -682,12 +680,11 @@ fn perimeter_param(x: f64, y: f64, w: f64, h: f64, r: f64) -> f64 {
     (best_param / total).min(1.0)
 }
 
-/// Alpha for the marching ants scheme: alternating colored and transparent
-/// Alpha for the marching ants scheme: alternating colored and transparent
-/// segments that travel around the outline. Dash length is shorter than
-/// Photoshop-style ants; speed is fixed (not zoom-dependent). The dashes
-/// are equal in perimeter distance thanks to [`perimeter_param`].
-fn marching_ants_alpha(x: i32, y: i32, w: f64, h: f64, speed: f64) -> u8 {
+/// Whether a pixel is on a dash (light) or a gap (dark) in the marching
+/// ants scheme.  Alternating segments travel around the outline at a
+/// fixed speed; dash length is shorter than Photoshop-style ants.  The
+/// dashes are equal in perimeter distance thanks to [`perimeter_param`].
+fn marching_ants_on_dash(x: i32, y: i32, w: f64, h: f64, speed: f64) -> bool {
     let t = outline_elapsed() as f64 * speed;
     let r = MINIMAP_CORNER_RADIUS as f64;
     let param = perimeter_param(x as f64, y as f64, w, h, r);
@@ -699,11 +696,7 @@ fn marching_ants_alpha(x: i32, y: i32, w: f64, h: f64, speed: f64) -> u8 {
     let half = 1.0 / num_half as f64;
     let phase = (param + t * 0.0175).rem_euclid(1.0);
     let slot = (phase / half).floor() as i32;
-    if slot % 2 == 0 {
-        255 // dash
-    } else {
-        0 // gap
-    }
+    slot % 2 == 0
 }
 
 fn fit_capture_thumb(capture: (f64, f64), max_w: f64, max_h: f64) -> (f64, f64) {
@@ -773,7 +766,6 @@ fn build_minimap_outline(
     scheme: crate::config::MinimapOutlineScheme,
     speed: f64,
     outline_width: f64,
-    background: Option<&RgbaBuffer>,
 ) -> RgbaBuffer {
     use crate::config::MinimapOutlineScheme;
     let mut out = RgbaBuffer::new(buf_w, buf_h);
@@ -801,22 +793,19 @@ fn build_minimap_outline(
                         .copy_from_slice(&[c[0], c[1], c[2], stroke]);
                 }
                 MinimapOutlineScheme::MarchingAnts => {
-                    let pattern_alpha =
-                        marching_ants_alpha(x, y, w, h, speed);
-                    if pattern_alpha == 0 {
-                        continue;
-                    }
-                    // Invert the background colour at dash positions
-                    // for the classic marching-ants look.
-                    let (r, g, b) = if let Some(bg) = background {
-                        let bi = i.min(bg.data.len().saturating_sub(4));
-                        (255 - bg.data[bi], 255 - bg.data[bi + 1], 255 - bg.data[bi + 2])
+                    // Alternate between light grey dashes and dark grey
+                    // gaps — both are solid and opaque, covering the
+                    // magnified screen underneath.
+                    let on_dash = marching_ants_on_dash(x, y, w, h, speed);
+                    let (lr, lg, lb) = (192u8, 192u8, 192u8); // light grey
+                    let (dr, dg, db) = (48u8, 48u8, 48u8);     // dark grey
+                    let (cr, cg, cb) = if on_dash {
+                        (lr, lg, lb)
                     } else {
-                        (255, 255, 255)
+                        (dr, dg, db)
                     };
-                    let a = (stroke as u16 * pattern_alpha as u16 / 255) as u8;
                     out.data[i..i + 4]
-                        .copy_from_slice(&[r, g, b, a]);
+                        .copy_from_slice(&[cr, cg, cb, stroke]);
                 }
             }
         }
@@ -1181,7 +1170,7 @@ fn build_minimap_sprite(
         }
     }
 
-    let outline = build_minimap_outline(buf_w, buf_h, scheme, speed, outline_width, Some(&frame));
+    let outline = build_minimap_outline(buf_w, buf_h, scheme, speed, outline_width);
     apply_minimap_mask(&mut frame, outline_width);
     let sprite = OsdSprite {
         buffer: frame,
@@ -4250,7 +4239,7 @@ impl MagnifierWindow {
                     self.minimap_base.take(),
                     self.state.config.minimap_outline_scheme,
                     self.state.config.minimap_outline_speed,
-                    self.state.config.minimap_outline_thickness,
+                    self.state.config.minimap_outline_thickness as f64,
                     self.state.config.minimap_outline_zoom_scale,
                     self.state.config.max_zoom,
                 );
@@ -4439,7 +4428,7 @@ impl MagnifierWindow {
                 self.minimap_base.take(),
                 self.state.config.minimap_outline_scheme,
                 self.state.config.minimap_outline_speed,
-                self.state.config.minimap_outline_thickness,
+                self.state.config.minimap_outline_thickness as f64,
                 self.state.config.minimap_outline_zoom_scale,
                 self.state.config.max_zoom,
             );

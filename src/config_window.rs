@@ -626,10 +626,10 @@ fn config_section(
             ui.horizontal(|ui| {
                 ui.add(
                     egui::DragValue::new(&mut config.minimap_outline_thickness)
-                        .range(0.5..=8.0)
-                        .speed(0.1),
+                        .range(1..=8)
+                        .speed(1),
                 );
-                ui.label("(2.0 = default)");
+                ui.label("(3 = default)");
             });
             ui.end_row();
             ui.label("Outline zoom thickening");

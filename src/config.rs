@@ -66,9 +66,9 @@ fn default_outline_speed() -> f64 {
     1.0
 }
 
-/// Default outline thickness in logical pixels.
-fn default_outline_thickness() -> f64 {
-    1.0
+/// Default outline thickness in whole pixels.
+fn default_outline_thickness() -> u32 {
+    3
 }
 
 /// Default zoom-based thickness scaling factor (0.25 = 25 % thicker at max
@@ -201,9 +201,9 @@ pub struct MagnifierConfig {
     /// the original built-in rate). Higher values speed up the animation.
     #[serde(default = "default_outline_speed")]
     pub minimap_outline_speed: f64,
-    /// Outline thickness in logical pixels (default 2.0).
+    /// Outline thickness in whole pixels (default 3).
     #[serde(default = "default_outline_thickness")]
-    pub minimap_outline_thickness: f64,
+    pub minimap_outline_thickness: u32,
     /// Fractional extra thickness applied at max zoom (default 0.25 = 25 %
     /// thicker at full zoom-in). The effective thickness scales linearly
     /// from the base value at 1× to base × (1 + zoom_scale) at max_zoom.
@@ -361,7 +361,7 @@ impl Default for MagnifierConfig {
             minimap_visible: true,
             minimap_outline_scheme: MinimapOutlineScheme::AngularGradient,
             minimap_outline_speed: 1.0,
-            minimap_outline_thickness: 1.0,
+            minimap_outline_thickness: 3,
             minimap_outline_zoom_scale: 0.25,
             shift_slow_factor: 0.1,
             show_shift_osd: true,
@@ -415,11 +415,7 @@ pub(crate) fn normalize_config(config: &mut MagnifierConfig) {
     } else {
         1.0
     };
-    config.minimap_outline_thickness = if config.minimap_outline_thickness.is_finite() {
-        config.minimap_outline_thickness.clamp(0.5, 8.0)
-    } else {
-        1.0
-    };
+    config.minimap_outline_thickness = config.minimap_outline_thickness.clamp(1, 8);
     config.minimap_outline_zoom_scale = if config.minimap_outline_zoom_scale.is_finite() {
         config.minimap_outline_zoom_scale.clamp(0.0, 2.0)
     } else {
