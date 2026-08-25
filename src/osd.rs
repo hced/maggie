@@ -294,6 +294,7 @@ fn blit_sprite(canvas: &mut [u8], canvas_w: i32, canvas_h: i32, sprite: &OsdSpri
 /// `(x, y)` on a `screen_w x screen_h` surface.
 pub struct OsdSprite {
     pub buffer: crate::render::RgbaBuffer,
+    pub outline: Option<crate::render::RgbaBuffer>,
     pub x: i32,
     pub y: i32,
     pub width: i32,
@@ -365,6 +366,7 @@ pub fn build_osd_sprite(
 
     Some(OsdSprite {
         buffer,
+        outline: None,
         x: box_x,
         y: box_y,
         width: box_w,
@@ -413,6 +415,7 @@ pub fn build_hint_sprite(
     }
     Some(OsdSprite {
         buffer,
+        outline: None,
         x: box_x,
         y: box_y,
         width: box_w,

@@ -463,6 +463,21 @@ fn config_section(
             });
             ui.end_row();
 
+            ui.label("Shift slow factor");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut config.shift_slow_factor)
+                        .range(0.01..=1.0)
+                        .speed(0.01),
+                );
+                ui.label("(0.1 = 10× slower while Shift is held; 1.0 = disabled)");
+            });
+            ui.end_row();
+
+            ui.label("Show Shift indicator");
+            ui.checkbox(&mut config.show_shift_osd, "");
+            ui.end_row();
+
             ui.label("Hold-to-zoom speed");
             ui.horizontal(|ui| {
                 ui.add(
@@ -577,6 +592,56 @@ fn config_section(
                     });
             });
             ui.end_row();
+            ui.label("Minimap outline style");
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("minimap_outline_scheme")
+                    .selected_text(config.minimap_outline_scheme.name())
+                    .show_ui(ui, |ui| {
+                        for scheme in [
+                            crate::config::MinimapOutlineScheme::Gradient,
+                            crate::config::MinimapOutlineScheme::AngularGradient,
+                            crate::config::MinimapOutlineScheme::MarchingAnts,
+                        ] {
+                            ui.selectable_value(
+                                &mut config.minimap_outline_scheme,
+                                scheme,
+                                scheme.name(),
+                            );
+                        }
+                    });
+                ui.label("(animated border of the minimap panel)");
+            });
+            ui.end_row();
+            ui.label("Outline animation speed");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut config.minimap_outline_speed)
+                        .range(0.01..=10.0)
+                        .speed(0.05),
+                );
+                ui.label("(0.2 = default, 5× slower than 1.0)");
+            });
+            ui.end_row();
+            ui.label("Outline thickness (px)");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut config.minimap_outline_thickness)
+                        .range(0.5..=8.0)
+                        .speed(0.1),
+                );
+                ui.label("(2.0 = default)");
+            });
+            ui.end_row();
+            ui.label("Outline zoom thickening");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut config.minimap_outline_zoom_scale)
+                        .range(0.0..=2.0)
+                        .speed(0.05),
+                );
+                ui.label("(0.25 = 25 % thicker at max zoom; 0 = constant width)");
+            });
+            ui.end_row();
         });
 
     ui.add_space(10.0);
@@ -622,11 +687,7 @@ fn config_section(
                 &mut config.keybindings.toggle_cursor,
             );
             key_row(ui, "Toggle minimap", &mut config.keybindings.minimap);
-            key_row(
-                ui,
-                "Hold-to-zoom modifier",
-                &mut config.keybindings.hold_to_zoom,
-            );
+            key_row(ui, "Hold-to-zoom key", &mut config.keybindings.hold_to_zoom);
             key_row(
                 ui,
                 "Toggle anti-aliasing",
@@ -647,13 +708,13 @@ fn config_section(
 
     ui.add_space(6.0);
     ui.small(
-        "Close this window with the Close button or Escape; the magnifier's keys (zoom 0-9, MMB reset, OSD, screenshots) resume immediately. Runtime changes apply live and are auto-saved on change.",
+        "Close this window with the Close button or Escape; the magnifier's keys (zoom 0-9, R reset, OSD, screenshots) resume immediately. Runtime changes apply live and are auto-saved on change.",
     );
     ui.small("Numeric keys 0-9 set zoom levels: 0 = 0%, keys 1-9 are percentages of the max zoom.");
     ui.small("Q / Esc / RMB quit Maggie when the Configuration window is closed.");
-    ui.small("Middle mouse button (MMB) resets the zoom to the default.");
-    ui.small("Hold-to-zoom: hold the modifier (default Super) and move the mouse up/down to zoom smoothly; left/right motion still pans normally.");
-    ui.small("If the hold-to-zoom modifier is a letter that is also bound to another action, both trigger — keep it on a modifier key.");
+    ui.small("The reset-zoom key (default R) resets the zoom to the default.");
+    ui.small("Hold-to-zoom: hold the key (default MMB, or a modifier like Super) and move the mouse up/down to zoom smoothly; left/right motion still pans normally.");
+    ui.small("If the hold-to-zoom key is a letter that is also bound to another action, both trigger — keep it on a modifier or mouse button.");
 }
 
 fn key_row(ui: &mut egui::Ui, label: &str, value: &mut String) {

@@ -36,14 +36,69 @@ fn default_minimap_corner() -> crate::osd::Corner {
     crate::osd::Corner::BottomRight
 }
 
+/// Animation scheme for the minimap outline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum MinimapOutlineScheme {
+    /// Continuously cycling RGB gradient (the default).
+    #[default]
+    Gradient,
+    /// A 45-degree angle gradient that slides along the outline over time.
+    AngularGradient,
+    /// Segmented dashes that travel around the outline; speed scales
+    /// inversely with zoom (further in = slower).
+    MarchingAnts,
+}
+
+impl MinimapOutlineScheme {
+    pub fn name(&self) -> &'static str {
+        match self {
+            MinimapOutlineScheme::Gradient => "gradient",
+            MinimapOutlineScheme::AngularGradient => "angular gradient",
+            MinimapOutlineScheme::MarchingAnts => "marching ants",
+        }
+    }
+}
+
+/// Default outline animation speed (0.2 = 5× slower than the original 1.0).
+fn default_outline_speed() -> f64 {
+    0.2
+}
+
+/// Default outline thickness in logical pixels.
+fn default_outline_thickness() -> f64 {
+    2.0
+}
+
+/// Default zoom-based thickness scaling factor (0.25 = 25 % thicker at max
+/// zoom relative to the base thickness).
+fn default_outline_zoom_scale() -> f64 {
+    0.25
+}
+
+/// Default slow-down factor when Shift is held during pointer motion
+/// (0.1 = 10 % speed, i.e. 10× slower than normal).
+fn default_shift_slow_factor() -> f64 {
+    0.1
+}
+
+/// Whether to show a small on-screen indicator while Shift slow-down is
+/// active (default true).
+fn default_show_shift_osd() -> bool {
+    true
+}
+
 /// Default key that toggles the magnified cursor inside the viewport.
 fn default_toggle_cursor() -> String {
     "c".to_string()
 }
 
-/// Default modifier key held to smooth-zoom with vertical mouse motion.
+/// Default key held to smooth-zoom with vertical mouse motion: the middle
+/// mouse button ("MMB"). A keyboard modifier (e.g. "Super") can be set
+/// instead; the magnifier arms hold-to-zoom on a key press for keyboard
+/// bindings and on MMB press for "MMB".
 fn default_hold_to_zoom() -> String {
-    "Super".to_string()
+    "MMB".to_string()
 }
 
 /// Default key that toggles the minimap overlay (a dimmed overview of the
@@ -138,6 +193,29 @@ pub struct MagnifierConfig {
     /// `minimap` key still toggles it at runtime).
     #[serde(default = "default_minimap_visible")]
     pub minimap_visible: bool,
+    /// Animation scheme for the minimap outline border.
+    #[serde(default)]
+    pub minimap_outline_scheme: MinimapOutlineScheme,
+    /// Outline animation speed multiplier (default 0.2, i.e. 5× slower than
+    /// the original built-in rate). Higher values speed up the animation.
+    #[serde(default = "default_outline_speed")]
+    pub minimap_outline_speed: f64,
+    /// Outline thickness in logical pixels (default 2.0).
+    #[serde(default = "default_outline_thickness")]
+    pub minimap_outline_thickness: f64,
+    /// Fractional extra thickness applied at max zoom (default 0.25 = 25 %
+    /// thicker at full zoom-in). The effective thickness scales linearly
+    /// from the base value at 1× to base × (1 + zoom_scale) at max_zoom.
+    #[serde(default = "default_outline_zoom_scale")]
+    pub minimap_outline_zoom_scale: f64,
+    /// Slow-down factor applied to pointer motion while Shift is held
+    /// (default 0.25 = quarter speed).
+    #[serde(default = "default_shift_slow_factor")]
+    pub shift_slow_factor: f64,
+    /// Whether to show a small on-screen indicator while Shift slow-down
+    /// is active (default true).
+    #[serde(default = "default_show_shift_osd")]
+    pub show_shift_osd: bool,
     /// Whether the view center is locked to the capture's pixel grid
     /// (default true): the magnified cursor's texels and the screen's texels
     /// stay flush at every zoom, with panning moving in whole magnified
@@ -214,8 +292,10 @@ pub struct Keybindings {
     pub mode_center_cursor: String,
     pub mode_edge_pan: String,
     pub mode_miniature: String,
-    /// Reset the zoom back to `default_zoom` (the middle mouse button does
-    /// the same). Defaults to "r" for config files written before it existed.
+    /// Reset the zoom back to `default_zoom`. Defaults to "r" for config
+    /// files written before it existed. (When the hold-to-zoom binding is
+    /// "MMB", the middle mouse button arms hold-to-zoom instead of resetting;
+    /// with any other hold-to-zoom binding MMB still resets.)
     #[serde(default = "default_reset_zoom")]
     pub reset_zoom: String,
     /// Toggle the magnified cursor inside the viewport. Defaults to "c"
@@ -223,8 +303,9 @@ pub struct Keybindings {
     /// freed up when the config window moved to Tab).
     #[serde(default = "default_toggle_cursor")]
     pub toggle_cursor: String,
-    /// Modifier key held to smooth-zoom with vertical pointer motion. Defaults
-    /// to "Super" (the Super/Mod key, either side).
+    /// Key held to smooth-zoom with vertical pointer motion. Defaults to
+    /// "MMB" (the middle mouse button); a keyboard modifier such as "Super"
+    /// (either side) can be set instead.
     #[serde(default = "default_hold_to_zoom")]
     pub hold_to_zoom: String,
     /// Toggle the effective screenshot scale (real vs magnified) while in
@@ -265,7 +346,7 @@ impl Default for MagnifierConfig {
                 mode_miniature: "Control-m".to_string(),
                 reset_zoom: "r".to_string(),
                 toggle_cursor: "c".to_string(),
-                hold_to_zoom: "Super".to_string(),
+                hold_to_zoom: "MMB".to_string(),
                 screenshot_scale_toggle: "v".to_string(),
                 minimap: "m".to_string(),
             },
@@ -277,6 +358,12 @@ impl Default for MagnifierConfig {
             osd_corner: crate::osd::Corner::TopLeft,
             minimap_corner: crate::osd::Corner::BottomRight,
             minimap_visible: true,
+            minimap_outline_scheme: MinimapOutlineScheme::Gradient,
+            minimap_outline_speed: 0.2,
+            minimap_outline_thickness: 2.0,
+            minimap_outline_zoom_scale: 0.25,
+            shift_slow_factor: 0.1,
+            show_shift_osd: true,
             pixel_locked_panning: true,
             pan_tuning: 0.0,
         }
@@ -321,6 +408,26 @@ pub(crate) fn normalize_config(config: &mut MagnifierConfig) {
         config.pan_tuning.clamp(0.0, 1.0)
     } else {
         0.0
+    };
+    config.minimap_outline_speed = if config.minimap_outline_speed.is_finite() {
+        config.minimap_outline_speed.clamp(0.01, 10.0)
+    } else {
+        0.2
+    };
+    config.minimap_outline_thickness = if config.minimap_outline_thickness.is_finite() {
+        config.minimap_outline_thickness.clamp(0.5, 8.0)
+    } else {
+        2.0
+    };
+    config.minimap_outline_zoom_scale = if config.minimap_outline_zoom_scale.is_finite() {
+        config.minimap_outline_zoom_scale.clamp(0.0, 2.0)
+    } else {
+        0.25
+    };
+    config.shift_slow_factor = if config.shift_slow_factor.is_finite() {
+        config.shift_slow_factor.clamp(0.01, 1.0)
+    } else {
+        0.1
     };
     // A default zoom of exactly 0 % requires 0 % zoom to be reachable, so the
     // allow-zero setting is forced on while it stays at 0 (the Configuration
@@ -443,9 +550,10 @@ mod tests {
     }
 
     #[test]
-    fn hold_to_zoom_default_is_super() {
-        // The hold-to-zoom modifier default is Super; an explicit legacy
-        // "Space" binding is left exactly as the user wrote it.
+    fn hold_to_zoom_default_is_mmb() {
+        // The hold-to-zoom default is MMB (the middle mouse button); an
+        // explicit legacy "Space" binding is left exactly as the user wrote
+        // it.
         let mut config = MagnifierConfig {
             keybindings: Keybindings {
                 hold_to_zoom: "Space".to_string(),
@@ -455,8 +563,8 @@ mod tests {
         };
         normalize_config(&mut config);
         assert_eq!(config.keybindings.hold_to_zoom, "Space");
-        // And the default is Super.
-        assert_eq!(MagnifierConfig::default().keybindings.hold_to_zoom, "Super");
+        // And the default is MMB.
+        assert_eq!(MagnifierConfig::default().keybindings.hold_to_zoom, "MMB");
     }
 
     #[test]

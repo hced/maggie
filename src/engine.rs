@@ -500,10 +500,10 @@ fn pan_tuning_gain(zoom: f64, tuning: f64) -> f64 {
     }
 }
 
-/// The minimap rectangle in logical viewport px: a small, aspect-correct
-/// overview pinned to the bottom-right corner with `margin` px of breathing
-/// room. The width is ~22 % of the viewport (clamped to a sane range); the
-/// height follows the capture's aspect ratio.
+/// The minimap rectangle in logical viewport px: a small overview of the
+/// whole viewport, including the black space beyond the captured frame, pinned
+/// to the configured corner. The rectangle follows the viewport aspect ratio;
+/// the capture is fitted inside it and letterboxed with black space.
 /// Half-size (capture px) of the region scrubbed around the launch pointer
 /// position when building the minimap base: the frozen frame can contain the
 /// launching app's *own* cursor graphic (XWayland / software cursors are
@@ -522,6 +522,10 @@ const MINIMAP_MARKER_MIN_EDGE: i32 = 12;
 /// the region (like camera viewfinder brackets), not full solid edges —
 /// less obtrusive. On very small regions they shrink to half the edge.
 const MINIMAP_CORNER_TICK: i32 = 7;
+/// Supersampling grid used to rasterize the rounded stroke evenly at corners.
+const MINIMAP_MASK_SAMPLES: i32 = 4;
+const MINIMAP_PULSE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+const MINIMAP_CORNER_RADIUS: i32 = 8;
 
 fn minimap_layout(
     viewport: (f64, f64),
@@ -541,10 +545,299 @@ fn minimap_layout(
     (x as f64, y as f64, w, h)
 }
 
+/// Seconds elapsed since program launch, used by all outline animation
+/// schemes so they share a common clock.
+fn outline_elapsed() -> f32 {
+    use std::sync::OnceLock;
+    static LAUNCH_TIME: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = LAUNCH_TIME.get_or_init(std::time::Instant::now);
+    start.elapsed().as_secs_f32()
+}
+
 /// The visible magnified region in capture px (the source rect of the view,
 /// which may extend past the capture edges near the screen — the marker is
 /// clamped to the capture in the drawing code). `None` when the zoom is
 /// degenerate (0 or negative), so no outline is drawn.
+fn minimap_outline_color(speed: f64) -> [u8; 3] {
+    let t = outline_elapsed() * speed as f32;
+    // A fully opaque, continuously moving RGB gradient. The pulse changes
+    // the brightness without changing alpha, so the outline never becomes
+    // translucent or disappears.
+    let pulse = 0.65 + 0.35 * (t * std::f32::consts::TAU / 1.6).sin();
+    let phase = t * std::f32::consts::TAU / 3.2;
+    [
+        (255.0 * pulse * (0.5 + 0.5 * phase.sin())) as u8,
+        (255.0 * pulse * (0.5 + 0.5 * (phase + 2.094).sin())) as u8,
+        (255.0 * pulse * (0.5 + 0.5 * (phase + 4.188).sin())) as u8,
+    ]
+}
+
+/// Per-pixel color for the angular gradient scheme: a 45-degree angle
+/// gradient that slides along the outline over time. The hue rotates with
+/// the projection of the pixel position onto the 45° axis, offset by time.
+fn minimap_angular_gradient_color(x: i32, y: i32, w: f64, h: f64, speed: f64) -> [u8; 3] {
+    let t = outline_elapsed() * speed as f32;
+    let cos45 = std::f32::consts::FRAC_1_SQRT_2;
+    let sin45 = cos45;
+    // Project pixel onto the 45° axis, normalized to [0, 1] across the
+    // diagonal of the minimap, then offset by time to make it slide.
+    let proj = (x as f32 * cos45 + y as f32 * sin45)
+        / ((w as f32 + h as f32) * cos45).max(1.0);
+    let phase = (proj + t * 0.15) * std::f32::consts::TAU;
+    [
+        (127.5 + 127.5 * phase.sin()) as u8,
+        (127.5 + 127.5 * (phase + 2.094).sin()) as u8,
+        (127.5 + 127.5 * (phase + 4.188).sin()) as u8,
+    ]
+}
+
+/// Alpha for the marching ants scheme: alternating colored and transparent
+/// segments that travel around the outline. Each dash and gap is shorter
+/// Perimeter parameter (0.0..1.0) for a point near a rounded rectangle's
+/// boundary. The parameter increases clockwise and is linear in arc/edge
+/// length, so equal increments correspond to equal distances along the
+/// perimeter — unlike angle-from-center which compresses corners.
+fn perimeter_param(x: f64, y: f64, w: f64, h: f64, r: f64) -> f64 {
+    let straight_h = (w - 2.0 * r).max(0.0);
+    let straight_v = (h - 2.0 * r).max(0.0);
+    let arc = std::f64::consts::FRAC_PI_2 * r;
+    let total = 2.0 * straight_h + 2.0 * straight_v + 4.0 * arc;
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let mut best_dist = f64::MAX;
+    let mut best_param = 0.0f64;
+    // --- straight edges ---
+    // Top edge: (r, 0) → (w-r, 0)
+    {
+        let nx = x.clamp(r, w - r);
+        let d = (x - nx).hypot(y);
+        if d < best_dist {
+            best_dist = d;
+            best_param = nx - r;
+        }
+    }
+    // Right edge: (w, r) → (w, h-r)
+    {
+        let ny = y.clamp(r, h - r);
+        let d = (x - w).hypot(y - ny);
+        if d < best_dist {
+            best_dist = d;
+            best_param = straight_h + arc + (ny - r);
+        }
+    }
+    // Bottom edge: (w-r, h) → (r, h)
+    {
+        let nx = x.clamp(r, w - r);
+        let d = (x - nx).hypot(y - h);
+        if d < best_dist {
+            best_dist = d;
+            best_param = straight_h + arc + straight_v + arc + (w - r - nx);
+        }
+    }
+    // Left edge: (0, h-r) → (0, r)
+    {
+        let ny = y.clamp(r, h - r);
+        let d = x.hypot(y - ny);
+        if d < best_dist {
+            best_dist = d;
+            best_param = 2.0 * straight_h + 3.0 * arc + straight_v + (h - r - ny);
+        }
+    }
+    // --- corner arcs (center, entry_angle, cumulative distance to entry) ---
+    let corners: [(f64, f64, f64, f64); 4] = [
+        (w - r, r, -std::f64::consts::FRAC_PI_2, straight_h),
+        (w - r, h - r, 0.0, straight_h + arc + straight_v),
+        (r, h - r, std::f64::consts::FRAC_PI_2, 2.0 * straight_h + 2.0 * arc + straight_v),
+        (r, r, std::f64::consts::PI, 2.0 * straight_h + 3.0 * arc + 2.0 * straight_v),
+    ];
+    for &(ccx, ccy, entry_angle, base_param) in &corners {
+        let dx = x - ccx;
+        let dy = y - ccy;
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist >= r + 2.0 {
+            continue;
+        }
+        let angle = dy.atan2(dx);
+        // Normalise both angles into [0, 2π) so arc distance wraps correctly.
+        let norm_a = if angle < 0.0 { angle + std::f64::consts::TAU } else { angle };
+        let norm_e = if entry_angle < 0.0 {
+            entry_angle + std::f64::consts::TAU
+        } else {
+            entry_angle
+        };
+        let mut arc_dist = (norm_a - norm_e) * r;
+        if arc_dist < -0.1 {
+            arc_dist += std::f64::consts::TAU * r;
+        }
+        if arc_dist >= -0.1 && arc_dist <= arc + 0.1 {
+            let d = (dist - r).abs();
+            if d < best_dist {
+                best_dist = d;
+                best_param = base_param + arc_dist.max(0.0);
+            }
+        }
+    }
+    (best_param / total).min(1.0)
+}
+
+/// Alpha for the marching ants scheme: alternating colored and transparent
+/// segments that travel around the outline. Dash length is shorter than
+/// Photoshop-style ants; speed scales inversely with zoom (further in =
+/// slower movement). The dashes are equal in perimeter distance thanks to
+/// [`perimeter_param`].
+/// Alpha for the marching ants scheme: alternating colored and transparent
+/// segments that travel around the outline. Dash length is shorter than
+/// Photoshop-style ants; speed scales inversely with zoom (further in =
+/// slower movement). The dashes are equal in perimeter distance thanks to
+/// [`perimeter_param`].
+fn marching_ants_alpha(x: i32, y: i32, w: f64, h: f64, speed: f64, zoom: f64) -> u8 {
+    let t = outline_elapsed() as f64 * speed;
+    let zoom_factor = zoom.max(1.0).sqrt();
+    let r = MINIMAP_CORNER_RADIUS as f64;
+    let param = perimeter_param(x as f64, y as f64, w, h, r);
+    let straight_h = (w - 2.0 * r).max(0.0);
+    let straight_v = (h - 2.0 * r).max(0.0);
+    let perimeter = 2.0 * straight_h + 2.0 * straight_v + std::f64::consts::TAU * r;
+    let target_dash_px = 20.0;
+    let num_half = ((perimeter / target_dash_px).round() as i32).max(4) & !1;
+    let half = 1.0 / num_half as f64;
+    let phase = (param + t * 0.035 / zoom_factor).rem_euclid(1.0);
+    let slot = (phase / half).floor() as i32;
+    if slot % 2 == 0 {
+        255 // dash
+    } else {
+        0 // gap
+    }
+}
+
+fn fit_capture_thumb(capture: (f64, f64), max_w: f64, max_h: f64) -> (f64, f64) {
+    let (cw, ch) = (capture.0.max(1.0), capture.1.max(1.0));
+    let scale = (max_w / cw).min(max_h / ch).min(1.0);
+    ((cw * scale).max(1.0), (ch * scale).max(1.0))
+}
+
+fn rounded_rect_sdf(x: f64, y: f64, w: f64, h: f64, r: f64) -> f64 {
+    let qx = (x - w / 2.0).abs() - (w / 2.0 - r);
+    let qy = (y - h / 2.0).abs() - (h / 2.0 - r);
+    let ox = qx.max(0.0);
+    let oy = qy.max(0.0);
+    (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - r
+}
+
+/// Return `(rounded-rect coverage, outline-stroke coverage)` for one pixel.
+/// Supersampling makes the Euclidean stroke have the same apparent thickness
+/// on straight runs and around the 8 px corner arcs instead of producing
+/// jagged, uneven binary corners.
+fn minimap_pixel_coverages(x: i32, y: i32, w: f64, h: f64, outline_width: f64) -> (u8, u8) {
+    let r = MINIMAP_CORNER_RADIUS as f64;
+    let mut inside = 0i32;
+    let mut stroke = 0i32;
+    let samples = MINIMAP_MASK_SAMPLES * MINIMAP_MASK_SAMPLES;
+    for sy in 0..MINIMAP_MASK_SAMPLES {
+        for sx in 0..MINIMAP_MASK_SAMPLES {
+            let px = x as f64 + (sx as f64 + 0.5) / MINIMAP_MASK_SAMPLES as f64;
+            let py = y as f64 + (sy as f64 + 0.5) / MINIMAP_MASK_SAMPLES as f64;
+            let d = rounded_rect_sdf(px, py, w, h, r);
+            if d <= 0.0 {
+                inside += 1;
+                if d >= -outline_width {
+                    stroke += 1;
+                }
+            }
+        }
+    }
+    (
+        ((inside * 255) / samples) as u8,
+        ((stroke * 255) / samples) as u8,
+    )
+}
+
+fn apply_minimap_mask(buf: &mut RgbaBuffer, outline_width: f64) {
+    let (w, h) = (buf.width as f64, buf.height as f64);
+    for y in 0..buf.height {
+        for x in 0..buf.width {
+            let (inside, stroke) = minimap_pixel_coverages(x, y, w, h, outline_width);
+            // The outline and the clipped-away outside are transparent in the
+            // content sprite. This exposes the magnified screen underneath
+            // the outline and lets the rounded corners cut only black space.
+            if inside < 255 || stroke > 0 {
+                let i = (y as usize * buf.width as usize + x as usize) * 4;
+                buf.data[i..i + 4].copy_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+}
+
+fn build_minimap_outline(
+    buf_w: i32,
+    buf_h: i32,
+    scheme: crate::config::MinimapOutlineScheme,
+    speed: f64,
+    zoom: f64,
+    outline_width: f64,
+    background: Option<&RgbaBuffer>,
+) -> RgbaBuffer {
+    use crate::config::MinimapOutlineScheme;
+    let mut out = RgbaBuffer::new(buf_w, buf_h);
+    let (w, h) = (buf_w as f64, buf_h as f64);
+    for y in 0..buf_h {
+        for x in 0..buf_w {
+            let (_, stroke) = minimap_pixel_coverages(x, y, w, h, outline_width);
+            if stroke == 0 {
+                continue;
+            }
+            let i = (y as usize * buf_w as usize + x as usize) * 4;
+            match scheme {
+                MinimapOutlineScheme::Gradient => {
+                    let c = minimap_outline_color(speed);
+                    out.data[i..i + 4]
+                        .copy_from_slice(&[c[0], c[1], c[2], 255]);
+                }
+                MinimapOutlineScheme::AngularGradient => {
+                    let c =
+                        minimap_angular_gradient_color(x, y, w, h, speed);
+                    out.data[i..i + 4]
+                        .copy_from_slice(&[c[0], c[1], c[2], 255]);
+                }
+                MinimapOutlineScheme::MarchingAnts => {
+                    let alpha =
+                        marching_ants_alpha(x, y, w, h, speed, zoom);
+                    if alpha == 0 {
+                        continue;
+                    }
+                    // Invert the background colour at dash positions
+                    // for the classic marching-ants look.
+                    let (r, g, b) = if let Some(bg) = background {
+                        let bi = i.min(bg.data.len().saturating_sub(4));
+                        (255 - bg.data[bi], 255 - bg.data[bi + 1], 255 - bg.data[bi + 2])
+                    } else {
+                        (255, 255, 255)
+                    };
+                    out.data[i..i + 4]
+                        .copy_from_slice(&[r, g, b, 255]);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn blend_outline_into(canvas: &mut [u8], stride: i32, outline: &[u8], width: i32, height: i32, ox: i32, oy: i32) {
+    for y in 0..height {
+        for x in 0..width {
+            let si = (y as usize * width as usize + x as usize) * 4;
+            let alpha = outline[si + 3] as u16;
+            if alpha == 0 { continue; }
+            let di = (((y + oy) as usize) * stride as usize + (x + ox) as usize) * 4;
+            let a = 255 - alpha;
+            canvas[di] = ((outline[si] as u16 * alpha + canvas[di] as u16 * a) / 255) as u8;
+            canvas[di + 1] = ((outline[si + 1] as u16 * alpha + canvas[di + 1] as u16 * a) / 255) as u8;
+            canvas[di + 2] = ((outline[si + 2] as u16 * alpha + canvas[di + 2] as u16 * a) / 255) as u8;
+        }
+    }
+}
+
 fn minimap_marker_rect(
     center: (f64, f64),
     zoom: f64,
@@ -660,7 +953,21 @@ fn build_minimap_sprite(
     corner: crate::osd::Corner,
     bake_pos: Option<(f64, f64)>,
     base: Option<RgbaBuffer>,
+    scheme: crate::config::MinimapOutlineScheme,
+    speed: f64,
+    outline_thickness: f64,
+    outline_zoom_scale: f64,
+    max_zoom: f64,
 ) -> (Option<OsdSprite>, Option<RgbaBuffer>) {
+    // Effective outline width: base thickness scaled by zoom level.
+    // At 1× the thickness is exactly the base; at max_zoom it reaches
+    // base × (1 + outline_zoom_scale).
+    let zoom_t = if max_zoom > 1.0 {
+        ((zoom - 1.0).max(0.0) / (max_zoom - 1.0)).min(1.0)
+    } else {
+        0.0
+    };
+    let outline_width = outline_thickness * (1.0 + outline_zoom_scale * zoom_t);
     let (mm_x, mm_y, mm_w, mm_h) = minimap_layout(
         viewport,
         (capture.width as f64, capture.height as f64),
@@ -669,74 +976,56 @@ fn build_minimap_sprite(
     );
     let buf_w = mm_w.round() as i32;
     let buf_h = mm_h.round() as i32;
-    // Rebuild the base when it is missing or the size changed (e.g. the
-    // viewport resized since the last build).
+    // Reserve a single rounded outline band. The base is opaque black so the
+    // letterboxed viewport space is represented explicitly.
+    let inset = outline_width.ceil() as i32;
+    let content_w = (buf_w - inset * 2).max(1);
+    let content_h = (buf_h - inset * 2).max(1);
+    let (tw, th) = fit_capture_thumb(
+        (capture.width as f64, capture.height as f64),
+        content_w as f64,
+        content_h as f64,
+    );
+    let tw_i = tw.round().clamp(1.0, content_w as f64) as i32;
+    let th_i = th.round().clamp(1.0, content_h as f64) as i32;
+    let ox_i = inset + (content_w - tw_i) / 2;
+    let oy_i = inset + (content_h - th_i) / 2;
+    // Rebuild the base when it is missing or the viewport size changed.
     let base = match base {
         Some(b) if b.width == buf_w && b.height == buf_h => b,
         _ => {
             let mut b = RgbaBuffer::new(buf_w, buf_h);
-            // Three concentric square borders, each 2 px wide — outer white,
-            // middle black, inner white — with sharp corners. The interior is
-            // filled with a translucent dark backdrop, then the dimmed image
-            // is blitted inside it (inset by 6 px = 3 borders x 2 px).
-            let border_white = [235, 235, 240, 255];
-            let border_black = [18, 18, 20, 255];
-            for y in 0..buf_h {
-                for x in 0..buf_w {
-                    let i = (y as usize * buf_w as usize + x as usize) * 4;
-                    let in_black = x >= 2 && y >= 2 && x < buf_w - 2 && y < buf_h - 2;
-                    let in_white = x >= 4 && y >= 4 && x < buf_w - 4 && y < buf_h - 4;
-                    let in_interior = x >= 6 && y >= 6 && x < buf_w - 6 && y < buf_h - 6;
-                    let col = if !in_black {
-                        border_white
-                    } else if !in_white {
-                        border_black
-                    } else if !in_interior {
-                        border_white
-                    } else {
-                        [10, 10, 12, 200] // translucent dark interior
-                    };
-                    b.data[i..i + 4].copy_from_slice(&col);
-                }
+            for px in b.data.chunks_exact_mut(4) {
+                px.copy_from_slice(&[0, 0, 0, 255]);
             }
-            // Dimmed image inset by 6 px (inside the three 2-px borders),
-            // scrubbed of the baked-in launch cursor when its position is
-            // known (XWayland / software cursors can't be excluded by
-            // `overlay_cursor = 0`, so remove them here instead — the scrub
-            // never touches the magnified view, only the minimap base).
-            let inset = 6;
-            let iw = (buf_w - inset * 2).max(1);
-            let ih = (buf_h - inset * 2).max(1);
             let src = match bake_pos {
                 Some((cx, cy)) => inpaint_cursor_region(capture, cx, cy, CURSOR_BAKE_HALF),
                 None => capture.clone(),
             };
-            let img = downscale_dimmed(&src, iw, ih, 0.45);
-            for y in 0..ih {
-                let s = y as usize * iw as usize * 4;
-                let d = ((y + inset) as usize * buf_w as usize + inset as usize) * 4;
-                b.data[d..d + (iw as usize * 4)]
-                    .copy_from_slice(&img.data[s..s + (iw as usize * 4)]);
+            let img = downscale_dimmed(&src, tw_i, th_i, 0.45);
+            for y in 0..th_i {
+                let s = y as usize * tw_i as usize * 4;
+                let d = ((y + oy_i) as usize * buf_w as usize + ox_i as usize) * 4;
+                b.data[d..d + tw_i as usize * 4]
+                    .copy_from_slice(&img.data[s..s + tw_i as usize * 4]);
             }
             b
         }
     };
 
     let mut frame = base.clone();
-    // Map a capture-px coordinate to the minimap image area (which starts at
-    // inset=6 px inside the buffer, below the three 2-px borders).
-    let inset = 6.0;
+    // Map capture coordinates into the fitted thumbnail. Coordinates remain
+    // inside the thumbnail, never into the surrounding black letterbox.
     let (cw, ch) = (capture.width as f64, capture.height as f64);
-    let img_w = (buf_w as f64 - inset * 2.0).max(1.0);
-    let img_h = (buf_h as f64 - inset * 2.0).max(1.0);
-    let to_mm = |px: f64, total: f64, img: f64| inset + (px / total.max(1.0)) * img;
+    let to_mm_x = |px: f64, total: f64| ox_i as f64 + (px / total.max(1.0)) * tw_i as f64;
+    let to_mm_y = |py: f64, total: f64| oy_i as f64 + (py / total.max(1.0)) * th_i as f64;
     // Marker: the visible region outline (clamped to the capture), amber so
     // it stands out against the dimmed overview.
     if let Some((rx0, ry0, rx1, ry1)) = minimap_marker_rect(view_center, zoom, viewport) {
-        let x0 = to_mm(rx0.clamp(0.0, cw), cw, img_w).round() as i32;
-        let x1 = to_mm(rx1.clamp(0.0, cw), cw, img_w).round() as i32;
-        let y0 = to_mm(ry0.clamp(0.0, ch), ch, img_h).round() as i32;
-        let y1 = to_mm(ry1.clamp(0.0, ch), ch, img_h).round() as i32;
+        let x0 = to_mm_x(rx0.clamp(0.0, cw), cw).round() as i32;
+        let x1 = to_mm_x(rx1.clamp(0.0, cw), cw).round() as i32;
+        let y0 = to_mm_y(ry0.clamp(0.0, ch), ch).round() as i32;
+        let y1 = to_mm_y(ry1.clamp(0.0, ch), ch).round() as i32;
         // Keep the outline at least 1 px wide/tall without ever inverting or
         // collapsing it: the low corner never exceeds high-1 and the high
         // corner never drops below low+1 (rounding can otherwise collapse a
@@ -848,8 +1137,8 @@ fn build_minimap_sprite(
     // Cursor marker: a filled red circle with a 1 px black outline, at the
     // view center (where the magnified cursor sprite always sits). Filled
     // per scanline so the shape is a real circle at any size.
-    let dx = to_mm(view_center.0.clamp(0.0, cw), cw, img_w).round() as i32;
-    let dy = to_mm(view_center.1.clamp(0.0, ch), ch, img_h).round() as i32;
+    let dx = to_mm_x(view_center.0.clamp(0.0, cw), cw).round() as i32;
+    let dy = to_mm_y(view_center.1.clamp(0.0, ch), ch).round() as i32;
     let (r_in, r_out) = (2.5f64, 3.5f64); // red fill + 1 px black outline
     let (red, black) = ([255, 60, 60, 255], [0, 0, 0, 255]);
     // Rows are only iterated while the radius actually covers them (never
@@ -891,8 +1180,11 @@ fn build_minimap_sprite(
         }
     }
 
+    let outline = build_minimap_outline(buf_w, buf_h, scheme, speed, zoom, outline_width, Some(&frame));
+    apply_minimap_mask(&mut frame, outline_width);
     let sprite = OsdSprite {
         buffer: frame,
+        outline: Some(outline),
         x: (mm_x * scale).round() as i32,
         y: (mm_y * scale).round() as i32,
         width: (mm_w * scale).round() as i32,
@@ -1300,8 +1592,14 @@ const BTN_LEFT: u32 = 0x110;
 const SCREENSHOT_NOTICE_SECS: u64 = 4;
 /// Linux input event code for the right mouse button.
 const BTN_RIGHT: u32 = 0x111;
-/// Linux input event code for the middle mouse button (resets the zoom).
+/// Linux input event code for the middle mouse button (the default
+/// hold-to-zoom key; with a non-MMB hold-to-zoom binding it resets the zoom).
 const BTN_MIDDLE: u32 = 0x112;
+/// The binding-name string for the middle mouse button, matched against
+/// `keybindings.hold_to_zoom`. When it is the configured hold-to-zoom key,
+/// MMB press arms hold-to-zoom (and MMB release disarms it) instead of
+/// resetting the zoom.
+const MMB_HTZ: &str = "MMB";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum MagnifierMode {
@@ -1570,6 +1868,9 @@ pub struct MagnifierWindow {
     /// a parked pointer's micro-wobble can't make the quantized view hop
     /// between the edge and `capture − 2`.
     edge_hold: (Option<bool>, Option<bool>),
+    /// Whether the Shift key is currently held. Used to slow down pointer
+    /// motion (panning) by the configured factor.
+    shift_held: bool,
     /// Whether the minimap overlay (a dimmed overview of the frozen screen
     /// with the visible-region marker) is shown in the viewport corner
     /// (toggled with the `minimap` key, default `M`).
@@ -2022,10 +2323,18 @@ impl PointerHandler for MagnifierWindow {
                             .last_motion_at
                             .map_or(0.016, |t| now.duration_since(t).as_secs_f64());
                         self.last_motion_at = Some(now);
-                        let dx = position.0 - self.pointer_position_f.0;
-                        let dy = position.1 - self.pointer_position_f.1;
+                        let raw_dx = position.0 - self.pointer_position_f.0;
+                        let raw_dy = position.1 - self.pointer_position_f.1;
                         self.pointer_position_f = position;
                         self.state.pointer_position = (position.0 as i32, position.1 as i32);
+                        // Shift modifier slows down panning for precision.
+                        let shift_factor = if self.shift_held {
+                            self.state.config.shift_slow_factor
+                        } else {
+                            1.0
+                        };
+                        let dx = raw_dx * shift_factor;
+                        let dy = raw_dy * shift_factor;
                         // The view pans with the hand's *movement* (relative
                         // deltas), never by re-centering on the hand's
                         // absolute position — the magnified cursor sits at
@@ -2138,14 +2447,59 @@ impl PointerHandler for MagnifierWindow {
                     if button == BTN_RIGHT {
                         self.exit = true;
                     }
-                    // Middle mouse button resets the zoom to the default;
-                    // the view stays put (zoom scales around the center). The
-                    // runtime minimum applies, so a default of 0 % lands on
-                    // the fully-zoomed-out view.
                     if button == BTN_MIDDLE {
-                        let default_zoom = self.state.config.default_zoom.unwrap_or(1.0);
-                        self.set_zoom(default_zoom, self.runtime_min_zoom());
-                        self.draw_frame(qh);
+                        // The middle mouse button is the default hold-to-zoom
+                        // key: while it is held, vertical motion zooms (see
+                        // the Motion handler), so MMB press arms the feature
+                        // instead of resetting the zoom. With any other
+                        // hold-to-zoom binding configured, MMB keeps its
+                        // legacy reset-to-default role (the `reset_zoom` key
+                        // always resets either way).
+                        if self.state.config.keybindings.hold_to_zoom == MMB_HTZ {
+                            self.hold_to_zoom_active = true;
+                            self.hold_zoom_last_y = self.pointer_position_f.1;
+                            self.hold_floor_dead_travel = 0.0;
+                            // Ensure the view center is initialized so the
+                            // vertical lock engages immediately (in case no
+                            // motion/draw happened before the press) —
+                            // mirrors the keyboard arm in `press_key`.
+                            if self.view_center.is_none() {
+                                let (sx, sy) = self.capture_scale();
+                                self.view_center = Some(self.clamp_to_capture((
+                                    self.pointer_position_f.0 * sx,
+                                    self.pointer_position_f.1 * sy,
+                                )));
+                            }
+                        } else {
+                            // Middle mouse button resets the zoom to the
+                            // default; the view stays put (zoom scales around
+                            // the center). The runtime minimum applies, so a
+                            // default of 0 % lands on the fully-zoomed-out
+                            // view.
+                            let default_zoom = self.state.config.default_zoom.unwrap_or(1.0);
+                            self.set_zoom(default_zoom, self.runtime_min_zoom());
+                            self.draw_frame(qh);
+                        }
+                    }
+                }
+                PointerEventKind::Release { button, .. } => {
+                    // Releasing the hold-to-zoom key stops smooth zooming —
+                    // the mouse-button counterpart of `release_key`. The view
+                    // stays exactly where it is (no jump, no self-animation);
+                    // the Motion handler corrects any residual offset with
+                    // real pointer motion.
+                    if button == BTN_MIDDLE && self.state.config.keybindings.hold_to_zoom == MMB_HTZ
+                    {
+                        let was_active = self.hold_to_zoom_active;
+                        self.hold_to_zoom_active = false;
+                        if was_active {
+                            // Fresh baseline so the first correction step
+                            // after the release never dumps the whole offset
+                            // (a pause before the next motion would otherwise
+                            // make dt huge).
+                            self.last_motion_at = Some(std::time::Instant::now());
+                            self.draw_frame(qh);
+                        }
                     }
                 }
                 PointerEventKind::Leave { serial, .. } => {
@@ -2192,7 +2546,6 @@ impl PointerHandler for MagnifierWindow {
                         }
                     }
                 }
-                _ => {}
             }
         }
     }
@@ -2460,6 +2813,7 @@ impl KeyboardHandler for MagnifierWindow {
         _: RawModifiers,
         _: u32,
     ) {
+        self.shift_held = modifiers.shift;
         if let Some(cw) = &mut self.config_window {
             cw.set_modifiers(egui::Modifiers {
                 alt: modifiers.alt,
@@ -2991,6 +3345,12 @@ impl MagnifierWindow {
     /// is unchanged).
     fn poll_timeout(&self) -> Option<std::time::Duration> {
         let mut best = self.repeat_poll_timeout();
+        // The outline pulse must continue while the minimap is visible even
+        // when the pointer is idle. A modest cadence keeps animation smooth
+        // without busy-spinning the event loop.
+        if self.minimap_visible {
+            best = Some(best.map_or(MINIMAP_PULSE_INTERVAL, |b| b.min(MINIMAP_PULSE_INTERVAL)));
+        }
         if self.redraw_pending {
             let wait = match self.last_draw_at {
                 None => std::time::Duration::ZERO,
@@ -3253,7 +3613,14 @@ impl MagnifierWindow {
             format!("{}  toggle cursor", config_key.toggle_cursor),
             format!("{}  toggle minimap", config_key.minimap),
             format!("hold {} + move  smooth zoom", config_key.hold_to_zoom),
-            format!("MMB / {}  reset zoom", config_key.reset_zoom),
+            // When MMB is the hold-to-zoom key it no longer resets the zoom
+            // (the `reset_zoom` key does); with any other hold-to-zoom binding
+            // MMB keeps the legacy reset role.
+            if config_key.hold_to_zoom == MMB_HTZ {
+                format!("{}  reset zoom", config_key.reset_zoom)
+            } else {
+                format!("MMB / {}  reset zoom", config_key.reset_zoom)
+            },
             "Q / Esc / RMB  quit".to_string(),
         ];
         // The magnified cursor always sits at the viewport center, and the
@@ -3765,9 +4132,17 @@ impl MagnifierWindow {
             } else {
                 None
             };
-            // Launch hint: a single dim line shown for a few seconds after
-            // startup so the user knows how to open the key legend.
-            let hint = if !self.state.osd_visible
+            // Shift slow-down indicator or launch hint — both are small,
+            // transient sprites drawn at the OSD corner.
+            let hint = if self.shift_held && self.state.config.show_shift_osd {
+                crate::osd::build_hint_sprite(
+                    &["Shift: slow".to_string()],
+                    osd_corner,
+                    self.width as i32 * crate::gpu::RENDER_SCALE,
+                    self.height as i32 * crate::gpu::RENDER_SCALE,
+                    [0xCC, 0xCC, 0xCC],
+                )
+            } else if !self.state.osd_visible
                 && self
                     .state
                     .launch_hint_deadline
@@ -3872,6 +4247,11 @@ impl MagnifierWindow {
                     minimap_corner,
                     self.cursor_bake_capture_pos,
                     self.minimap_base.take(),
+                    self.state.config.minimap_outline_scheme,
+                    self.state.config.minimap_outline_speed,
+                    self.state.config.minimap_outline_thickness,
+                    self.state.config.minimap_outline_zoom_scale,
+                    self.state.config.max_zoom,
                 );
                 self.minimap_base = base;
                 sprite
@@ -3980,7 +4360,9 @@ impl MagnifierWindow {
         let show_osd = self.state.osd_visible || notice_fresh;
         let osd_lines = self.osd_lines();
         // Launch hint (CPU path).
-        let hint_lines: Vec<String> = if !self.state.osd_visible
+        let hint_lines: Vec<String> = if self.shift_held && self.state.config.show_shift_osd {
+            vec!["Shift: slow".to_string()]
+        } else if !self.state.osd_visible
             && self
                 .state
                 .launch_hint_deadline
@@ -4044,7 +4426,7 @@ impl MagnifierWindow {
         // The minimap for the CPU path: the same base-cached sprite, at
         // logical resolution, blended into the canvas at its corner position
         // inside the render closure (which cannot borrow `self`).
-        let minimap_cpu: Option<(RgbaBuffer, i32, i32)> = if self.minimap_visible {
+        let minimap_cpu: Option<(RgbaBuffer, i32, i32, Option<RgbaBuffer>)> = if self.minimap_visible {
             let (sprite, base) = build_minimap_sprite(
                 &captured.buffer,
                 (center_x, center_y),
@@ -4054,13 +4436,19 @@ impl MagnifierWindow {
                 minimap_corner,
                 self.cursor_bake_capture_pos,
                 self.minimap_base.take(),
+                self.state.config.minimap_outline_scheme,
+                self.state.config.minimap_outline_speed,
+                self.state.config.minimap_outline_thickness,
+                self.state.config.minimap_outline_zoom_scale,
+                self.state.config.max_zoom,
             );
             self.minimap_base = base;
-            sprite.map(|s| (s.buffer, s.x, s.y))
+            sprite.map(|s| (s.buffer, s.x, s.y, s.outline))
         } else {
             None
         };
 
+        let shift_held = self.shift_held;
         self.render_frame(qh, |canvas, width, height, stride| {
             canvas.fill(0);
             for y in 0..dest_h {
@@ -4076,20 +4464,28 @@ impl MagnifierWindow {
             if let Some((cursor_pos, ref cursor_sprite, hotspot)) = cursor_buf {
                 Self::draw_cursor_at(canvas, stride, cursor_pos, cursor_sprite, hotspot);
             }
-            if let Some((ref mm, mm_x, mm_y)) = minimap_cpu {
+            if let Some((ref mm, mm_x, mm_y, ref outline)) = minimap_cpu {
                 blend_overlay_into(canvas, stride, &mm.data, mm.width, mm.height, mm_x, mm_y);
+                if let Some(outline) = outline {
+                    blend_outline_into(canvas, stride, &outline.data, outline.width, outline.height, mm_x, mm_y);
+                }
             }
             if show_osd {
                 crate::osd::draw_osd(canvas, width, height, &osd_lines, osd_corner);
             }
             if !hint_lines.is_empty() {
+                let hint_color = if shift_held {
+                    [0xCC, 0xCC, 0xCC]
+                } else {
+                    [0x80, 0x80, 0x80]
+                };
                 crate::osd::draw_osd_colored(
                     canvas,
                     width,
                     height,
                     &hint_lines,
                     osd_corner,
-                    [0x80, 0x80, 0x80],
+                    hint_color,
                 );
             }
         });
@@ -4341,6 +4737,7 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         hold_floor_dead_travel: 0.0,
 
         edge_hold: (None, None),
+        shift_held: false,
         minimap_visible: minimap_on_launch,
         minimap_base: None,
     };
@@ -4377,6 +4774,9 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         // fire it so the cursor snaps into grid alignment without needing a
         // further event.
         window.draw_frame_if_settle_due(&qh);
+        if window.minimap_visible {
+            window.draw_frame(&qh);
+        }
     }
 
     Ok(())
@@ -5285,6 +5685,11 @@ mod tests {
             crate::osd::Corner::BottomRight,
             None,
             None,
+            crate::config::MinimapOutlineScheme::Gradient,
+            0.2,
+            2.0,
+            0.25,
+            9.0,
         );
         let buf = sprite.unwrap().buffer;
         let mut amber = 0;
@@ -5321,6 +5726,11 @@ mod tests {
             crate::osd::Corner::BottomRight,
             None,
             None,
+            crate::config::MinimapOutlineScheme::Gradient,
+            0.2,
+            2.0,
+            0.25,
+            9.0,
         );
         let buf = sprite.unwrap().buffer;
         let amber = buf
