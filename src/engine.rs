@@ -523,7 +523,8 @@ const MINIMAP_MARKER_MIN_EDGE: i32 = 12;
 /// less obtrusive. On very small regions they shrink to half the edge.
 const MINIMAP_CORNER_TICK: i32 = 7;
 /// Supersampling grid used to rasterize the rounded stroke evenly at corners.
-const MINIMAP_MASK_SAMPLES: i32 = 4;
+/// 8×8 = 64 sub-samples per pixel — enough for buttery-smooth corner arcs.
+const MINIMAP_MASK_SAMPLES: i32 = 8;
 const MINIMAP_PULSE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 const MINIMAP_CORNER_RADIUS: i32 = 8;
 
@@ -720,9 +721,12 @@ fn rounded_rect_sdf(x: f64, y: f64, w: f64, h: f64, r: f64) -> f64 {
 }
 
 /// Return `(rounded-rect coverage, outline-stroke coverage)` for one pixel.
-/// Supersampling makes the Euclidean stroke have the same apparent thickness
-/// on straight runs and around the 8 px corner arcs instead of producing
-/// jagged, uneven binary corners.
+/// The stroke is measured **inside the boundary only** (`-outline_width ≤ d ≤ 0`)
+/// so the visual thickness is exactly `outline_width` everywhere, including
+/// corners.  8×8 supersampling gives smooth coverage gradients at the
+/// inner edge of the stroke — the coverage value is used directly as the
+/// outline's alpha for buttery-smooth anti-aliasing instead of a jagged
+/// binary threshold.
 fn minimap_pixel_coverages(x: i32, y: i32, w: f64, h: f64, outline_width: f64) -> (u8, u8) {
     let r = MINIMAP_CORNER_RADIUS as f64;
     let mut inside = 0i32;
@@ -781,22 +785,25 @@ fn build_minimap_outline(
                 continue;
             }
             let i = (y as usize * buf_w as usize + x as usize) * 4;
+            // Use the supersampled coverage directly as the outline alpha
+            // so corners anti-alias smoothly instead of snapping to a
+            // jagged binary edge.
             match scheme {
                 MinimapOutlineScheme::Gradient => {
                     let c = minimap_outline_color(speed);
                     out.data[i..i + 4]
-                        .copy_from_slice(&[c[0], c[1], c[2], 255]);
+                        .copy_from_slice(&[c[0], c[1], c[2], stroke]);
                 }
                 MinimapOutlineScheme::AngularGradient => {
                     let c =
                         minimap_angular_gradient_color(x, y, w, h, speed);
                     out.data[i..i + 4]
-                        .copy_from_slice(&[c[0], c[1], c[2], 255]);
+                        .copy_from_slice(&[c[0], c[1], c[2], stroke]);
                 }
                 MinimapOutlineScheme::MarchingAnts => {
-                    let alpha =
+                    let pattern_alpha =
                         marching_ants_alpha(x, y, w, h, speed);
-                    if alpha == 0 {
+                    if pattern_alpha == 0 {
                         continue;
                     }
                     // Invert the background colour at dash positions
@@ -807,8 +814,9 @@ fn build_minimap_outline(
                     } else {
                         (255, 255, 255)
                     };
+                    let a = (stroke as u16 * pattern_alpha as u16 / 255) as u8;
                     out.data[i..i + 4]
-                        .copy_from_slice(&[r, g, b, 255]);
+                        .copy_from_slice(&[r, g, b, a]);
                 }
             }
         }
