@@ -682,18 +682,12 @@ fn perimeter_param(x: f64, y: f64, w: f64, h: f64, r: f64) -> f64 {
 }
 
 /// Alpha for the marching ants scheme: alternating colored and transparent
-/// segments that travel around the outline. Dash length is shorter than
-/// Photoshop-style ants; speed scales inversely with zoom (further in =
-/// slower movement). The dashes are equal in perimeter distance thanks to
-/// [`perimeter_param`].
 /// Alpha for the marching ants scheme: alternating colored and transparent
 /// segments that travel around the outline. Dash length is shorter than
-/// Photoshop-style ants; speed scales inversely with zoom (further in =
-/// slower movement). The dashes are equal in perimeter distance thanks to
-/// [`perimeter_param`].
-fn marching_ants_alpha(x: i32, y: i32, w: f64, h: f64, speed: f64, zoom: f64) -> u8 {
+/// Photoshop-style ants; speed is fixed (not zoom-dependent). The dashes
+/// are equal in perimeter distance thanks to [`perimeter_param`].
+fn marching_ants_alpha(x: i32, y: i32, w: f64, h: f64, speed: f64) -> u8 {
     let t = outline_elapsed() as f64 * speed;
-    let zoom_factor = zoom.max(1.0).sqrt();
     let r = MINIMAP_CORNER_RADIUS as f64;
     let param = perimeter_param(x as f64, y as f64, w, h, r);
     let straight_h = (w - 2.0 * r).max(0.0);
@@ -702,7 +696,7 @@ fn marching_ants_alpha(x: i32, y: i32, w: f64, h: f64, speed: f64, zoom: f64) ->
     let target_dash_px = 20.0;
     let num_half = ((perimeter / target_dash_px).round() as i32).max(4) & !1;
     let half = 1.0 / num_half as f64;
-    let phase = (param + t * 0.035 / zoom_factor).rem_euclid(1.0);
+    let phase = (param + t * 0.0175).rem_euclid(1.0);
     let slot = (phase / half).floor() as i32;
     if slot % 2 == 0 {
         255 // dash
@@ -774,7 +768,6 @@ fn build_minimap_outline(
     buf_h: i32,
     scheme: crate::config::MinimapOutlineScheme,
     speed: f64,
-    zoom: f64,
     outline_width: f64,
     background: Option<&RgbaBuffer>,
 ) -> RgbaBuffer {
@@ -802,7 +795,7 @@ fn build_minimap_outline(
                 }
                 MinimapOutlineScheme::MarchingAnts => {
                     let alpha =
-                        marching_ants_alpha(x, y, w, h, speed, zoom);
+                        marching_ants_alpha(x, y, w, h, speed);
                     if alpha == 0 {
                         continue;
                     }
@@ -1180,7 +1173,7 @@ fn build_minimap_sprite(
         }
     }
 
-    let outline = build_minimap_outline(buf_w, buf_h, scheme, speed, zoom, outline_width, Some(&frame));
+    let outline = build_minimap_outline(buf_w, buf_h, scheme, speed, outline_width, Some(&frame));
     apply_minimap_mask(&mut frame, outline_width);
     let sprite = OsdSprite {
         buffer: frame,

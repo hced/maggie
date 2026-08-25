@@ -40,10 +40,11 @@ fn default_minimap_corner() -> crate::osd::Corner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum MinimapOutlineScheme {
-    /// Continuously cycling RGB gradient (the default).
-    #[default]
+    /// Continuously cycling RGB gradient.
     Gradient,
-    /// A 45-degree angle gradient that slides along the outline over time.
+    /// A 45-degree angle gradient that slides along the outline over time
+    /// (the default).
+    #[default]
     AngularGradient,
     /// Segmented dashes that travel around the outline; speed scales
     /// inversely with zoom (further in = slower).
@@ -60,14 +61,14 @@ impl MinimapOutlineScheme {
     }
 }
 
-/// Default outline animation speed (0.2 = 5× slower than the original 1.0).
+/// Default outline animation speed (1.0 = full speed).
 fn default_outline_speed() -> f64 {
-    0.2
+    1.0
 }
 
 /// Default outline thickness in logical pixels.
 fn default_outline_thickness() -> f64 {
-    2.0
+    1.0
 }
 
 /// Default zoom-based thickness scaling factor (0.25 = 25 % thicker at max
@@ -358,9 +359,9 @@ impl Default for MagnifierConfig {
             osd_corner: crate::osd::Corner::TopLeft,
             minimap_corner: crate::osd::Corner::BottomRight,
             minimap_visible: true,
-            minimap_outline_scheme: MinimapOutlineScheme::Gradient,
-            minimap_outline_speed: 0.2,
-            minimap_outline_thickness: 2.0,
+            minimap_outline_scheme: MinimapOutlineScheme::AngularGradient,
+            minimap_outline_speed: 1.0,
+            minimap_outline_thickness: 1.0,
             minimap_outline_zoom_scale: 0.25,
             shift_slow_factor: 0.1,
             show_shift_osd: true,
@@ -412,12 +413,12 @@ pub(crate) fn normalize_config(config: &mut MagnifierConfig) {
     config.minimap_outline_speed = if config.minimap_outline_speed.is_finite() {
         config.minimap_outline_speed.clamp(0.01, 10.0)
     } else {
-        0.2
+        1.0
     };
     config.minimap_outline_thickness = if config.minimap_outline_thickness.is_finite() {
         config.minimap_outline_thickness.clamp(0.5, 8.0)
     } else {
-        2.0
+        1.0
     };
     config.minimap_outline_zoom_scale = if config.minimap_outline_zoom_scale.is_finite() {
         config.minimap_outline_zoom_scale.clamp(0.0, 2.0)
