@@ -587,6 +587,7 @@ impl GpuRenderer {
         cursor: Option<CursorSprite>,
         overlay: Option<&RgbaBuffer>,
         upload_overlay: bool,
+        upload_cursor: bool,
         minimap: Option<&OsdSprite>,
     ) {
         unsafe {
@@ -675,17 +676,19 @@ impl GpuRenderer {
                 gles2::ActiveTexture(gles2::TEXTURE0);
                 gles2::BindTexture(gles2::TEXTURE_2D, self.cursor_tex);
                 gles2::UseProgram(self.sprite_program);
-                gles2::TexImage2D(
-                    gles2::TEXTURE_2D,
-                    0,
-                    gles2::RGBA as GLint,
-                    cursor_buf.width,
-                    cursor_buf.height,
-                    0,
-                    gles2::RGBA,
-                    gles2::UNSIGNED_BYTE,
-                    cursor_buf.data.as_ptr() as *const GLvoid,
-                );
+                if upload_cursor {
+                    gles2::TexImage2D(
+                        gles2::TEXTURE_2D,
+                        0,
+                        gles2::RGBA as GLint,
+                        cursor_buf.width,
+                        cursor_buf.height,
+                        0,
+                        gles2::RGBA,
+                        gles2::UNSIGNED_BYTE,
+                        cursor_buf.data.as_ptr() as *const GLvoid,
+                    );
+                }
                 // The engine computes the cursor sprite origin so the
                 // cursor's hotspot pixel starts at the same surface-pixel
                 // boundary as the screen texel at the viewport center — the

@@ -934,6 +934,13 @@ fn inpaint_cursor_region(capture: &RgbaBuffer, cx: f64, cy: f64, half: i32) -> R
 /// resolution; 1.0 on the CPU path); the base buffer itself is
 /// scale-independent and shared between the paths.
 #[allow(clippy::too_many_arguments)]
+/// Build the minimap sprite (dimmed overview + animated outline + marker).
+///
+/// Since the frozen frame never changes, the expensive SDF-based outline
+/// geometry and content mask are **cached** and only recomputed when the
+/// minimap dimensions or outline thickness change. Each frame, only the
+/// animated outline colors and the per-frame marker/cursor-dot are drawn.
+#[allow(clippy::too_many_arguments)]
 fn build_minimap_sprite(
     capture: &RgbaBuffer,
     view_center: (f64, f64),
@@ -948,10 +955,10 @@ fn build_minimap_sprite(
     outline_thickness: f64,
     outline_zoom_scale: f64,
     max_zoom: f64,
+    outline_coverage_cache: &mut Option<(i32, i32, f64, Vec<u8>)>,
+    masked_base_cache: &mut Option<(i32, i32, f64, RgbaBuffer)>,
 ) -> (Option<OsdSprite>, Option<RgbaBuffer>) {
     // Effective outline width: base thickness scaled by zoom level.
-    // At 1× the thickness is exactly the base; at max_zoom it reaches
-    // base × (1 + outline_zoom_scale).
     let zoom_t = if max_zoom > 1.0 {
         ((zoom - 1.0).max(0.0) / (max_zoom - 1.0)).min(1.0)
     } else {
@@ -966,8 +973,6 @@ fn build_minimap_sprite(
     );
     let buf_w = mm_w.round() as i32;
     let buf_h = mm_h.round() as i32;
-    // Reserve a single rounded outline band. The base is opaque black so the
-    // letterboxed viewport space is represented explicitly.
     let inset = outline_width.ceil() as i32;
     let content_w = (buf_w - inset * 2).max(1);
     let content_h = (buf_h - inset * 2).max(1);
@@ -980,7 +985,8 @@ fn build_minimap_sprite(
     let th_i = th.round().clamp(1.0, content_h as f64) as i32;
     let ox_i = inset + (content_w - tw_i) / 2;
     let oy_i = inset + (content_h - th_i) / 2;
-    // Rebuild the base when it is missing or the viewport size changed.
+
+    // Rebuild the base (dimmed downscale) when missing or size changed.
     let base = match base {
         Some(b) if b.width == buf_w && b.height == buf_h => b,
         _ => {
@@ -999,141 +1005,77 @@ fn build_minimap_sprite(
                 b.data[d..d + tw_i as usize * 4]
                     .copy_from_slice(&img.data[s..s + tw_i as usize * 4]);
             }
+            // Invalidate outline/mask caches when the base changes.
+            *outline_coverage_cache = None;
+            *masked_base_cache = None;
             b
         }
     };
 
-    let mut frame = base.clone();
-    // Map capture coordinates into the fitted thumbnail. Coordinates remain
-    // inside the thumbnail, never into the surrounding black letterbox.
+    // --- Outline geometry cache (SDF + supersampling) ---
+    // The outline coverage (per-pixel stroke alpha) depends only on the
+    // minimap dimensions and outline width — both constant during panning.
+    // Recompute only when the cache key changes.
+    let coverage_valid = outline_coverage_cache
+        .as_ref()
+        .is_some_and(|(w, h, ow, _)| *w == buf_w && *h == buf_h && (*ow - outline_width).abs() < 1e-9);
+    if !coverage_valid {
+        let coverage = compute_outline_coverage(buf_w, buf_h, outline_width);
+        *outline_coverage_cache = Some((buf_w, buf_h, outline_width, coverage));
+    }
+    let coverage = &outline_coverage_cache.as_ref().unwrap().3;
+
+    // --- Pre-masked base cache ---
+    // The mask clears pixels in the content where the outline sits. This
+    // geometry is also constant — apply once and cache.
+    let mask_valid = masked_base_cache
+        .as_ref()
+        .is_some_and(|(w, h, ow, _)| *w == buf_w && *h == buf_h && (*ow - outline_width).abs() < 1e-9);
+    if !mask_valid {
+        let mut masked = base.clone();
+        apply_minimap_mask(&mut masked, outline_width);
+        *masked_base_cache = Some((buf_w, buf_h, outline_width, masked));
+    }
+    let masked_base = &masked_base_cache.as_ref().unwrap().3;
+
+    // --- Per-frame work (cheap) ---
+    // Clone the pre-masked base, draw the marker + cursor dot, then
+    // apply animated colors from the cached coverage.
+    let mut frame = masked_base.clone();
     let (cw, ch) = (capture.width as f64, capture.height as f64);
     let to_mm_x = |px: f64, total: f64| ox_i as f64 + (px / total.max(1.0)) * tw_i as f64;
     let to_mm_y = |py: f64, total: f64| oy_i as f64 + (py / total.max(1.0)) * th_i as f64;
-    // Marker: the visible region outline (clamped to the capture), amber so
-    // it stands out against the dimmed overview.
+
+    // Marker: visible-region corner brackets.
     if let Some((rx0, ry0, rx1, ry1)) = minimap_marker_rect(view_center, zoom, viewport) {
         let x0 = to_mm_x(rx0.clamp(0.0, cw), cw).round() as i32;
         let x1 = to_mm_x(rx1.clamp(0.0, cw), cw).round() as i32;
         let y0 = to_mm_y(ry0.clamp(0.0, ch), ch).round() as i32;
         let y1 = to_mm_y(ry1.clamp(0.0, ch), ch).round() as i32;
-        // Keep the outline at least 1 px wide/tall without ever inverting or
-        // collapsing it: the low corner never exceeds high-1 and the high
-        // corner never drops below low+1 (rounding can otherwise collapse a
-        // very small rect — or, with `.max` on the low corner, collapse *any*
-        // rect down to a single pixel).
         let (x0, x1) = (x0.min(x1 - 1), x1.max(x0 + 1));
         let (y0, y1) = (y0.min(y1 - 1), y1.max(y0 + 1));
-        // Skip the outline when the visible region is smaller than the marker
-        // dot: it would sit hidden behind the dot with only stray corner
-        // pixels poking out (a "single pixel" artifact at deep zoom). The
-        // dot alone marks the position then.
         if (x1 - x0) >= MINIMAP_MARKER_MIN_EDGE && (y1 - y0) >= MINIMAP_MARKER_MIN_EDGE {
-            // Short L-shaped brackets at the four corners of the visible
-            // region (camera-viewfinder style) instead of solid edges — the
-            // corners convey the extent without the busy full rectangle.
-            // Each leg is `tick` px long, shrinking to half the edge on
-            // small regions so opposite brackets never overlap.
             let tick = MINIMAP_CORNER_TICK
                 .min((x1 - x0) / 2)
                 .min((y1 - y0) / 2)
                 .max(1);
-            let outline = [255, 200, 70, 255];
-            // Top-left corner.
-            fill_px(
-                &mut frame.data,
-                buf_w,
-                buf_h,
-                x0,
-                x0 + tick,
-                y0,
-                y0 + 1,
-                outline,
-            );
-            fill_px(
-                &mut frame.data,
-                buf_w,
-                buf_h,
-                x0,
-                x0 + 1,
-                y0,
-                y0 + tick,
-                outline,
-            );
-            // Top-right corner.
-            fill_px(
-                &mut frame.data,
-                buf_w,
-                buf_h,
-                x1 - tick,
-                x1,
-                y0,
-                y0 + 1,
-                outline,
-            );
-            fill_px(
-                &mut frame.data,
-                buf_w,
-                buf_h,
-                x1 - 1,
-                x1,
-                y0,
-                y0 + tick,
-                outline,
-            );
-            // Bottom-left corner.
-            fill_px(
-                &mut frame.data,
-                buf_w,
-                buf_h,
-                x0,
-                x0 + tick,
-                y1 - 1,
-                y1,
-                outline,
-            );
-            fill_px(
-                &mut frame.data,
-                buf_w,
-                buf_h,
-                x0,
-                x0 + 1,
-                y1 - tick,
-                y1,
-                outline,
-            );
-            // Bottom-right corner.
-            fill_px(
-                &mut frame.data,
-                buf_w,
-                buf_h,
-                x1 - tick,
-                x1,
-                y1 - 1,
-                y1,
-                outline,
-            );
-            fill_px(
-                &mut frame.data,
-                buf_w,
-                buf_h,
-                x1 - 1,
-                x1,
-                y1 - tick,
-                y1,
-                outline,
-            );
+            let bracket = [255, 200, 70, 255];
+            fill_px(&mut frame.data, buf_w, buf_h, x0, x0 + tick, y0, y0 + 1, bracket);
+            fill_px(&mut frame.data, buf_w, buf_h, x0, x0 + 1, y0, y0 + tick, bracket);
+            fill_px(&mut frame.data, buf_w, buf_h, x1 - tick, x1, y0, y0 + 1, bracket);
+            fill_px(&mut frame.data, buf_w, buf_h, x1 - 1, x1, y0, y0 + tick, bracket);
+            fill_px(&mut frame.data, buf_w, buf_h, x0, x0 + tick, y1 - 1, y1, bracket);
+            fill_px(&mut frame.data, buf_w, buf_h, x0, x0 + 1, y1 - tick, y1, bracket);
+            fill_px(&mut frame.data, buf_w, buf_h, x1 - tick, x1, y1 - 1, y1, bracket);
+            fill_px(&mut frame.data, buf_w, buf_h, x1 - 1, x1, y1 - tick, y1, bracket);
         }
     }
-    // Cursor marker: a filled red circle with a 1 px black outline, at the
-    // view center (where the magnified cursor sprite always sits). Filled
-    // per scanline so the shape is a real circle at any size.
+
+    // Cursor marker: filled red circle with black outline.
     let dx = to_mm_x(view_center.0.clamp(0.0, cw), cw).round() as i32;
     let dy = to_mm_y(view_center.1.clamp(0.0, ch), ch).round() as i32;
-    let (r_in, r_out) = (2.5f64, 3.5f64); // red fill + 1 px black outline
+    let (r_in, r_out) = (2.5f64, 3.5f64);
     let (red, black) = ([255, 60, 60, 255], [0, 0, 0, 255]);
-    // Rows are only iterated while the radius actually covers them (never
-    // beyond `r_out`), and rows whose half-width is below a pixel are
-    // skipped — so no degenerate 1 px spikes at the top/bottom of the circle.
     for py in (dy - r_out as i32)..=(dy + r_out as i32) {
         let dyr = (py as f64 - dy as f64).abs();
         let half = ((r_out * r_out - dyr * dyr).max(0.0)).sqrt();
@@ -1142,36 +1084,17 @@ fn build_minimap_sprite(
         }
         let x_lo = (dx as f64 - half).floor() as i32;
         let x_hi = (dx as f64 + half).ceil() as i32;
-        // Outline: the whole row within the outer radius.
-        fill_px(
-            &mut frame.data,
-            buf_w,
-            buf_h,
-            x_lo,
-            x_hi + 1,
-            py,
-            py + 1,
-            black,
-        );
+        fill_px(&mut frame.data, buf_w, buf_h, x_lo, x_hi + 1, py, py + 1, black);
         if dyr <= r_in {
             let half_in = ((r_in * r_in - dyr * dyr).max(0.0)).sqrt();
             let xi_lo = (dx as f64 - half_in).ceil() as i32;
             let xi_hi = (dx as f64 + half_in).floor() as i32;
-            fill_px(
-                &mut frame.data,
-                buf_w,
-                buf_h,
-                xi_lo,
-                xi_hi + 1,
-                py,
-                py + 1,
-                red,
-            );
+            fill_px(&mut frame.data, buf_w, buf_h, xi_lo, xi_hi + 1, py, py + 1, red);
         }
     }
 
-    let outline = build_minimap_outline(buf_w, buf_h, scheme, speed, outline_width);
-    apply_minimap_mask(&mut frame, outline_width);
+    // Apply animated outline colors from cached coverage — no SDF needed.
+    let outline = apply_outline_colors(coverage, buf_w, buf_h, scheme, speed);
     let sprite = OsdSprite {
         buffer: frame,
         outline: Some(outline),
@@ -1181,6 +1104,66 @@ fn build_minimap_sprite(
         height: (mm_h * scale).round() as i32,
     };
     (Some(sprite), Some(base))
+}
+
+/// Pre-compute the outline stroke coverage for every pixel. The result is
+/// cached and reused across frames — only the animated colors change.
+fn compute_outline_coverage(buf_w: i32, buf_h: i32, outline_width: f64) -> Vec<u8> {
+    let mut coverage = Vec::with_capacity((buf_w * buf_h) as usize);
+    let (w, h) = (buf_w as f64, buf_h as f64);
+    for y in 0..buf_h {
+        for x in 0..buf_w {
+            let (_, stroke) = minimap_pixel_coverages(x, y, w, h, outline_width);
+            coverage.push(stroke);
+        }
+    }
+    coverage
+}
+
+/// Apply animated outline colors from pre-computed coverage. Per-pixel
+/// color lookup only — no SDF, no supersampling.
+fn apply_outline_colors(
+    coverage: &[u8],
+    buf_w: i32,
+    buf_h: i32,
+    scheme: crate::config::MinimapOutlineScheme,
+    speed: f64,
+) -> RgbaBuffer {
+    use crate::config::MinimapOutlineScheme;
+    let mut out = RgbaBuffer::new(buf_w, buf_h);
+    for (i, &stroke) in coverage.iter().enumerate() {
+        if stroke == 0 {
+            continue;
+        }
+        let pi = i * 4;
+        let x = (i as i32) % buf_w;
+        let y = (i as i32) / buf_w;
+        match scheme {
+            MinimapOutlineScheme::Gradient => {
+                let c = minimap_outline_color(speed);
+                out.data[pi..pi + 4]
+                    .copy_from_slice(&[c[0], c[1], c[2], stroke]);
+            }
+            MinimapOutlineScheme::AngularGradient => {
+                let c = minimap_angular_gradient_color(x, y, buf_w as f64, buf_h as f64, speed);
+                out.data[pi..pi + 4]
+                    .copy_from_slice(&[c[0], c[1], c[2], stroke]);
+            }
+            MinimapOutlineScheme::MarchingAnts => {
+                let on_dash = marching_ants_on_dash(x, y, buf_w as f64, buf_h as f64, speed);
+                let (lr, lg, lb) = (192u8, 192u8, 192u8);
+                let (dr, dg, db) = (48u8, 48u8, 48u8);
+                let (cr, cg, cb) = if on_dash {
+                    (lr, lg, lb)
+                } else {
+                    (dr, dg, db)
+                };
+                out.data[pi..pi + 4]
+                    .copy_from_slice(&[cr, cg, cb, stroke]);
+            }
+        }
+    }
+    out
 }
 
 /// Snap a capture-px position to the nearest whole capture pixel. The
@@ -1870,6 +1853,20 @@ pub struct MagnifierWindow {
     /// the minimap size changes; each frame the marker is drawn into a clone
     /// of this.
     minimap_base: Option<RgbaBuffer>,
+    /// Cached minimap outline coverage (per-pixel stroke alpha from the
+    /// SDF supersampling). Keyed on `(buf_w, buf_h, outline_width)`. Only
+    /// recomputed when the minimap dimensions or outline thickness change.
+    minimap_outline_coverage: Option<(i32, i32, f64, Vec<u8>)>,
+    /// Cached minimap base with the outline mask already applied. Keyed
+    /// on `(buf_w, buf_h, outline_width)`. Avoids re-running the SDF-
+    /// based mask on every frame.
+    minimap_masked_base: Option<(i32, i32, f64, RgbaBuffer)>,
+    /// Last zoom level at which the cursor texture was uploaded to the GPU.
+    /// When the zoom hasn't changed, theTexImage2D upload is skipped.
+    cursor_upload_zoom: f64,
+    /// Whether the cursor was visible on the previous frame. When
+    /// visibility toggles, the texture is re-uploaded.
+    cursor_was_visible: bool,
 }
 
 struct ScreencastManagerData;
@@ -2036,11 +2033,17 @@ impl smithay_client_toolkit::dispatch2::Dispatch2<ZwlrScreencopyFrameV1, Magnifi
 }
 
 fn convert_row(row: &[u8], width: usize, out: &mut Vec<u8>) {
-    for px in row.chunks_exact(4).take(width) {
-        out.push(px[2]);
-        out.push(px[1]);
-        out.push(px[0]);
-        out.push(255);
+    // Direct index writes into pre-allocated capacity — avoids per-element
+    // bounds checks from repeated `push` calls.
+    let base = out.len();
+    let n = width.min(row.len() / 4);
+    out.resize(base + n * 4, 0);
+    for (i, px) in row.chunks_exact(4).take(n).enumerate() {
+        let o = base + i * 4;
+        out[o] = px[2];
+        out[o + 1] = px[1];
+        out[o + 2] = px[0];
+        out[o + 3] = 255;
     }
 }
 
@@ -4242,6 +4245,8 @@ impl MagnifierWindow {
                     self.state.config.minimap_outline_thickness as f64,
                     self.state.config.minimap_outline_zoom_scale,
                     self.state.config.max_zoom,
+                    &mut self.minimap_outline_coverage,
+                    &mut self.minimap_masked_base,
                 );
                 self.minimap_base = base;
                 sprite
@@ -4275,6 +4280,9 @@ impl MagnifierWindow {
                     view_w.min(source_w as f64) / source_w as f64,
                     view_h.min(source_h as f64) / source_h as f64,
                 );
+                let cursor_changed = self.state.cursor_visible
+                    && ((self.cursor_upload_zoom - zoom).abs() > 1e-9
+                        || self.state.cursor_visible != self.cursor_was_visible);
                 gpu.draw(
                     Some(uv),
                     osd.as_ref(),
@@ -4282,6 +4290,7 @@ impl MagnifierWindow {
                     cursor.as_ref(),
                     overlay,
                     rebuild,
+                    cursor_changed,
                     minimap.as_ref(),
                 );
             } else {
@@ -4289,6 +4298,9 @@ impl MagnifierWindow {
                 // plain black view (src = None clears the buffer) while the
                 // magnified cursor and OSD legend stay visible so the user
                 // can still navigate back in.
+                let cursor_changed = self.state.cursor_visible
+                    && ((self.cursor_upload_zoom - zoom).abs() > 1e-9
+                        || self.state.cursor_visible != self.cursor_was_visible);
                 gpu.draw(
                     None,
                     osd.as_ref(),
@@ -4296,9 +4308,20 @@ impl MagnifierWindow {
                     cursor.as_ref(),
                     overlay,
                     rebuild,
+                    cursor_changed,
                     minimap.as_ref(),
                 );
             }
+            // Track cursor state for next frame's upload skip.
+            // Only update the zoom tracker when the cursor was actually
+            // present this frame — otherwise the first frame (before any
+            // pointer event) would mark the zoom as "uploaded" and skip
+            // the texture upload on the second frame when the cursor
+            // first appears.
+            if cursor.is_some() && self.state.cursor_visible {
+                self.cursor_upload_zoom = zoom;
+            }
+            self.cursor_was_visible = self.state.cursor_visible;
             if self.animating {
                 self.request_frame_callback(qh);
             }
@@ -4431,6 +4454,8 @@ impl MagnifierWindow {
                 self.state.config.minimap_outline_thickness as f64,
                 self.state.config.minimap_outline_zoom_scale,
                 self.state.config.max_zoom,
+                &mut self.minimap_outline_coverage,
+                &mut self.minimap_masked_base,
             );
             self.minimap_base = base;
             sprite.map(|s| (s.buffer, s.x, s.y, s.outline))
@@ -4528,7 +4553,7 @@ impl MagnifierWindow {
 
     fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
         if let Some(gpu) = &mut self.gpu {
-            gpu.draw(None, None, None, None, None, false, None);
+            gpu.draw(None, None, None, None, None, false, true, None);
             return;
         }
         self.render_frame(qh, |canvas, _width, _height, _stride| {
@@ -4730,6 +4755,10 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         shift_held: false,
         minimap_visible: minimap_on_launch,
         minimap_base: None,
+        minimap_outline_coverage: None,
+        minimap_masked_base: None,
+        cursor_upload_zoom: -1.0,
+        cursor_was_visible: false,
     };
 
     tracing::info!(
@@ -5680,6 +5709,8 @@ mod tests {
             2.0,
             0.25,
             9.0,
+            &mut None,
+            &mut None,
         );
         let buf = sprite.unwrap().buffer;
         let mut amber = 0;
@@ -5721,6 +5752,8 @@ mod tests {
             2.0,
             0.25,
             9.0,
+            &mut None,
+            &mut None,
         );
         let buf = sprite.unwrap().buffer;
         let amber = buf
