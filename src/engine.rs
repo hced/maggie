@@ -2377,12 +2377,17 @@ impl PointerHandler for MagnifierWindow {
                                 // consistent.
                                 let tuning = self.state.config.pan_tuning.clamp(0.0, 1.0);
                                 let gain = pan_tuning_gain(self.state.zoom, tuning);
-                                let scaled = dx * sx * gain;
-                                self.pan_accum.0 += scaled;
-                                if self.pan_accum.0.abs() >= 0.5 {
-                                    let step = self.pan_accum.0.round();
-                                    self.pan_accum.0 -= step;
-                                    let nx = self.clamp_to_capture((cx + step, cy)).0;
+                                if self.shift_held {
+                                    let scaled = dx * sx * gain;
+                                    self.pan_accum.0 += scaled;
+                                    if self.pan_accum.0.abs() >= 0.5 {
+                                        let step = self.pan_accum.0.round();
+                                        self.pan_accum.0 -= step;
+                                        let nx = self.clamp_to_capture((cx + step, cy)).0;
+                                        self.view_center = Some((nx, cy));
+                                    }
+                                } else {
+                                    let nx = self.clamp_to_capture((cx + dx * sx * gain, cy)).0;
                                     self.view_center = Some((nx, cy));
                                 }
                             }
@@ -2402,30 +2407,33 @@ impl PointerHandler for MagnifierWindow {
                             // a residual and erase it on the next toward-motion.
                             let tuning = self.state.config.pan_tuning.clamp(0.0, 1.0);
                             let gain = pan_tuning_gain(self.state.zoom, tuning);
-                            // Accumulate scaled deltas; advance the view
-                            // center only when the accumulator crosses 0.5
-                            // capture px. This eliminates the quantization
-                            // artifacts ("square" motion) that a simple
-                            // per-event multiplier creates at high zoom.
-                            let (scaled_x, scaled_y) = (dx * sx * gain, dy * sy * gain);
-                            self.pan_accum.0 += scaled_x;
-                            self.pan_accum.1 += scaled_y;
-                            let step_x = if self.pan_accum.0.abs() >= 0.5 {
-                                let s = self.pan_accum.0.round();
-                                self.pan_accum.0 -= s;
-                                s
+                            let (nx, ny) = if self.shift_held {
+                                // Accumulate scaled deltas; advance the view
+                                // center only when the accumulator crosses 0.5
+                                // capture px. This eliminates the quantization
+                                // artifacts ("square" motion) that a simple
+                                // per-event multiplier creates at high zoom.
+                                let (scaled_x, scaled_y) = (dx * sx * gain, dy * sy * gain);
+                                self.pan_accum.0 += scaled_x;
+                                self.pan_accum.1 += scaled_y;
+                                let step_x = if self.pan_accum.0.abs() >= 0.5 {
+                                    let s = self.pan_accum.0.round();
+                                    self.pan_accum.0 -= s;
+                                    s
+                                } else {
+                                    0.0
+                                };
+                                let step_y = if self.pan_accum.1.abs() >= 0.5 {
+                                    let s = self.pan_accum.1.round();
+                                    self.pan_accum.1 -= s;
+                                    s
+                                } else {
+                                    0.0
+                                };
+                                self.clamp_to_capture((cx + step_x, cy + step_y))
                             } else {
-                                0.0
+                                self.clamp_to_capture((cx + dx * sx * gain, cy + dy * sy * gain))
                             };
-                            let step_y = if self.pan_accum.1.abs() >= 0.5 {
-                                let s = self.pan_accum.1.round();
-                                self.pan_accum.1 -= s;
-                                s
-                            } else {
-                                0.0
-                            };
-                            let (nx, ny) =
-                                self.clamp_to_capture((cx + step_x, cy + step_y));
                             let (fx, fy) = if tuning > 0.0 {
                                 (nx, ny)
                             } else {
@@ -2840,6 +2848,9 @@ impl KeyboardHandler for MagnifierWindow {
         _: RawModifiers,
         _: u32,
     ) {
+        if self.shift_held && !modifiers.shift {
+            self.pan_accum = (0.0, 0.0);
+        }
         self.shift_held = modifiers.shift;
         if let Some(cw) = &mut self.config_window {
             cw.set_modifiers(egui::Modifiers {
