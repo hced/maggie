@@ -2372,12 +2372,12 @@ impl PointerHandler for MagnifierWindow {
                                 self.set_zoom(new_zoom, min_zoom);
                             }
                             if let Some((cx, cy)) = self.view_center {
-                                // Pan-tuning applies to the horizontal pan
-                                // during hold-to-zoom too, so the feel is
-                                // consistent.
-                                let tuning = self.state.config.pan_tuning.clamp(0.0, 1.0);
-                                let gain = pan_tuning_gain(self.state.zoom, tuning);
-                                let scaled = dx * sx * gain;
+                                // During HTZ, horizontal pan is always 1:1
+                                // (gain = 1.0) so it stays responsive at any
+                                // zoom level — pan_tuning is suspended to
+                                // avoid the zoom-dependent slowdown that
+                                // makes HTZ feel sluggish when zoomed in.
+                                let scaled = dx * sx;
                                 self.pan_accum.0 += scaled;
                                 if self.pan_accum.0.abs() >= 0.5 {
                                     let step = self.pan_accum.0.round();
