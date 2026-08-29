@@ -828,6 +828,35 @@ fn blend_outline_into(canvas: &mut [u8], stride: i32, outline: &[u8], width: i32
     }
 }
 
+/// Blend an RGBA sprite into a canvas buffer at an offset position.
+fn blend_sprite_into(canvas: &mut [u8], canvas_w: i32, sprite: &RgbaBuffer, ox: i32, oy: i32) {
+    for y in 0..sprite.height {
+        for x in 0..sprite.width {
+            let si = (y as usize * sprite.width as usize + x as usize) * 4;
+            let alpha = sprite.data[si + 3] as u16;
+            if alpha == 0 {
+                continue;
+            }
+            let dx = x + ox;
+            let dy = y + oy;
+            if dx < 0 || dx >= canvas_w || dy < 0 {
+                continue;
+            }
+            // Canvas height not passed; compute from buffer length.
+            let canvas_h = canvas.len() as i32 / (canvas_w as usize * 4) as i32;
+            if dy >= canvas_h {
+                continue;
+            }
+            let di = (dy as usize * canvas_w as usize + dx as usize) * 4;
+            let inv = 255 - alpha;
+            canvas[di] = ((sprite.data[si] as u16 * alpha + canvas[di] as u16 * inv) / 255) as u8;
+            canvas[di + 1] = ((sprite.data[si + 1] as u16 * alpha + canvas[di + 1] as u16 * inv) / 255) as u8;
+            canvas[di + 2] = ((sprite.data[si + 2] as u16 * alpha + canvas[di + 2] as u16 * inv) / 255) as u8;
+            canvas[di + 3] = ((255u16 * alpha + canvas[di + 3] as u16 * inv) / 255) as u8;
+        }
+    }
+}
+
 fn minimap_marker_rect(
     center: (f64, f64),
     zoom: f64,
@@ -1844,6 +1873,8 @@ pub struct MagnifierWindow {
     /// Whether the Shift key is currently held. Used to slow down pointer
     /// motion (panning) by the configured factor.
     shift_held: bool,
+    /// Whether Ctrl is currently held (for undo/redo shortcuts).
+    ctrl_held: bool,
     /// Sub-pixel accumulator for smooth shift-slowed panning: tracks the
     /// fractional capture-pixel movement from scaled deltas, advancing
     /// the view center only when the accumulator crosses 0.5 px. This
@@ -1873,6 +1904,8 @@ pub struct MagnifierWindow {
     /// Whether the cursor was visible on the previous frame. When
     /// visibility toggles, the texture is re-uploaded.
     cursor_was_visible: bool,
+    /// Draw Mode state: vector annotation overlay activated by LMB.
+    draw_mode: crate::draw_mode::DrawModeState,
 }
 
 struct ScreencastManagerData;
@@ -2294,6 +2327,33 @@ impl PointerHandler for MagnifierWindow {
                 self.handle_screenshot_pointer(event, qh);
                 continue;
             }
+            // Space held: track free cursor and update pie menu hover.
+            // Panning is paused — all motion goes to cursor movement.
+            // The cursor moves at 1:1 physical speed (same as a separate screen).
+            if self.draw_mode.space_held {
+                match event.kind {
+                    PointerEventKind::Motion { .. } => {
+                        let pos = event.position;
+                        let raw_dx = pos.0 - self.pointer_position_f.0;
+                        let raw_dy = pos.1 - self.pointer_position_f.1;
+                        self.pointer_position_f = pos;
+                        self.draw_mode.free_cursor_offset.0 += raw_dx;
+                        self.draw_mode.free_cursor_offset.1 += raw_dy;
+                        self.draw_mode.update_pie_hover(self.draw_mode.free_cursor_offset);
+                        self.request_motion_redraw(qh);
+                    }
+                    PointerEventKind::Press { button, .. } => {
+                        if button == BTN_RIGHT {
+                            // RMB while pie menu is shown: cancel it.
+                            self.draw_mode.cancel_space_hold();
+                            self.draw_frame(qh);
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match event.kind {
                 PointerEventKind::Enter { .. } => {
                     let position = event.position;
@@ -2326,6 +2386,17 @@ impl PointerHandler for MagnifierWindow {
                         let raw_dy = position.1 - self.pointer_position_f.1;
                         self.pointer_position_f = position;
                         self.state.pointer_position = (position.0 as i32, position.1 as i32);
+                        // Update in-progress drawing (capture px) while LMB is held.
+                        if self.draw_mode.drawing.is_some() {
+                            let (sx, sy) = self.capture_scale();
+                            let cap = (position.0 * sx, position.1 * sy);
+                            if let Some(ref mut drawing) = self.draw_mode.drawing {
+                                drawing.current = cap;
+                                if drawing.tool == crate::draw_mode::DrawTool::Freehand {
+                                    drawing.points.push(cap);
+                                }
+                            }
+                        }
                         // Shift modifier slows down panning for precision.
                         let shift_factor = if self.shift_held {
                             self.state.config.shift_slow_factor
@@ -2515,8 +2586,27 @@ impl PointerHandler for MagnifierWindow {
                             self.draw_frame(qh);
                         }
                     }
+                    if button == BTN_LEFT {
+                        // LMB press: start drawing with current tool.
+                        let pos = event.position;
+                        let (sx, sy) = self.capture_scale();
+                        let cap = (pos.0 * sx, pos.1 * sy);
+                        self.draw_mode.drawing = Some(
+                            crate::draw_mode::DrawingInProgress::new(
+                                self.draw_mode.tool,
+                                cap,
+                            ),
+                        );
+                        self.draw_mode.drawing_held = true;
+                    }
+
                 }
                 PointerEventKind::Release { button, .. } => {
+                    if button == BTN_LEFT && self.draw_mode.drawing_held {
+                        self.draw_mode.drawing_held = false;
+                        self.draw_mode.commit_drawing();
+                        self.draw_frame(qh);
+                    }
                     // Releasing the hold-to-zoom key stops smooth zooming —
                     // the mouse-button counterpart of `release_key`. The view
                     // stays exactly where it is (no jump, no self-animation);
@@ -2527,10 +2617,6 @@ impl PointerHandler for MagnifierWindow {
                         let was_active = self.hold_to_zoom_active;
                         self.hold_to_zoom_active = false;
                         if was_active {
-                            // Fresh baseline so the first correction step
-                            // after the release never dumps the whole offset
-                            // (a pause before the next motion would otherwise
-                            // make dt huge).
                             self.last_motion_at = Some(std::time::Instant::now());
                             self.draw_frame(qh);
                         }
@@ -2660,6 +2746,26 @@ impl KeyboardHandler for MagnifierWindow {
                 return;
             }
         }
+
+        // Space hold shows Annotation UI (pie menu), pauses panning.
+        if keysym_str == "Space" {
+            let (vp_w, vp_h) = (self.width as i32, self.height as i32);
+            self.draw_mode.begin_space_hold(vp_w, vp_h);
+            self.draw_frame(qh);
+            return;
+        }
+
+        // Ctrl+Z / Ctrl+Shift+Z for undo/redo annotations.
+        if self.ctrl_held && keysym_str == "z" {
+            if self.shift_held {
+                self.draw_mode.redo();
+            } else {
+                self.draw_mode.undo();
+            }
+            self.draw_frame(qh);
+            return;
+        }
+
 
         // Hold-to-zoom: pressing the configured modifier arms smooth zooming.
         // The baseline is the current pointer Y, so the zoom does not jump on
@@ -2813,6 +2919,26 @@ impl KeyboardHandler for MagnifierWindow {
                 self.nudge_hold = None;
             }
         }
+        // Space release selects the closest pie item and re-centers the cursor.
+        if self.draw_mode.space_held
+            && keysym_to_string(event.keysym) == "Space"
+        {
+            let offset = self.draw_mode.end_space_hold();
+            // Shift the view center so the content under the cursor stays
+            // visible after the cursor re-centers.
+            if offset.0.abs() > 0.01 || offset.1.abs() > 0.01 {
+                if let Some((cx, cy)) = self.view_center {
+                    let (sx, sy) = self.capture_scale();
+                    self.view_center = Some(self.clamp_to_capture((
+                        cx + offset.0 * sx,
+                        cy + offset.1 * sy,
+                    )));
+                }
+            }
+            self.draw_frame(qh);
+            return;
+        }
+
         if let Some(cw) = &mut self.config_window
             && let Some(key) = crate::config_window::keysym_to_egui_key(event.keysym)
         {
@@ -2848,6 +2974,7 @@ impl KeyboardHandler for MagnifierWindow {
         _: u32,
     ) {
         self.shift_held = modifiers.shift;
+        self.ctrl_held = modifiers.ctrl;
         if let Some(cw) = &mut self.config_window {
             cw.set_modifiers(egui::Modifiers {
                 alt: modifiers.alt,
@@ -3569,6 +3696,14 @@ impl MagnifierWindow {
         }
     }
 
+    /// Handle pointer events in Annotation Mode.
+    ///
+    /// - Motion updates toolbar hover, draws if in progress, and pans the view.
+    /// - LMB on toolbar: select tool/color/action.
+    /// - LMB on canvas: start drawing.
+    /// - LMB release: commit drawing.
+    /// - RMB: exit annotation mode.
+    /// - Scroll wheel: zoom (falls through to normal handler via `continue`).
     /// Clamp a view-center coordinate to the frozen capture's bounds
     /// (capture px). The magnified cursor sits at the viewport center, which
     /// *is* the view center: keeping the center inside the capture guarantees
@@ -4093,8 +4228,8 @@ impl MagnifierWindow {
                 self.screenshot_cursor_logical()
             } else {
                 Some((
-                    off_x as f64 + dest_w as f64 / 2.0,
-                    off_y as f64 + dest_h as f64 / 2.0,
+                    off_x as f64 + dest_w as f64 / 2.0 + self.draw_mode.free_cursor_offset.0,
+                    off_y as f64 + dest_h as f64 / 2.0 + self.draw_mode.free_cursor_offset.1,
                 ))
             }
         } else {
@@ -4195,6 +4330,7 @@ impl MagnifierWindow {
                 self.state.launch_hint_deadline = None;
                 None
             };
+            // Draw Mode toolbar: rendered into the overlay buffer below.
             // The screenshot selection overlay (scrim + colored border) at
             // the RENDER_SCALE buffer resolution, uploaded as a fullscreen
             // sprite on the GPU. It is **cached**: only rebuilt (and only
@@ -4249,7 +4385,46 @@ impl MagnifierWindow {
                 self.screenshot_overlay = Some(buf);
                 self.screenshot_overlay_state = Some(overlay_state);
             }
-            let overlay = self.screenshot_overlay.as_ref();
+            // Render annotations overlay (always, if annotations exist or drawing).
+            let draw_mode_overlay = if !self.draw_mode.annotations.is_empty() || self.draw_mode.drawing.is_some() {
+                let scale = crate::gpu::RENDER_SCALE as f64;
+                let vp_w = self.width as i32 * scale as i32;
+                let vp_h = self.height as i32 * scale as i32;
+                crate::draw_mode::render_annotations_overlay(
+                    &self.draw_mode.annotations,
+                    self.draw_mode.drawing.as_ref(),
+                    vp_w,
+                    vp_h,
+                    (center_x, center_y),
+                    zoom,
+                )
+            } else {
+                None
+            };
+            // Annotation UI sprite: shown when Space is held.
+            let toolbar_sprite = if self.draw_mode.space_held {
+                self.draw_mode.pie_menu_sprite().map(|tb| {
+                    let scale = crate::gpu::RENDER_SCALE as f64;
+                    let sw = self.width as f64 * scale;
+                    let sh = self.height as f64 * scale;
+                    crate::osd::OsdSprite {
+                        buffer: tb.buffer.clone(),
+                        outline: None,
+                        x: (sw / 2.0 - tb.width as f64 / 2.0).round() as i32,
+                        y: (sh / 2.0 - tb.height as f64 / 2.0).round() as i32,
+                        width: tb.width,
+                        height: tb.height,
+                    }
+                })
+            } else {
+                None
+            };
+            // Prefer screenshot overlay; fall back to draw-mode overlay.
+            let overlay = self.screenshot_overlay.as_ref().or(draw_mode_overlay.as_ref());
+            // Force texture re-upload when draw-mode overlay is present
+            // (it changes every frame due to annotations/toolbar/drawing).
+            let rebuild = rebuild || draw_mode_overlay.is_some();
+
             // The GPU buffer is RENDER_SCALE x the logical size, so the
             // cursor sprite origin is scaled to match. The cursor never
             // moves on its own: its origin is always the dead-center hotspot
@@ -4258,11 +4433,19 @@ impl MagnifierWindow {
             // edges are crisp. In Screenshot Mode the cursor tracks the
             // live pointer (the aim position) instead.
             let cursor = cursor_logical.map(|(cx, cy)| {
+                // When Space is held (Annotation UI), render cursor at 1:1
+                // (unscaled) size so the user can point at pie menu items
+                // naturally; otherwise scale by zoom × RENDER_SCALE.
+                let sprite_scale = if self.draw_mode.space_held {
+                    crate::gpu::RENDER_SCALE as f64 / zoom
+                } else {
+                    crate::gpu::RENDER_SCALE as f64
+                };
                 let (buf, (hx, hy)) = self
                     .magnified_cursor
                     .as_mut()
                     .expect("magnified cursor present")
-                    .sprite(crate::gpu::RENDER_SCALE as f64);
+                    .sprite(sprite_scale);
                 let origin_x = (cx * crate::gpu::RENDER_SCALE as f64 - hx).round() as i32;
                 let origin_y = (cy * crate::gpu::RENDER_SCALE as f64 - hy).round() as i32;
                 ((origin_x, origin_y), buf, (hx, hy))
@@ -4333,6 +4516,7 @@ impl MagnifierWindow {
                     rebuild,
                     cursor_changed,
                     minimap.as_ref(),
+                    toolbar_sprite.as_ref(),
                 );
             } else {
                 // 0 % zoom: the magnified view collapses to nothing — draw a
@@ -4351,6 +4535,7 @@ impl MagnifierWindow {
                     rebuild,
                     cursor_changed,
                     minimap.as_ref(),
+                    toolbar_sprite.as_ref(),
                 );
             }
             // Track cursor state for next frame's upload skip.
@@ -4377,11 +4562,18 @@ impl MagnifierWindow {
         // cursor's lattice so the screen's blocks and the cursor's blocks
         // coincide with the cursor at the dead center).
         let cursor_buf = cursor_logical.map(|(cx, cy)| {
+            // When Space is held (Annotation UI), render cursor at 1:1
+            // (unscaled) size; otherwise scale by zoom.
+            let sprite_scale = if self.draw_mode.space_held {
+                1.0 / zoom
+            } else {
+                1.0
+            };
             let (buf, (hx, hy)) = self
                 .magnified_cursor
                 .as_mut()
                 .expect("magnified cursor present")
-                .sprite(1.0);
+                .sprite(sprite_scale);
             // Dead center origin (or the live pointer in Screenshot Mode), on
             // the canvas pixel grid. The cursor never moves on its own.
             let origin_x = (cx - hx).round() as i32;
@@ -4594,7 +4786,7 @@ impl MagnifierWindow {
 
     fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
         if let Some(gpu) = &mut self.gpu {
-            gpu.draw(None, None, None, None, None, false, true, None);
+            gpu.draw(None, None, None, None, None, false, true, None, None);
             return;
         }
         self.render_frame(qh, |canvas, _width, _height, _stride| {
@@ -4792,15 +4984,16 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         hold_zoom_last_y: 0.0,
         hold_floor_dead_travel: 0.0,
 
-        edge_hold: (None, None),
-        shift_held: false,
-        pan_accum: (0.0, 0.0),
+        edge_hold: (None, None),            shift_held: false,
+            ctrl_held: false,
+            pan_accum: (0.0, 0.0),
         minimap_visible: minimap_on_launch,
         minimap_base: None,
         minimap_outline_coverage: None,
         minimap_masked_base: None,
         cursor_upload_zoom: -1.0,
         cursor_was_visible: false,
+        draw_mode: crate::draw_mode::DrawModeState::new(),
     };
 
     tracing::info!(

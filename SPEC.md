@@ -97,7 +97,78 @@ Triggered using dedicated keybindings (`S`, `W`, `F`); a unified **Screenshot Mo
 
 ---
 
-## 9. Configuration Window — *Implemented* (GPU path)
+## 9. Annotation — *Implemented*
+
+Annotation overlays vector drawing tools on the magnified view, allowing the user to mark up the frozen frame with freehand strokes, lines, boxes, arrows, circles, and numbered markers. Annotations persist for the session and are drawn on top of the magnified content. There is **no mode** — LMB always draws with the last-used tool (default: Freehand/Pen).
+
+### Drawing
+* **LMB press** starts drawing with the currently selected tool.
+* **LMB drag** draws **and pans the view simultaneously** — drawing and panning are not mutually exclusive.
+* **LMB release** commits the drawing as a finalized annotation.
+* The last-used tool and color persist across draws.
+
+### Annotation UI (Space Hold)
+* **Hold Space** to show the **Annotation UI**, centered at the viewport center (screen center). The UI **does not follow the cursor** — it is fixed at screen center.
+* While Space is held, **panning is paused** and the **cursor detaches from the center**, resized to the 1:1 (100% zoom) cursor size so it can be moved around and pointed at various components.
+* **Release Space** to activate the highlighted component and re-center the cursor. The view shifts so the content under the cursor stays visible after re-centering.
+
+### Selection Style (Preference)
+Two modes for how components are highlighted in the Annotation UI:
+* **Nearest** (default): Always highlight the component closest to the cursor, regardless of distance.
+* **Overlap**: Only highlight components when the cursor is actually over them.
+
+### Annotation UI Layout (Concentric Layers of Rounded Buttons)
+The UI is built from **labeled layers** of separate rounded-corner buttons arranged in concentric rings. Each layer has a name (e.g. "colors", "tools") for future preferences/reordering. The layout **auto-enlarges** the ring radius when more buttons are added. Buttons float with transparent space between them — **no background circle**.
+
+**Inner Ring** — **"colors" layer**: 8 color swatches (Red, Orange, Yellow, Green, Blue, Purple, White, Black) evenly spaced. Each swatch is a rounded square (64×64 px) with:
+* Filled with the actual color
+* 3 px rounded-corner border (white; blue when highlighted)
+
+**Outer Ring** — **"tools" layer**: 8 tool buttons (Sel, Pen, Ers, Line, Box, Arr, Cir, #) evenly spaced in a circle. Each button is a rounded rectangle (112×128 px) with:
+* SVG icon from [Lucide](https://lucide.dev/) rendered in white (4.0× scale)
+* 3-letter label below the icon
+* 3 px rounded-corner border (white; blue when highlighted)
+* 10 px inner padding between border and icon
+
+**Center Hub** — Empty space (cursor resting area). No button here.
+
+**Highlight**: hovered button gets a blue border (`rgb(100,180,255)`) and slightly brighter background.
+
+**SVG Icons** — stored in `assets/ui/button/`: mouse-pointer.svg (Select), pencil.svg (Freehand), eraser.svg (Erase), minus.svg (Line), square.svg (Box), arrow-up-right.svg (Arrow), circle.svg (Circle), hash.svg (Number). Loaded at startup via `resvg` and cached as rasterized RGBA buffers.
+
+### Undo / Redo
+* **Ctrl+Z** undoes the last annotation (placed on redo stack).
+* **Ctrl+Shift+Z** redoes the last undone annotation.
+
+### Tools
+| Key | Tool | Description |
+|-----|------|-------------|
+| Sel | Select | Selection tool (placeholder) |
+| Pen | Freehand | Freehand drawing — captures all pointer positions while LMB is held |
+| Ers | Erase | Erasing brush — removes annotations along the stroke path |
+| Line | Line | Straight line from press to release |
+| Box | Box | Rectangle from press to release |
+| Arr | Arrow | Line with arrowhead from press to release |
+| Cir | Circle | Circle outline from center (press) to radius (release) |
+| # | Number | Places an auto-incrementing number marker at the click position |
+
+### Colors
+The 8 palette colors are selectable via the "colors" layer of the Annotation UI. The selected color applies to all subsequent annotations. The current color is indicated with a highlighted border.
+
+### Exiting / Quitting
+* **Escape** or **Q** quits the application (always).
+* **RMB** quits the application (always). When the Annotation UI is visible (Space held), RMB **cancels** the pie menu instead of quitting.
+* **Scroll wheel** zooms in/out (works at all times).
+
+### Rendering
+* Annotations are rendered into a **viewport-sized overlay buffer** at RENDER_SCALE resolution, then composited over the magnified frame by the GPU sprite shader.
+* The Annotation UI is rendered as an **OSD sprite at logical resolution**, positioned at the viewport center. The GPU shader scales it up to fill the RENDER_SCALE surface. The sprite is **cached** and only rebuilt when the hover state changes (no per-frame rasterization cost).
+* In-progress drawings (while LMB is held) are rendered live in the overlay buffer.
+* All Annotation UI buttons have **3 px rounded-corner borders** (white normally, blue when highlighted) for clear selection indication.
+
+---
+
+## 10. Configuration Window — *Implemented* (GPU path)
 * Activated via the **`Tab`** key (`keybindings.config_window`; changed from `C` so `C` could become the magnified-cursor toggle); closed with the **Close** button or **Escape**.
 * Built with **egui 0.35 + egui-glow** (`src/config_window.rs`) painted directly into the same EGL surface through a `glow` context sharing the app's GLES2 function pointers — no separate toplevel window is created (Maggie is a full-screen layer-shell overlay). Requires the **GPU render path**; on the CPU fallback the key logs a warning.
 * While open, the whole surface shows the UI, **pointer and keyboard events are forwarded to egui** (motion, buttons, wheel, keys via an xkeysym→`egui::Key` mapping, text input, modifiers), and the magnifier's own key handling (zoom keys, Q/Esc quit) is suspended. Keyboard interactivity stays **`on-demand`** throughout (never toggled): niri grants it at map time and on every click, so text fields receive keys after the first click — and critically, *not* switching to `exclusive` means niri never clears its remembered on-demand focus, so closing the window leaves the magnifier's global keys working immediately (an `exclusive`→`on-demand` round trip would drop focus until the next click).
@@ -113,7 +184,7 @@ Triggered using dedicated keybindings (`S`, `W`, `F`); a unified **Screenshot Mo
 
 ---
 
-## 10. CLI Arguments — *Implemented*
+## 11. CLI Arguments — *Implemented*
 The application supports the following command-line interface arguments:
 * `-z` or `--zoom <LEVEL>`: Specifies a preferred initial zoom level (e.g., `3`).
 * `-d` or `--debug`: Enables debug mode to output verbose troubleshooting logs to `stdout`.

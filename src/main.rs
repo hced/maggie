@@ -6,6 +6,7 @@ mod capture;
 mod config;
 mod config_window;
 mod cursor;
+mod draw_mode;
 mod engine;
 mod gpu;
 mod input;

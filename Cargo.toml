@@ -26,6 +26,8 @@ egui = "0.35"
 egui_glow = "0.35"
 glow = "0.17"
 egui-file-dialog = "0.14.1"
+resvg = "0.45"
+thorvg = "0.5"
 
 [build-dependencies]
 gl_generator = "0.14"

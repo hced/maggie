@@ -67,7 +67,7 @@ impl std::str::FromStr for Corner {
 }
 const TEXT_COLOR: [u8; 3] = [0xE6, 0xE6, 0xE6];
 
-fn glyph(character: char) -> Option<&'static [u8; GLYPH_HEIGHT]> {
+pub fn glyph(character: char) -> Option<&'static [u8; GLYPH_HEIGHT]> {
     match character {
         ' ' => Some(&[
             0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000,
