@@ -513,9 +513,9 @@ fn draw_color_annulus(buf: &mut [u8], bw: i32, bh: i32, center: f64, hovered_col
                 let sector = ((angle / std::f64::consts::TAU) * n) as usize;
                 let sector = sector.min(COLOR_BUTTONS.len() - 1);
                 let mut color = COLOR_BUTTONS[sector].0;
-                // Brighten the hovered color segment.
+                // Brighten the hovered color segment significantly.
                 if hovered_color == Some(color) {
-                    color = brighten(color, 40);
+                    color = brighten(color, 70);
                 }
                 let idx = (py as usize * bw as usize + px as usize) * 4;
                 buf[idx] = color[0];
@@ -535,9 +535,10 @@ fn draw_tool_button(buf: &mut [u8], bw: i32, bh: i32, btn: &PieButton, is_hovere
     let rh = (btn.hh * 2.0).round() as i32;
     let cr = btn.cr.round() as i32;
 
-    // Background — brighter when hovered.
-    let bg = if is_hovered { brighten(btn.bg, 50) } else { btn.bg };
-    fill_rounded_rect(buf, bw, bh, x0, y0, rw, rh, cr, [bg[0], bg[1], bg[2], 220]);
+    // Background — much brighter when hovered.
+    let bg = if is_hovered { brighten(btn.bg, 80) } else { btn.bg };
+    let bg_a = if is_hovered { 255 } else { 220 };
+    fill_rounded_rect(buf, bw, bh, x0, y0, rw, rh, cr, [bg[0], bg[1], bg[2], bg_a]);
 
     // Icon centered inside.
     if let Some(icon_name) = btn.icon {
@@ -582,69 +583,95 @@ fn cursor_polar(dx: f64, dy: f64) -> (f64, f64) {
     (r, angle)
 }
 
-/// Angular-sector hit test: checks which ring the cursor is in,
-/// then selects the button by its angular sector within that ring.
-fn find_nearest(layers: &[PieLayer], _center: f64, dx: f64, dy: f64) -> Option<usize> {
-    let (r, angle) = cursor_polar(dx, dy);
-    let n_colors = COLOR_BUTTONS.len();
-    let n_tools = TOOL_BUTTONS.len();
+/// Minimum cursor distance (buffer px) before any button is selected.
+const PIE_DEAD_ZONE: f64 = 30.0;
 
-    // Check color ring (annulus).
-    if r >= COLOR_INNER_R && r <= COLOR_OUTER_R {
-        let sector = ((angle / std::f64::consts::TAU) * n_colors as f64) as usize;
-        return Some(sector.min(n_colors - 1));
+/// Direction vectors for each color button (matches annulus drawing order).
+fn color_dirs() -> [(f64, f64); 8] {
+    let mut dirs = [(0.0f64, 0.0f64); 8];
+    for i in 0..8 {
+        let a = std::f64::consts::TAU * i as f64 / 8.0;
+        dirs[i] = (a.cos(), a.sin());
     }
+    dirs
+}
 
-    // Check tool ring zone (around TOOL_R).
-    if r >= TOOL_R - TOOL_HW && r <= TOOL_R + TOOL_HW {
-        let sector = ((angle / std::f64::consts::TAU) * n_tools as f64) as usize;
-        return Some(n_colors + sector.min(n_tools - 1));
+/// Direction vectors for each tool button (starts at -PI/2, 12 o'clock).
+fn tool_dirs() -> [(f64, f64); 8] {
+    let mut dirs = [(0.0f64, 0.0f64); 8];
+    for i in 0..8 {
+        let a = std::f64::consts::TAU * i as f64 / 8.0 - std::f64::consts::FRAC_PI_2;
+        dirs[i] = (a.cos(), a.sin());
     }
+    dirs
+}
 
-    // Outside both rings — find nearest button by Euclidean distance.
-    let mut best = None;
-    let mut best_d = f64::MAX;
-    let mut idx = 0;
-    for layer in layers {
-        for btn in &layer.buttons {
-            // Skip color buttons (they have hw=0).
-            if btn.hw == 0.0 { idx += 1; continue; }
-            let d = dx.hypot(dy) - TOOL_R; // radial distance to tool ring center
-            let d2 = d.abs();
-            if d2 < best_d { best_d = d2; best = Some(idx); }
-            idx += 1;
+/// Find closest button by dot product (Blender-style direction comparison).
+fn closest_by_direction(cursor_dir: (f64, f64), dirs: &[(f64, f64)]) -> usize {
+    let (cx, cy) = cursor_dir;
+    let mut best = 0;
+    let mut best_dot = f64::NEG_INFINITY;
+    for (i, &(bx, by)) in dirs.iter().enumerate() {
+        let dot = cx * bx + cy * by;
+        if dot > best_dot {
+            best_dot = dot;
+            best = i;
         }
     }
     best
 }
 
-/// Overlap hit test: checks if cursor is inside a tool button's rounded rect.
-fn hit_test_overlap(layers: &[PieLayer], center: f64, dx: f64, dy: f64) -> Option<usize> {
-    let (r, angle) = cursor_polar(dx, dy);
+fn normalize_dir(dx: f64, dy: f64) -> (f64, f64) {
+    let len = dx.hypot(dy);
+    if len < 1e-6 { (0.0, 0.0) } else { (dx / len, dy / len) }
+}
+
+/// Nearest hit test: direction-based (Blender-style).
+fn find_nearest(_layers: &[PieLayer], _center: f64, dx: f64, dy: f64) -> Option<usize> {
+    let s = crate::gpu::RENDER_SCALE as f64;
+    let bx = dx * s;
+    let by = dy * s;
+    let r = bx.hypot(by);
     let n_colors = COLOR_BUTTONS.len();
 
-    // Check color ring.
+    if r < PIE_DEAD_ZONE { return None; }
+    let dir = normalize_dir(bx, by);
+
     if r >= COLOR_INNER_R && r <= COLOR_OUTER_R {
-        let sector = ((angle / std::f64::consts::TAU) * n_colors as f64) as usize;
-        return Some(sector.min(n_colors - 1));
+        return Some(closest_by_direction(dir, &color_dirs()));
+    }
+    Some(n_colors + closest_by_direction(dir, &tool_dirs()))
+}
+
+/// Overlap hit test: precise hit first, then direction-based fallback.
+fn hit_test_overlap(layers: &[PieLayer], center: f64, dx: f64, dy: f64) -> Option<usize> {
+    let s = crate::gpu::RENDER_SCALE as f64;
+    let bx = dx * s;
+    let by = dy * s;
+    let r = bx.hypot(by);
+    let n_colors = COLOR_BUTTONS.len();
+
+    if r < PIE_DEAD_ZONE { return None; }
+    let dir = normalize_dir(bx, by);
+
+    // A. Precise hit: inside color ring.
+    if r >= COLOR_INNER_R && r <= COLOR_OUTER_R {
+        return Some(closest_by_direction(dir, &color_dirs()));
     }
 
-    // Convert cursor offset to buffer coordinates for button hit test.
-    let bx = center + dx;
-    let by = center + dy;
-    let mut idx = n_colors;
-    for layer in layers {
-        for btn in &layer.buttons {
-            if btn.hw == 0.0 { idx += 1; continue; }
-            let lx = (bx - (btn.cx - btn.hw)).round() as i32;
-            let ly = (by - (btn.cy - btn.hh)).round() as i32;
-            if point_in_rounded_rect(lx, ly, (btn.hw*2.0) as i32, (btn.hh*2.0) as i32, btn.cr as i32) {
-                return Some(idx);
-            }
-            idx += 1;
+    // A. Precise hit: inside a tool button's bounding rect.
+    let buf_bx = center + bx;
+    let buf_by = center + by;
+    for (i, btn) in layers[1].buttons.iter().enumerate() {
+        let lx = (buf_bx - (btn.cx - btn.hw)).round() as i32;
+        let ly = (buf_by - (btn.cy - btn.hh)).round() as i32;
+        if point_in_rounded_rect(lx, ly, (btn.hw * 2.0) as i32, (btn.hh * 2.0) as i32, btn.cr as i32) {
+            return Some(n_colors + i);
         }
     }
-    None
+
+    // B. Fallback: closest tool by direction.
+    Some(n_colors + closest_by_direction(dir, &tool_dirs()))
 }
 
 // ── Render pie menu sprite ──

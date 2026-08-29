@@ -671,6 +671,42 @@ impl GpuRenderer {
                 gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
             }
 
+            // Draw Mode toolbar sprite — rendered before cursor so cursor
+            // appears on top of the pie menu buttons.
+            if let Some(sprite) = toolbar {
+                gles2::Enable(gles2::BLEND);
+                gles2::BlendFunc(gles2::SRC_ALPHA, gles2::ONE_MINUS_SRC_ALPHA);
+                gles2::ActiveTexture(gles2::TEXTURE0);
+                gles2::BindTexture(gles2::TEXTURE_2D, self.osd_tex);
+                gles2::UseProgram(self.sprite_program);
+                gles2::TexImage2D(
+                    gles2::TEXTURE_2D,
+                    0,
+                    gles2::RGBA as GLint,
+                    sprite.width,
+                    sprite.height,
+                    0,
+                    gles2::RGBA,
+                    gles2::UNSIGNED_BYTE,
+                    sprite.buffer.data.as_ptr() as *const GLvoid,
+                );
+                let x0 = sprite.x as GLfloat / self.width as GLfloat;
+                let y0 = sprite.y as GLfloat / self.height as GLfloat;
+                let x1 = (sprite.x + sprite.width) as GLfloat / self.width as GLfloat;
+                let y1 = (sprite.y + sprite.height) as GLfloat / self.height as GLfloat;
+                let verts: [GLfloat; 12] =
+                    [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+                gles2::BufferData(
+                    gles2::ARRAY_BUFFER,
+                    size_of_val(&verts) as GLsizeiptr,
+                    verts.as_ptr() as *const GLvoid,
+                    gles2::STREAM_DRAW,
+                );
+                gles2::Uniform4f(self.u_rect_loc, x0, y0, x1 - x0, y1 - y0);
+                gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
+                gles2::Disable(gles2::BLEND);
+            }
+
             if let Some((pos, cursor_buf, (_hx, _hy))) = cursor {
                 gles2::Enable(gles2::BLEND);
                 gles2::BlendFunc(gles2::SRC_ALPHA, gles2::ONE_MINUS_SRC_ALPHA);
@@ -690,17 +726,10 @@ impl GpuRenderer {
                         cursor_buf.data.as_ptr() as *const GLvoid,
                     );
                 }
-                // The engine computes the cursor sprite origin so the
-                // cursor's hotspot pixel starts at the same surface-pixel
-                // boundary as the screen texel at the viewport center — the
-                // two grids are on one shared lattice. We place the sprite at
-                // that origin directly (no hotspot subtraction needed).
                 let x0 = pos.0 as f32 / self.width as f32;
                 let y0 = pos.1 as f32 / self.height as f32;
                 let x1 = (pos.0 as f32 + cursor_buf.width as f32) / self.width as f32;
                 let y1 = (pos.1 as f32 + cursor_buf.height as f32) / self.height as f32;
-                // Unit quad: the sprite shader computes screen = u_rect.xy +
-                // a_pos * u_rect.zw, so the rect lives entirely in u_rect.
                 let verts: [GLfloat; 12] =
                     [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
                 gles2::BufferData(
@@ -828,41 +857,6 @@ impl GpuRenderer {
                     gles2::BlendFunc(gles2::SRC_ALPHA, gles2::ONE_MINUS_SRC_ALPHA);
                     gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
                 }
-                gles2::Disable(gles2::BLEND);
-            }
-
-            // Draw Mode toolbar sprite — rendered like the OSD legend.
-            if let Some(sprite) = toolbar {
-                gles2::Enable(gles2::BLEND);
-                gles2::BlendFunc(gles2::SRC_ALPHA, gles2::ONE_MINUS_SRC_ALPHA);
-                gles2::ActiveTexture(gles2::TEXTURE0);
-                gles2::BindTexture(gles2::TEXTURE_2D, self.osd_tex);
-                gles2::UseProgram(self.sprite_program);
-                gles2::TexImage2D(
-                    gles2::TEXTURE_2D,
-                    0,
-                    gles2::RGBA as GLint,
-                    sprite.width,
-                    sprite.height,
-                    0,
-                    gles2::RGBA,
-                    gles2::UNSIGNED_BYTE,
-                    sprite.buffer.data.as_ptr() as *const GLvoid,
-                );
-                let x0 = sprite.x as GLfloat / self.width as GLfloat;
-                let y0 = sprite.y as GLfloat / self.height as GLfloat;
-                let x1 = (sprite.x + sprite.width) as GLfloat / self.width as GLfloat;
-                let y1 = (sprite.y + sprite.height) as GLfloat / self.height as GLfloat;
-                let verts: [GLfloat; 12] =
-                    [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
-                gles2::BufferData(
-                    gles2::ARRAY_BUFFER,
-                    size_of_val(&verts) as GLsizeiptr,
-                    verts.as_ptr() as *const GLvoid,
-                    gles2::STREAM_DRAW,
-                );
-                gles2::Uniform4f(self.u_rect_loc, x0, y0, x1 - x0, y1 - y0);
-                gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
                 gles2::Disable(gles2::BLEND);
             }
 
