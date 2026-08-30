@@ -3536,6 +3536,17 @@ impl MagnifierWindow {
                 Some(b) => b.min(wait),
             });
         }
+        // Tooltip delay: wake the loop when the tooltip should appear.
+        if self.draw_mode.space_held {
+            if let Some(remaining) = self.draw_mode.tooltip_redraw_after() {
+                if !remaining.is_zero() {
+                    best = Some(match best {
+                        None => remaining,
+                        Some(b) => b.min(remaining),
+                    });
+                }
+            }
+        }
         best
     }
 
@@ -4290,6 +4301,15 @@ impl MagnifierWindow {
             None
         };
 
+        // Tooltip timer: request redraw when tooltip should appear.
+        if self.draw_mode.space_held {
+            if let Some(remaining) = self.draw_mode.tooltip_redraw_after() {
+                if remaining.is_zero() {
+                    self.redraw_pending = true;
+                }
+            }
+        }
+
         if let Some(gpu) = &mut self.gpu {
             let osd = if self.state.osd_visible || notice_fresh {
                 crate::osd::build_osd_sprite(
@@ -5024,6 +5044,14 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         // so panning stays smooth at a capped rate without flooding the
         // compositor with per-event commits.
         window.draw_frame_if_motion_pending(&qh);
+        // Tooltip timer: redraw when the tooltip should appear.
+        if window.draw_mode.space_held {
+            if let Some(remaining) = window.draw_mode.tooltip_redraw_after() {
+                if remaining.is_zero() && !window.redraw_pending {
+                    window.draw_frame(&qh);
+                }
+            }
+        }
         // And a cursor settle may have come due while the pointer rested:
         // fire it so the cursor snaps into grid alignment without needing a
         // further event.

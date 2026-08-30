@@ -37,6 +37,18 @@ impl DrawTool {
             DrawTool::Number => "#",
         }
     }
+    pub fn label_long(self) -> &'static str {
+        match self {
+            DrawTool::Select => "Select",
+            DrawTool::Freehand => "Draw",
+            DrawTool::Erase => "Erase",
+            DrawTool::Line => "Line",
+            DrawTool::Box => "Rectangle",
+            DrawTool::Arrow => "Arrow",
+            DrawTool::Circle => "Circle",
+            DrawTool::Number => "Number",
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -495,26 +507,39 @@ fn brighten(c: [u8; 3], amount: u8) -> [u8; 3] {
     [c[0].saturating_add(amount), c[1].saturating_add(amount), c[2].saturating_add(amount)]
 }
 
+/// Determine which color sector a pixel belongs to, or None if outside the ring.
+fn annulus_sector(px: i32, py: i32, center: f64) -> Option<usize> {
+    let dx = px as f64 + 0.5 - center;
+    let dy = py as f64 + 0.5 - center;
+    let r = dx.hypot(dy);
+    if r < COLOR_INNER_R || r > COLOR_OUTER_R {
+        return None;
+    }
+    let mut angle = dy.atan2(dx);
+    if angle < 0.0 { angle += std::f64::consts::TAU; }
+    let n = COLOR_BUTTONS.len() as f64;
+    let sector = ((angle / std::f64::consts::TAU) * n) as usize;
+    Some(sector.min(COLOR_BUTTONS.len() - 1))
+}
+
 /// Draw the color ring: a thick annulus with wedge-shaped color segments.
+/// Hovered segment gets brightened + white border outline.
 fn draw_color_annulus(buf: &mut [u8], bw: i32, bh: i32, center: f64, hovered_color: Option<[u8; 3]>) {
+    let hovered_sector = hovered_color.and_then(|hc| {
+        COLOR_BUTTONS.iter().position(|(c, _)| *c == hc)
+    });
     let n = COLOR_BUTTONS.len() as f64;
     let y_min = (center - COLOR_OUTER_R - 1.0).floor() as i32;
     let y_max = (center + COLOR_OUTER_R + 1.0).ceil() as i32;
     let x_min = (center - COLOR_OUTER_R - 1.0).floor() as i32;
     let x_max = (center + COLOR_OUTER_R + 1.0).ceil() as i32;
+
+    // Pass 1: fill colors.
     for py in y_min.max(0)..y_max.min(bh) {
         for px in x_min.max(0)..x_max.min(bw) {
-            let dx = px as f64 + 0.5 - center;
-            let dy = py as f64 + 0.5 - center;
-            let r = dx.hypot(dy);
-            if r >= COLOR_INNER_R && r <= COLOR_OUTER_R {
-                let mut angle = dy.atan2(dx);
-                if angle < 0.0 { angle += std::f64::consts::TAU; }
-                let sector = ((angle / std::f64::consts::TAU) * n) as usize;
-                let sector = sector.min(COLOR_BUTTONS.len() - 1);
+            if let Some(sector) = annulus_sector(px, py, center) {
                 let mut color = COLOR_BUTTONS[sector].0;
-                // Brighten the hovered color segment significantly.
-                if hovered_color == Some(color) {
+                if hovered_sector == Some(sector) {
                     color = brighten(color, 70);
                 }
                 let idx = (py as usize * bw as usize + px as usize) * 4;
@@ -522,6 +547,27 @@ fn draw_color_annulus(buf: &mut [u8], bw: i32, bh: i32, center: f64, hovered_col
                 buf[idx+1] = color[1];
                 buf[idx+2] = color[2];
                 buf[idx+3] = 255;
+            }
+        }
+    }
+
+    // Pass 2: white border on hovered segment edges.
+    if let Some(hs) = hovered_sector {
+        for py in y_min.max(0)..y_max.min(bh) {
+            for px in x_min.max(0)..x_max.min(bw) {
+                let here = annulus_sector(px, py, center);
+                if here != Some(hs) { continue; }
+                // Check 4 neighbors — if any is different sector or outside ring, draw white.
+                let is_edge = [(0,1),(0,-1),(1,0),(-1,0)].iter().any(|&(ox, oy)| {
+                    annulus_sector(px + ox, py + oy, center) != Some(hs)
+                });
+                if is_edge {
+                    let idx = (py as usize * bw as usize + px as usize) * 4;
+                    buf[idx] = 255;
+                    buf[idx+1] = 255;
+                    buf[idx+2] = 255;
+                    buf[idx+3] = 255;
+                }
             }
         }
     }
@@ -539,6 +585,11 @@ fn draw_tool_button(buf: &mut [u8], bw: i32, bh: i32, btn: &PieButton, is_hovere
     let bg = if is_hovered { brighten(btn.bg, 80) } else { btn.bg };
     let bg_a = if is_hovered { 255 } else { 220 };
     fill_rounded_rect(buf, bw, bh, x0, y0, rw, rh, cr, [bg[0], bg[1], bg[2], bg_a]);
+
+    // White border when hovered.
+    if is_hovered {
+        stroke_rounded_rect(buf, bw, bh, x0, y0, rw, rh, cr, 3, [255, 255, 255, 255]);
+    }
 
     // Icon centered inside.
     if let Some(icon_name) = btn.icon {
@@ -695,19 +746,43 @@ fn flat_label(layers: &[PieLayer], idx: usize) -> Option<&'static str> {
     None
 }
 
-fn render_pie_menu(current_tool: DrawTool, _current_color: [u8; 3], hovered: Option<usize>, icons: &IconCache) -> OsdSprite {
+fn flat_label_long(layers: &[PieLayer], idx: usize) -> Option<&'static str> {
+    fn color_name(c: [u8; 3]) -> &'static str {
+        match c {
+            [255, 0, 0] => "Red", [255, 140, 0] => "Orange",
+            [255, 255, 0] => "Yellow", [0, 200, 0] => "Green",
+            [0, 150, 255] => "Blue", [140, 0, 255] => "Purple",
+            [255, 255, 255] => "White", [0, 0, 0] => "Black",
+            _ => "Color",
+        }
+    }
+    let mut flat = 0;
+    for layer in layers {
+        for btn in &layer.buttons {
+            if flat == idx {
+                return match btn.action {
+                    PieAction::Tool(t) => Some(t.label_long()),
+                    PieAction::Color(c) => Some(color_name(c)),
+                };
+            }
+            flat += 1;
+        }
+    }
+    None
+}
+
+fn render_pie_menu(
+    current_tool: DrawTool, _current_color: [u8; 3],
+    hovered: Option<usize>, tooltip: Option<&str>,
+    icons: &IconCache,
+) -> OsdSprite {
     let (layers, total_r) = compute_layout(current_tool, _current_color);
     let diameter = (total_r * 2.0).ceil() as i32;
     let mut buf = RgbaBuffer::new(diameter, diameter);
     let center = total_r;
 
-    // Determine which color is hovered (for annulus brightening).
     let hovered_color = hovered.and_then(|idx| {
-        if idx < COLOR_BUTTONS.len() {
-            Some(COLOR_BUTTONS[idx].0)
-        } else {
-            None
-        }
+        if idx < COLOR_BUTTONS.len() { Some(COLOR_BUTTONS[idx].0) } else { None }
     });
 
     // 1. Draw color annulus.
@@ -720,15 +795,40 @@ fn render_pie_menu(current_tool: DrawTool, _current_color: [u8; 3], hovered: Opt
         draw_tool_button(&mut buf.data, diameter, diameter, btn, is_hovered, icons);
     }
 
-    // 3. Center label for hovered item.
-    if let Some(idx) = hovered {
-        if let Some(label) = flat_label(&layers, idx) {
-            let s = 5;
-            let lw = label.len() as i32 * 6 * s;
-            let lh = 8 * s;
-            let tx = center as i32 - lw / 2;
-            let ty = center as i32 - lh / 2;
-            draw_text_scaled(&mut buf.data, diameter, diameter, tx, ty, label, [255, 255, 255], s);
+    // 3. Tooltip: dark pill + white text near the hovered button.
+    if let Some(label) = tooltip {
+        let s = 4;
+        let lw = label.len() as i32 * 6 * s;
+        let lh = 8 * s;
+        let pad_x = 12;
+        let pad_y = 8;
+
+        // Find the hovered button's center position.
+        let btn_center = hovered.and_then(|idx| {
+            if idx < n_colors {
+                None // colors don't get tooltips
+            } else {
+                layers[1].buttons.get(idx - n_colors).map(|b| (b.cx, b.cy))
+            }
+        });
+
+        if let Some((bx, by)) = btn_center {
+            // Position tooltip above the button.
+            let tx = bx as i32 - lw / 2;
+            let ty = by as i32 - TOOL_HH as i32 - lh - pad_y * 2 - 8;
+            let bg_x0 = tx - pad_x;
+            let bg_y0 = ty - pad_y;
+            let bg_w = lw + pad_x * 2;
+            let bg_h = lh + pad_y * 2;
+            fill_rounded_rect(
+                &mut buf.data, diameter, diameter,
+                bg_x0, bg_y0, bg_w, bg_h, 10,
+                [30, 30, 35, 220],
+            );
+            draw_text_scaled(
+                &mut buf.data, diameter, diameter,
+                tx, ty, label, [255, 255, 255], s,
+            );
         }
     }
 
@@ -752,8 +852,13 @@ pub struct DrawModeState {
     pub viewport_size: (i32, i32),
     pub free_cursor_offset: (f64, f64),
     pub cached_pie_sprite: Option<OsdSprite>,
+    cached_tooltip: bool,
     pub selection_style: SelectionStyle,
     icons: IconCache,
+    /// When the current hover started (for tooltip delay).
+    hover_start: Option<std::time::Instant>,
+    /// The hover index when the timer started.
+    hover_timer_idx: Option<usize>,
 }
 
 impl DrawModeState {
@@ -763,9 +868,12 @@ impl DrawModeState {
             annotations: Vec::new(), redo_stack: Vec::new(), next_number: 1,
             drawing: None, drawing_held: false, space_held: false,
             pie_hover: None, viewport_size: (0, 0),
-            free_cursor_offset: (0.0, 0.0), cached_pie_sprite: None,
+            free_cursor_offset: (0.0, 0.0),            cached_pie_sprite: None,
+            cached_tooltip: false,
             selection_style: SelectionStyle::Nearest,
             icons: IconCache::new(),
+            hover_start: None,
+            hover_timer_idx: None,
         }
     }
 
@@ -817,13 +925,56 @@ impl DrawModeState {
         };
         if new_hover != self.pie_hover {
             self.pie_hover = new_hover;
-            self.cached_pie_sprite = None; // invalidate so center label updates
+            self.hover_start = Some(std::time::Instant::now());
+            self.hover_timer_idx = new_hover;
+            self.cached_pie_sprite = None;
+        }
+    }
+
+    /// Check if the current hover has been active long enough for a tooltip.
+    pub fn tooltip_label(&self) -> Option<&'static str> {
+        let idx = self.pie_hover?;
+        let start = self.hover_start?;
+        if self.hover_timer_idx != self.pie_hover {
+            return None; // hover changed, timer reset
+        }
+        if start.elapsed() < std::time::Duration::from_secs(4) {
+            return None; // not yet
+        }
+        let (layers, _) = compute_layout(self.tool, self.color);
+        flat_label_long(&layers, idx)
+    }
+
+    /// Time until the tooltip should appear, if applicable.
+    pub fn tooltip_redraw_after(&self) -> Option<std::time::Duration> {
+        let idx = self.pie_hover?;
+        let start = self.hover_start?;
+        if self.hover_timer_idx != self.pie_hover {
+            return None;
+        }
+        let elapsed = start.elapsed();
+        let delay = std::time::Duration::from_secs(4);
+        if elapsed >= delay {
+            // Tooltip should be visible — but only if cache hasn't been
+            // rebuilt yet. Return None (no redraw needed) if already shown.
+            if self.cached_tooltip { None } else { Some(std::time::Duration::ZERO) }
+        } else {
+            Some(delay - elapsed)
         }
     }
 
     pub fn pie_menu_sprite(&mut self) -> Option<&OsdSprite> {
+        let wants_tooltip = self.tooltip_label().is_some();
+        // Invalidate if tooltip state changed.
+        if self.cached_tooltip != wants_tooltip {
+            self.cached_pie_sprite = None;
+        }
         if self.cached_pie_sprite.is_none() {
-            self.cached_pie_sprite = Some(render_pie_menu(self.tool, self.color, self.pie_hover, &self.icons));
+            let tooltip = self.tooltip_label();
+            self.cached_pie_sprite = Some(render_pie_menu(
+                self.tool, self.color, self.pie_hover, tooltip, &self.icons,
+            ));
+            self.cached_tooltip = wants_tooltip;
         }
         self.cached_pie_sprite.as_ref()
     }

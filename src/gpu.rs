@@ -704,6 +704,16 @@ impl GpuRenderer {
                 );
                 gles2::Uniform4f(self.u_rect_loc, x0, y0, x1 - x0, y1 - y0);
                 gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
+                // Inversion mask for center label text: white pixels
+                // invert the frame underneath (ONE_MINUS_DST_COLOR blend).
+                if let Some(outline) = &sprite.outline {
+                    gles2::TexImage2D(gles2::TEXTURE_2D, 0, gles2::RGBA as GLint, outline.width, outline.height, 0, gles2::RGBA, gles2::UNSIGNED_BYTE, outline.data.as_ptr() as *const GLvoid);
+                    gles2::BlendFuncSeparate(
+                        gles2::ONE_MINUS_DST_COLOR, gles2::ONE_MINUS_SRC_ALPHA,
+                        gles2::ZERO, gles2::ONE,
+                    );
+                    gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
+                }
                 gles2::Disable(gles2::BLEND);
             }
 
