@@ -3,6 +3,8 @@
 ## 1. Project Overview & Scope
 **Maggie** is a native Wayland screen magnifier and utility tool written in **Rust (Edition 2024)**. It is designed to run seamlessly on minimal desktop environments and tiling window managers (such as **Niri**) without relying on legacy X11 layers or fallback architectures.
 
+> **Note (2026-08-30):** Considering renaming the app to **Magshot**. Evaluate before any public release.
+
 ---
 
 ## 2. Core Architecture & Environment
@@ -68,9 +70,32 @@
 
 ---
 
-## 6. Behavior Modes — *Revised*
-* The former **Center Cursor** / **Edge Pan** / **Miniature Window** modes remain **obsolete/removed** in the frozen-frame model; they are pending redefinition or removal. Mode-switch bindings (`Ctrl+C`/`Ctrl+E`/`Ctrl+M`) still exist in code but have no rendering effect.
-* **Cursor-following:** The former "Center Cursor" concept is now the **built-in default behavior** of the frozen viewport — the view follows the live cursor over the frozen frame with the magnified cursor always pinned at the viewport center; near the capture edges the view extends past the frame (black fill). See §3.
+## 6. Behavior Modes — *Implemented*
+Maggie operates in one of three mutually exclusive modes at any time. All modes share the same frozen-frame viewport, zoom controls, and keyboard shortcuts — only input handling and cursor rendering differ.
+
+* **Magnify Mode** (default): The normal, primary mode. The user pans around and zooms the frozen screen image. The magnified system cursor is drawn at the viewport center (the default cursor sprite, nearest-neighbor upscaled by zoom × render scale). LMB pans the view; scroll wheel zooms; hold-to-zoom works as documented in §3. **RMB quits the application** (same as `Q`/`Esc`).
+* **Annotation Mode**: Entered by selecting a tool from the Annotation pie menu (hold **Space**, pick a tool, release). In this mode, **LMB draws** with the selected tool instead of panning — only **MMB drag** pans the view (so drawing stays stable on the content). A **custom crosshair cursor** (white cross with dark outline, transparent center) replaces the system cursor at the viewport center, making it easy to see the precise drawing target. **RMB returns to Magnify Mode** (discards any in-progress drawing). `Q`/`Esc` also return to Magnify Mode (Escape first cancels the pie menu if Space is held). The Annotation pie menu is shown while Space is held; releasing Space activates the highlighted tool/color and enters Annotation Mode.
+* **Capture Mode**: Entered with the screenshot manual key (`G`) or fullscreen key (`F`). The user defines a screenshot selection rectangle over the frozen frame (LMB drag, WASD nudge). A **custom crosshair cursor** (same as Annotation Mode) is shown at the viewport center, replacing the system cursor, so the user can precisely aim the selection. **RMB returns to Magnify Mode** (discards the selection). `Q`/`Esc` also return to Magnify Mode. `Return` saves the screenshot and returns to Magnify Mode. See §8 for full Capture Mode details.
+
+### Cursor Rules by Mode
+| Mode | Cursor | LMB | RMB |
+|------|--------|-----|-----|
+| Magnify | System cursor (magnified) | Pan view | Quit app |
+| Annotation | Crosshair | Draw with tool | Return to Magnify |
+| Capture | Crosshair | Drag selection | Return to Magnify |
+
+### Mode Transitions
+* **→ Magnify**: Always the default on startup. Return from Annotation/Capture via RMB, Escape, or Q.
+* **→ Annotation**: Hold Space → pie menu → release on tool/color.
+* **→ Capture**: Press `G` (manual) or `F` (fullscreen).
+* Annotation and Capture are **mutually exclusive** — entering one cancels the other.
+
+### Crosshair Cursor
+* Rendered as a **white cross** (4 lines: up, down, left, right from center) with a **dark outline** (1 px dark edge around each white line) for visibility against any background. Center is transparent (no center dot).
+* **Fixed size** in capture pixels: 32 px long arms, 2 px arm thickness, 1 px outline. Scaled by zoom × render scale to match the magnified view.
+* Hotspot is at the exact center (16, 16) capture px — the crosshair is always centered at the viewport center.
+* Rendered on both the GPU path (alpha-blended textured quad via sprite shader) and the CPU fallback.
+* Replaces the system cursor in Annotation and Capture modes; the system cursor is restored when returning to Magnify Mode.
 
 ---
 
@@ -161,7 +186,7 @@ The 8 palette colors are selectable via the "colors" layer of the Annotation UI.
 * **Scroll wheel** zooms in/out (works at all times).
 
 ### Rendering
-* Annotations are rendered into a **viewport-sized overlay buffer** at RENDER_SCALE resolution, then composited over the magnified frame by the GPU sprite shader.
+* Annotations are rendered into a **viewport-sized overlay buffer** at logical resolution, then composited over the magnified frame by the GPU sprite shader. **Pan-without-rerender:** the overlay is rendered once at a specific `view_center`. On subsequent frames, if the view has panned but the overlay buffer still covers the visible area, the GPU shifts the texture via a **UV offset uniform** (`u_uv_offset` in a dedicated overlay fragment shader) instead of re-rendering all annotations from scratch. Re-rendering is forced only when annotations change (commit/undo/redo/erase) or the pan exceeds the buffer's coverage. This avoids the per-frame CPU cost of re-rasterizing all annotations on every mouse movement during normal panning. The CPU fallback path re-renders every frame (no GPU UV offset available).
 * The Annotation UI is rendered as an **OSD sprite at logical resolution**, positioned at the viewport center. The GPU shader scales it up to fill the RENDER_SCALE surface. The sprite is **cached** and only rebuilt when the hover state changes (no per-frame rasterization cost).
 * In-progress drawings (while LMB is held) are rendered live in the overlay buffer.
 * All Annotation UI buttons have **3 px rounded-corner borders** (white normally, blue when highlighted) for clear selection indication.

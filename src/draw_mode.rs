@@ -1,9 +1,10 @@
-/// Annotation tools and Annotation UI for the magnified view.
+/// Annotation Mode — a dedicated mode for drawing annotations on the
+/// magnified view.
 ///
-/// There is no "annotation mode" — LMB always draws with the last-used
-/// tool (default: Freehand). Holding Space shows the Annotation UI;
-/// panning pauses and the cursor detaches from center at 1:1 size.
-/// Releasing Space activates the highlighted component.
+/// Activated by selecting a tool from the pie menu (Space). In this mode
+/// mouse movement does not pan the view — only MMB drag pans, so the
+/// user can draw without the screen shifting. LMB draws with the current
+/// tool; RMB exits annotation mode.
 
 use crate::osd::{self, OsdSprite};
 use crate::render::RgbaBuffer;
@@ -88,14 +89,15 @@ impl Annotation {
 #[derive(Debug, Clone)]
 pub struct DrawingInProgress {
     pub tool: DrawTool,
+    pub color: [u8; 3],
     pub start: (f64, f64),
     pub current: (f64, f64),
     pub points: Vec<(f64, f64)>,
 }
 
 impl DrawingInProgress {
-    pub fn new(tool: DrawTool, start: (f64, f64)) -> Self {
-        Self { tool, start, current: start, points: vec![start] }
+    pub fn new(tool: DrawTool, color: [u8; 3], start: (f64, f64)) -> Self {
+        Self { tool, color, start, current: start, points: vec![start] }
     }
 }
 
@@ -202,75 +204,57 @@ fn draw_text_scaled(buf: &mut [u8], bw: i32, bh: i32, x: i32, y: i32, text: &str
     }
 }
 
-/// Render annotations overlay.
-pub fn render_annotations_overlay(
-    annotations: &[Annotation], drawing: Option<&DrawingInProgress>,
-    vp_w: i32, vp_h: i32, view_center: (f64, f64), zoom: f64,
-) -> Option<RgbaBuffer> {
-    if annotations.is_empty() && drawing.is_none() { return None; }
-    let mut buf = RgbaBuffer::new(vp_w, vp_h);
-    let draw_ann = |buf: &mut RgbaBuffer, ann: &Annotation| {
-        let c = ann.color();
-        match ann {
-            Annotation::Freehand { points, width, .. } => {
-                for w in points.windows(2) {
-                    let p0 = capture_to_screen(w[0], view_center, zoom, vp_w, vp_h);
-                    let p1 = capture_to_screen(w[1], view_center, zoom, vp_w, vp_h);
-                    draw_thick_line(&mut buf.data, vp_w, vp_h, p0, p1, *width as f64, c);
-                }
-            }
-            Annotation::Line { start, end, width, .. } => {
-                let p0 = capture_to_screen(*start, view_center, zoom, vp_w, vp_h);
-                let p1 = capture_to_screen(*end, view_center, zoom, vp_w, vp_h);
+/// Render a single annotation into a buffer.
+fn render_one_annotation(
+    buf: &mut RgbaBuffer, vp_w: i32, vp_h: i32,
+    view_center: (f64, f64), zoom: f64, ann: &Annotation,
+) {
+    let c = ann.color();
+    match ann {
+        Annotation::Freehand { points, width, .. } => {
+            for w in points.windows(2) {
+                let p0 = capture_to_screen(w[0], view_center, zoom, vp_w, vp_h);
+                let p1 = capture_to_screen(w[1], view_center, zoom, vp_w, vp_h);
                 draw_thick_line(&mut buf.data, vp_w, vp_h, p0, p1, *width as f64, c);
-            }
-            Annotation::Box { top_left, bottom_right, width, .. } => {
-                let tl = capture_to_screen(*top_left, view_center, zoom, vp_w, vp_h);
-                let br = capture_to_screen(*bottom_right, view_center, zoom, vp_w, vp_h);
-                let (x0,y0) = (tl.0.round() as i32, tl.1.round() as i32);
-                let (x1,y1) = (br.0.round() as i32, br.1.round() as i32);
-                draw_thick_line(&mut buf.data, vp_w, vp_h, (x0 as f64, y0 as f64), (x1 as f64, y0 as f64), *width as f64, c);
-                draw_thick_line(&mut buf.data, vp_w, vp_h, (x1 as f64, y0 as f64), (x1 as f64, y1 as f64), *width as f64, c);
-                draw_thick_line(&mut buf.data, vp_w, vp_h, (x1 as f64, y1 as f64), (x0 as f64, y1 as f64), *width as f64, c);
-                draw_thick_line(&mut buf.data, vp_w, vp_h, (x0 as f64, y1 as f64), (x0 as f64, y0 as f64), *width as f64, c);
-            }
-            Annotation::Arrow { start, end, width, .. } => {
-                let p0 = capture_to_screen(*start, view_center, zoom, vp_w, vp_h);
-                let p1 = capture_to_screen(*end, view_center, zoom, vp_w, vp_h);
-                draw_thick_line(&mut buf.data, vp_w, vp_h, p0, p1, *width as f64, c);
-                let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
-                let len = (dx*dx + dy*dy).sqrt();
-                if len > 1.0 {
-                    let (ux, uy) = (dx/len, dy/len);
-                    let (hl, hw) = (12.0, 6.0);
-                    draw_thick_line(&mut buf.data, vp_w, vp_h, p1, (p1.0-ux*hl+uy*hw, p1.1-uy*hl-ux*hw), *width as f64, c);
-                    draw_thick_line(&mut buf.data, vp_w, vp_h, p1, (p1.0-ux*hl-uy*hw, p1.1-uy*hl+ux*hw), *width as f64, c);
-                }
-            }
-            Annotation::Circle { center, radius, width, .. } => {
-                let sc = capture_to_screen(*center, view_center, zoom, vp_w, vp_h);
-                draw_thick_circle(&mut buf.data, vp_w, vp_h, sc, radius * zoom, *width as f64, c);
-            }
-            Annotation::Number { pos, value, .. } => {
-                let sp = capture_to_screen(*pos, view_center, zoom, vp_w, vp_h);
-                draw_text_scaled(&mut buf.data, vp_w, vp_h, sp.0.round() as i32, sp.1.round() as i32, &format!("{value}"), c, 1);
             }
         }
-    };
-    for ann in annotations { draw_ann(&mut buf, ann); }
-    if let Some(d) = drawing {
-        match d.tool {
-            DrawTool::Freehand => { for w in d.points.windows(2) { let p0=capture_to_screen(w[0],view_center,zoom,vp_w,vp_h); let p1=capture_to_screen(w[1],view_center,zoom,vp_w,vp_h); draw_thick_line(&mut buf.data,vp_w,vp_h,p0,p1,2.0f64,[255,0,0]); } }
-            DrawTool::Erase => { for w in d.points.windows(2) { let p0=capture_to_screen(w[0],view_center,zoom,vp_w,vp_h); let p1=capture_to_screen(w[1],view_center,zoom,vp_w,vp_h); draw_thick_line(&mut buf.data,vp_w,vp_h,p0,p1,10.0f64,[255,255,255]); } }
-            DrawTool::Line => { let p0=capture_to_screen(d.start,view_center,zoom,vp_w,vp_h); let p1=capture_to_screen(d.current,view_center,zoom,vp_w,vp_h); draw_thick_line(&mut buf.data,vp_w,vp_h,p0,p1,2.0f64,[255,0,0]); }
-            DrawTool::Box => { let tl=capture_to_screen(d.start,view_center,zoom,vp_w,vp_h); let br=capture_to_screen(d.current,view_center,zoom,vp_w,vp_h); let(x0,y0)=(tl.0.round() as i32,tl.1.round() as i32); let(x1,y1)=(br.0.round() as i32,br.1.round() as i32); draw_thick_line(&mut buf.data,vp_w,vp_h,(x0 as f64,y0 as f64),(x1 as f64,y0 as f64),2.0f64,[255,0,0]); draw_thick_line(&mut buf.data,vp_w,vp_h,(x1 as f64,y0 as f64),(x1 as f64,y1 as f64),2.0f64,[255,0,0]); draw_thick_line(&mut buf.data,vp_w,vp_h,(x1 as f64,y1 as f64),(x0 as f64,y1 as f64),2.0f64,[255,0,0]); draw_thick_line(&mut buf.data,vp_w,vp_h,(x0 as f64,y1 as f64),(x0 as f64,y0 as f64),2.0f64,[255,0,0]); }
-            DrawTool::Arrow => { let p0=capture_to_screen(d.start,view_center,zoom,vp_w,vp_h); let p1=capture_to_screen(d.current,view_center,zoom,vp_w,vp_h); draw_thick_line(&mut buf.data,vp_w,vp_h,p0,p1,2.0f64,[255,0,0]); let(dx,dy)=(p1.0-p0.0,p1.1-p0.1); let len=(dx*dx+dy*dy).sqrt(); if len>1.0 { let(ux,uy)=(dx/len,dy/len); let(hl,hw)=(12.0,6.0); draw_thick_line(&mut buf.data,vp_w,vp_h,p1,(p1.0-ux*hl+uy*hw,p1.1-uy*hl-ux*hw),2.0f64,[255,0,0]); draw_thick_line(&mut buf.data,vp_w,vp_h,p1,(p1.0-ux*hl-uy*hw,p1.1-uy*hl+ux*hw),2.0f64,[255,0,0]); } }
-            DrawTool::Circle => { let sc=capture_to_screen(d.start,view_center,zoom,vp_w,vp_h); let(dx,dy)=(d.current.0-d.start.0,d.current.1-d.start.1); draw_thick_circle(&mut buf.data,vp_w,vp_h,sc,((dx*dx+dy*dy).sqrt())*zoom,2.0f64,[255,0,0]); }
-            DrawTool::Number => { let sp=capture_to_screen(d.start,view_center,zoom,vp_w,vp_h); draw_text_scaled(&mut buf.data,vp_w,vp_h,sp.0.round() as i32,sp.1.round() as i32,"#?",[255,0,0],1); }
-            DrawTool::Select => {}
+        Annotation::Line { start, end, width, .. } => {
+            let p0 = capture_to_screen(*start, view_center, zoom, vp_w, vp_h);
+            let p1 = capture_to_screen(*end, view_center, zoom, vp_w, vp_h);
+            draw_thick_line(&mut buf.data, vp_w, vp_h, p0, p1, *width as f64, c);
+        }
+        Annotation::Box { top_left, bottom_right, width, .. } => {
+            let tl = capture_to_screen(*top_left, view_center, zoom, vp_w, vp_h);
+            let br = capture_to_screen(*bottom_right, view_center, zoom, vp_w, vp_h);
+            let (x0,y0) = (tl.0.round() as i32, tl.1.round() as i32);
+            let (x1,y1) = (br.0.round() as i32, br.1.round() as i32);
+            draw_thick_line(&mut buf.data, vp_w, vp_h, (x0 as f64, y0 as f64), (x1 as f64, y0 as f64), *width as f64, c);
+            draw_thick_line(&mut buf.data, vp_w, vp_h, (x1 as f64, y0 as f64), (x1 as f64, y1 as f64), *width as f64, c);
+            draw_thick_line(&mut buf.data, vp_w, vp_h, (x1 as f64, y1 as f64), (x0 as f64, y1 as f64), *width as f64, c);
+            draw_thick_line(&mut buf.data, vp_w, vp_h, (x0 as f64, y1 as f64), (x0 as f64, y0 as f64), *width as f64, c);
+        }
+        Annotation::Arrow { start, end, width, .. } => {
+            let p0 = capture_to_screen(*start, view_center, zoom, vp_w, vp_h);
+            let p1 = capture_to_screen(*end, view_center, zoom, vp_w, vp_h);
+            draw_thick_line(&mut buf.data, vp_w, vp_h, p0, p1, *width as f64, c);
+            let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
+            let len = (dx*dx + dy*dy).sqrt();
+            if len > 1.0 {
+                let (ux, uy) = (dx/len, dy/len);
+                let (hl, hw) = (12.0, 6.0);
+                draw_thick_line(&mut buf.data, vp_w, vp_h, p1, (p1.0-ux*hl+uy*hw, p1.1-uy*hl-ux*hw), *width as f64, c);
+                draw_thick_line(&mut buf.data, vp_w, vp_h, p1, (p1.0-ux*hl-uy*hw, p1.1-uy*hl+ux*hw), *width as f64, c);
+            }
+        }
+        Annotation::Circle { center, radius, width, .. } => {
+            let sc = capture_to_screen(*center, view_center, zoom, vp_w, vp_h);
+            draw_thick_circle(&mut buf.data, vp_w, vp_h, sc, radius * zoom, *width as f64, c);
+        }
+        Annotation::Number { pos, value, .. } => {
+            let sp = capture_to_screen(*pos, view_center, zoom, vp_w, vp_h);
+            draw_text_scaled(&mut buf.data, vp_w, vp_h, sp.0.round() as i32, sp.1.round() as i32, &format!("{value}"), c, 1);
         }
     }
-    Some(buf)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -836,6 +820,61 @@ fn render_pie_menu(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Erase helpers
+// ═══════════════════════════════════════════════════════════════════
+
+/// Minimum distance from a point to a line segment (in capture px).
+fn point_to_segment_dist(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len_sq = dx * dx + dy * dy;
+    let t = if len_sq < 1e-12 {
+        0.0
+    } else {
+        ((px - ax) * dx + (py - ay) * dy) / len_sq
+    };
+    let t = t.clamp(0.0, 1.0);
+    let proj_x = ax + t * dx;
+    let proj_y = ay + t * dy;
+    ((px - proj_x).powi(2) + (py - proj_y).powi(2)).sqrt()
+}
+
+/// Check if a single erase point is within `radius` of an annotation.
+fn point_near_annotation(px: f64, py: f64, ann: &Annotation, radius: f64) -> bool {
+    match ann {
+        Annotation::Freehand { points, .. } => {
+            points.windows(2).any(|w| point_to_segment_dist(px, py, w[0].0, w[0].1, w[1].0, w[1].1) < radius)
+        }
+        Annotation::Line { start, end, .. } => {
+            point_to_segment_dist(px, py, start.0, start.1, end.0, end.1) < radius
+        }
+        Annotation::Box { top_left, bottom_right, .. } => {
+            let (x0, y0) = top_left;
+            let (x1, y1) = bottom_right;
+            point_to_segment_dist(px, py, *x0, *y0, *x1, *y0) < radius
+                || point_to_segment_dist(px, py, *x1, *y0, *x1, *y1) < radius
+                || point_to_segment_dist(px, py, *x1, *y1, *x0, *y1) < radius
+                || point_to_segment_dist(px, py, *x0, *y1, *x0, *y0) < radius
+        }
+        Annotation::Arrow { start, end, .. } => {
+            point_to_segment_dist(px, py, start.0, start.1, end.0, end.1) < radius
+        }
+        Annotation::Circle { center, radius: r, .. } => {
+            let dist = ((px - center.0).powi(2) + (py - center.1).powi(2)).sqrt();
+            (dist - r).abs() < radius
+        }
+        Annotation::Number { pos, .. } => {
+            ((px - pos.0).powi(2) + (py - pos.1).powi(2)).sqrt() < radius
+        }
+    }
+}
+
+/// Check if any erase stroke point is near an annotation.
+fn annotation_intersects_stroke(ann: &Annotation, stroke: &[(f64, f64)], radius: f64) -> bool {
+    stroke.iter().any(|&(px, py)| point_near_annotation(px, py, ann, radius))
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // State
 // ═══════════════════════════════════════════════════════════════════
 
@@ -859,6 +898,20 @@ pub struct DrawModeState {
     hover_start: Option<std::time::Instant>,
     /// The hover index when the timer started.
     hover_timer_idx: Option<usize>,
+    /// Whether an annotation tool is active (selected from pie menu).
+    /// LMB drawing is only allowed when this is true.
+    pub annotation_active: bool,
+
+    /// The (view_center, zoom, vp_w, vp_h) the cached overlay was rendered at.
+    overlay_view_key: Option<((f64, f64), f64, i32, i32)>,
+    /// Index into annotations vec — how many were rendered in the cache.
+    overlay_annotation_count: usize,
+    /// Number of points rendered in the current drawing's overlay cache.
+    overlay_drawing_points: usize,
+    /// Monotonically increasing version counter, bumped on every annotation
+    /// change (commit, undo, redo, erase). The engine uses this to detect
+    /// when the overlay needs re-rendering vs. GPU UV offset shift.
+    overlay_version: u64,
 }
 
 impl DrawModeState {
@@ -874,6 +927,12 @@ impl DrawModeState {
             icons: IconCache::new(),
             hover_start: None,
             hover_timer_idx: None,
+            annotation_active: false,
+
+            overlay_view_key: None,
+            overlay_annotation_count: 0,
+            overlay_drawing_points: 0,
+            overlay_version: 0,
         }
     }
 
@@ -896,6 +955,7 @@ impl DrawModeState {
                             PieAction::Tool(t) => self.tool = t,
                             PieAction::Color(c) => self.color = c,
                         }
+                        self.annotation_active = true;
                         break 'outer;
                     }
                     flat += 1;
@@ -915,6 +975,14 @@ impl DrawModeState {
         self.pie_hover = None;
         self.free_cursor_offset = (0.0, 0.0);
         self.cached_pie_sprite = None;
+        self.annotation_active = false;
+    }
+
+    /// Exit annotation mode (e.g. via Escape).
+    pub fn deactivate_annotation(&mut self) {
+        self.annotation_active = false;
+        self.drawing = None;
+        self.drawing_held = false;
     }
 
     pub fn update_pie_hover(&mut self, cursor_offset: (f64, f64)) {
@@ -938,7 +1006,7 @@ impl DrawModeState {
         if self.hover_timer_idx != self.pie_hover {
             return None; // hover changed, timer reset
         }
-        if start.elapsed() < std::time::Duration::from_secs(4) {
+        if start.elapsed() < std::time::Duration::from_secs(1) {
             return None; // not yet
         }
         let (layers, _) = compute_layout(self.tool, self.color);
@@ -953,11 +1021,9 @@ impl DrawModeState {
             return None;
         }
         let elapsed = start.elapsed();
-        let delay = std::time::Duration::from_secs(4);
+        let delay = std::time::Duration::from_secs(1);
         if elapsed >= delay {
-            // Tooltip should be visible — but only if cache hasn't been
-            // rebuilt yet. Return None (no redraw needed) if already shown.
-            if self.cached_tooltip { None } else { Some(std::time::Duration::ZERO) }
+            Some(std::time::Duration::ZERO)
         } else {
             Some(delay - elapsed)
         }
@@ -979,12 +1045,107 @@ impl DrawModeState {
         self.cached_pie_sprite.as_ref()
     }
 
+    /// Render annotations overlay into an external buffer.
+    /// - Annotations are rendered once into the canvas.
+    /// - Freehand drawing appends segments incrementally.
+    /// - Non-freehand drawing clears only the dirty region and redraws.
+    /// The overlay is at logical (viewport) resolution — the GPU upscales
+    /// it via LINEAR filtering. This avoids the RENDER_SCALE mismatch and
+    /// reduces buffer size by 4×.
+    pub fn annotations_overlay(
+        &mut self,
+        target: &mut Option<RgbaBuffer>,
+        vp_w: i32, vp_h: i32,
+        view_center: (f64, f64), zoom: f64,
+    ) {
+        let key = (view_center, zoom, vp_w, vp_h);
+        let n_ann = self.annotations.len();
+        let is_freehand = self.drawing.as_ref().map_or(false, |d| d.tool == DrawTool::Freehand);
+        let anns_changed = self.overlay_view_key != Some(key)
+            || self.overlay_annotation_count != n_ann;
+
+        // Allocate or resize the canvas if needed.
+        let canvas_ok = target.as_ref().map_or(false, |b| b.width == vp_w && b.height == vp_h);
+        if !canvas_ok {
+            *target = Some(RgbaBuffer::new(vp_w, vp_h));
+        }
+
+        if anns_changed {
+            // Re-render all annotations into the persistent canvas.
+            if let Some(buf) = target {
+                buf.data.fill(0);
+                for ann in &self.annotations {
+                    render_one_annotation(buf, vp_w, vp_h, view_center, zoom, ann);
+                }
+            }
+            self.overlay_view_key = Some(key);
+            self.overlay_annotation_count = n_ann;
+            self.overlay_drawing_points = 0;
+        }
+
+        // Drawing in progress.
+        if let Some(ref d) = self.drawing {
+            if let Some(buf) = target {
+                if is_freehand {
+                    // Incremental: append only new segments.
+                    let n_existing = self.overlay_drawing_points;
+                    let n_total = d.points.len();
+                    if n_total > n_existing && n_existing > 0 {
+                        for i in (n_existing - 1)..(n_total - 1) {
+                            let p0 = capture_to_screen(d.points[i], view_center, zoom, vp_w, vp_h);
+                            let p1 = capture_to_screen(d.points[i + 1], view_center, zoom, vp_w, vp_h);
+                            draw_thick_line(&mut buf.data, vp_w, vp_h, p0, p1, 2.0, d.color);
+                        }
+                    } else if n_total > 0 && n_existing == 0 {
+                        for w in d.points.windows(2) {
+                            let p0 = capture_to_screen(w[0], view_center, zoom, vp_w, vp_h);
+                            let p1 = capture_to_screen(w[1], view_center, zoom, vp_w, vp_h);
+                            draw_thick_line(&mut buf.data, vp_w, vp_h, p0, p1, 2.0, d.color);
+                        }
+                    }
+                    self.overlay_drawing_points = n_total;
+                } else {
+                    // Non-freehand: clear dirty region and redraw shape.
+                    let (x0, y0, x1, y1) = drawing_bounds(d, view_center, zoom, vp_w, vp_h);
+                    clear_region(&mut buf.data, vp_w, vp_h, x0, y0, x1, y1);
+                    render_drawing_preview(buf, vp_w, vp_h, view_center, zoom, d);
+                }
+            }
+        }
+    }
+
+    /// Invalidate the overlay cache (call when drawing is committed or view changes).
+    pub fn invalidate_overlay(&mut self) {
+        self.overlay_view_key = None;
+        self.overlay_annotation_count = 0;
+        self.overlay_drawing_points = 0;
+    }
+
+    /// Return the current overlay version counter. Bumped on every annotation
+    /// change (commit, undo, redo, erase). The engine uses this to detect
+    /// when the overlay needs re-rendering vs. GPU UV offset shift.
+    pub fn overlay_version(&self) -> u64 {
+        self.overlay_version
+    }
+
     pub fn commit_drawing(&mut self) {
         if let Some(d) = self.drawing.take() {
             let (c, w) = (self.color, 2.0);
             let ann = match d.tool {
                 DrawTool::Freehand => Annotation::Freehand { points: d.points, color: c, width: w },
-                DrawTool::Erase => return,
+                DrawTool::Erase => {
+                    // Erase: remove annotations that intersect the erase stroke.
+                    let stroke: Vec<_> = d.points.iter().map(|p| *p).collect();
+                    let erase_radius = 10.0; // capture pixels
+                    let before = self.annotations.len();
+                    self.annotations.retain(|ann| {
+                        !annotation_intersects_stroke(ann, &stroke, erase_radius)
+                    });
+                    if self.annotations.len() != before {
+                        self.overlay_version = self.overlay_version.wrapping_add(1);
+                    }
+                    return;
+                }
                 DrawTool::Line => Annotation::Line { start: d.start, end: d.current, color: c, width: w },
                 DrawTool::Box => Annotation::Box { top_left: (d.start.0.min(d.current.0), d.start.1.min(d.current.1)), bottom_right: (d.start.0.max(d.current.0), d.start.1.max(d.current.1)), color: c, width: w },
                 DrawTool::Arrow => Annotation::Arrow { start: d.start, end: d.current, color: c, width: w },
@@ -994,13 +1155,17 @@ impl DrawModeState {
             };
             self.redo_stack.clear();
             self.annotations.push(ann);
+            self.overlay_version = self.overlay_version.wrapping_add(1);
         }
+        self.invalidate_overlay();
     }
 
     pub fn undo(&mut self) {
         if let Some(ann) = self.annotations.pop() {
             if let Annotation::Number { value, .. } = ann { if value < self.next_number { self.next_number = value; } }
             self.redo_stack.push(ann);
+            self.overlay_version = self.overlay_version.wrapping_add(1);
+            self.invalidate_overlay();
         }
     }
 
@@ -1008,6 +1173,106 @@ impl DrawModeState {
         if let Some(ann) = self.redo_stack.pop() {
             if let Annotation::Number { value, .. } = ann { if value >= self.next_number { self.next_number = value + 1; } }
             self.annotations.push(ann);
+            self.overlay_version = self.overlay_version.wrapping_add(1);
+            self.invalidate_overlay();
         }
+    }
+}
+
+/// Clear a rectangular region in a buffer to transparent.
+fn clear_region(data: &mut [u8], vp_w: i32, vp_h: i32, x0: i32, y0: i32, x1: i32, y1: i32) {
+    let x0 = x0.max(0) as usize;
+    let y0 = y0.max(0) as usize;
+    let x1 = (x1 as usize).min(vp_w as usize);
+    let y1 = (y1 as usize).min(vp_h as usize);
+    for y in y0..y1 {
+        let start = (y * vp_w as usize + x0) * 4;
+        let end = (y * vp_w as usize + x1) * 4;
+        data[start..end].fill(0);
+    }
+}
+
+/// Compute bounding box of a drawing in screen coordinates.
+fn drawing_bounds(d: &DrawingInProgress, view_center: (f64, f64), zoom: f64, vp_w: i32, vp_h: i32) -> (i32, i32, i32, i32) {
+    let pad = 20; // extra pixels for line thickness
+    match d.tool {
+        DrawTool::Freehand => (0, 0, 0, 0), // handled incrementally
+        DrawTool::Line | DrawTool::Arrow => {
+            let p0 = capture_to_screen(d.start, view_center, zoom, vp_w, vp_h);
+            let p1 = capture_to_screen(d.current, view_center, zoom, vp_w, vp_h);
+            let x0 = (p0.0.min(p1.0) as i32) - pad;
+            let y0 = (p0.1.min(p1.1) as i32) - pad;
+            let x1 = (p0.0.max(p1.0) as i32) + pad;
+            let y1 = (p0.1.max(p1.1) as i32) + pad;
+            (x0, y0, x1, y1)
+        }
+        DrawTool::Box => {
+            let tl = capture_to_screen(d.start, view_center, zoom, vp_w, vp_h);
+            let br = capture_to_screen(d.current, view_center, zoom, vp_w, vp_h);
+            let x0 = (tl.0.min(br.0) as i32) - pad;
+            let y0 = (tl.1.min(br.1) as i32) - pad;
+            let x1 = (tl.0.max(br.0) as i32) + pad;
+            let y1 = (tl.1.max(br.1) as i32) + pad;
+            (x0, y0, x1, y1)
+        }
+        DrawTool::Circle => {
+            let sc = capture_to_screen(d.start, view_center, zoom, vp_w, vp_h);
+            let (dx, dy) = (d.current.0 - d.start.0, d.current.1 - d.start.1);
+            let r = ((dx * dx + dy * dy).sqrt() * zoom) as i32 + pad;
+            (sc.0 as i32 - r, sc.1 as i32 - r, sc.0 as i32 + r, sc.1 as i32 + r)
+        }
+        DrawTool::Number => {
+            let sp = capture_to_screen(d.start, view_center, zoom, vp_w, vp_h);
+            let s = 20;
+            (sp.0 as i32 - s, sp.1 as i32 - s, sp.0 as i32 + s, sp.1 as i32 + s)
+        }
+        _ => (0, 0, 0, 0),
+    }
+}
+
+/// Render a non-freehand drawing preview (Line, Box, Arrow, Circle, Number).
+fn render_drawing_preview(
+    buf: &mut RgbaBuffer, vp_w: i32, vp_h: i32,
+    view_center: (f64, f64), zoom: f64, d: &DrawingInProgress,
+) {
+    match d.tool {
+        DrawTool::Line => {
+            let p0 = capture_to_screen(d.start, view_center, zoom, vp_w, vp_h);
+            let p1 = capture_to_screen(d.current, view_center, zoom, vp_w, vp_h);
+            draw_thick_line(&mut buf.data, vp_w, vp_h, p0, p1, 2.0, d.color);
+        }
+        DrawTool::Box => {
+            let tl = capture_to_screen(d.start, view_center, zoom, vp_w, vp_h);
+            let br = capture_to_screen(d.current, view_center, zoom, vp_w, vp_h);
+            let (x0,y0) = (tl.0.round() as i32, tl.1.round() as i32);
+            let (x1,y1) = (br.0.round() as i32, br.1.round() as i32);
+            draw_thick_line(&mut buf.data, vp_w, vp_h, (x0 as f64, y0 as f64), (x1 as f64, y0 as f64), 2.0, d.color);
+            draw_thick_line(&mut buf.data, vp_w, vp_h, (x1 as f64, y0 as f64), (x1 as f64, y1 as f64), 2.0, d.color);
+            draw_thick_line(&mut buf.data, vp_w, vp_h, (x1 as f64, y1 as f64), (x0 as f64, y1 as f64), 2.0, d.color);
+            draw_thick_line(&mut buf.data, vp_w, vp_h, (x0 as f64, y1 as f64), (x0 as f64, y0 as f64), 2.0, d.color);
+        }
+        DrawTool::Arrow => {
+            let p0 = capture_to_screen(d.start, view_center, zoom, vp_w, vp_h);
+            let p1 = capture_to_screen(d.current, view_center, zoom, vp_w, vp_h);
+            draw_thick_line(&mut buf.data, vp_w, vp_h, p0, p1, 2.0, d.color);
+            let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
+            let len = (dx*dx + dy*dy).sqrt();
+            if len > 1.0 {
+                let (ux, uy) = (dx/len, dy/len);
+                let (hl, hw) = (12.0, 6.0);
+                draw_thick_line(&mut buf.data, vp_w, vp_h, p1, (p1.0-ux*hl+uy*hw, p1.1-uy*hl-ux*hw), 2.0, d.color);
+                draw_thick_line(&mut buf.data, vp_w, vp_h, p1, (p1.0-ux*hl-uy*hw, p1.1-uy*hl+ux*hw), 2.0, d.color);
+            }
+        }
+        DrawTool::Circle => {
+            let sc = capture_to_screen(d.start, view_center, zoom, vp_w, vp_h);
+            let (dx,dy) = (d.current.0-d.start.0, d.current.1-d.start.1);
+            draw_thick_circle(&mut buf.data, vp_w, vp_h, sc, ((dx*dx+dy*dy).sqrt())*zoom, 2.0, d.color);
+        }
+        DrawTool::Number => {
+            let sp = capture_to_screen(d.start, view_center, zoom, vp_w, vp_h);
+            draw_text_scaled(&mut buf.data, vp_w, vp_h, sp.0.round() as i32, sp.1.round() as i32, "#?", d.color, 1);
+        }
+        _ => {}
     }
 }

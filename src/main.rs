@@ -26,6 +26,13 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Panic hook: log to stderr so panics are visible.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("PANIC: {info}");
+        default_hook(info);
+    }));
+
     // The log filter honours `RUST_LOG` (e.g. `RUST_LOG=maggie=debug maggie`),
     // falling back to `maggie=info` when it is unset/empty/invalid — note
     // that `try_from_default_env()` returns an *empty* (all-silent) filter for

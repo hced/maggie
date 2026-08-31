@@ -91,6 +91,18 @@ impl MagnifiedCursor {
         (self.base.clone(), self.hotspot)
     }
 
+    /// Render the crosshair cursor for Annotation/Capture modes. Returns
+    /// the crosshair sprite and its hotspot in sprite-pixel coordinates.
+    /// The crosshair is built once and cached per scale factor, like the
+    /// normal cursor sprite.
+    pub fn crosshair_sprite(&mut self, scale: f64) -> (RgbaBuffer, (f64, f64)) {
+        let cross = build_crosshair();
+        let factor = self.zoom * scale;
+        let sprite = cross.nearest_neighbor_scale(factor);
+        let hotspot = (16.0 * factor, 16.0 * factor);
+        (sprite, hotspot)
+    }
+
     /// Convenience for tests: build a `MagnifiedCursor` from an explicit image
     /// (also used by the engine tests, hence `pub(crate)`).
     #[cfg(test)]
@@ -135,6 +147,54 @@ fn build_reticle(base_size: i32) -> RgbaBuffer {
             let dy = (y - center_y).abs();
             if dx < center_half && dy < center_half {
                 buffer.set_pixel(x, y, [0, 0, 0, 255]);
+            }
+        }
+    }
+
+    buffer
+}
+
+/// Crosshair cursor for Annotation and Capture modes: a white cross with
+/// dark outline, transparent center. Fixed size in capture pixels (32 px
+/// long arms, 2 px arm thickness, 1 px outline), scaled by zoom × render
+/// scale to match the magnified view. Hotspot at exact center (16, 16).
+fn build_crosshair() -> RgbaBuffer {
+    let size = 32;
+    let half = size / 2;
+    let arm_thickness = 2; // white arm width in capture px
+    let outline = 1;       // dark outline around each arm
+    let mut buffer = RgbaBuffer::new(size, size);
+
+    // Draw the cross: 4 arms (up, down, left, right) from center.
+    // Each arm is a white rectangle with a 1-px dark outline.
+    for y in 0..size {
+        for x in 0..size {
+            let dx = (x as i32 - half as i32).abs();
+            let dy = (y as i32 - half as i32).abs();
+
+            // Horizontal arm (left/right from center)
+            let in_h_arm = dy < arm_thickness as i32 / 2 + 1
+                && dx >= outline as i32
+                && dx < (half as i32 - outline as i32);
+            // Vertical arm (up/down from center)
+            let in_v_arm = dx < arm_thickness as i32 / 2 + 1
+                && dy >= outline as i32
+                && dy < (half as i32 - outline as i32);
+            // Outline of horizontal arm
+            let on_h_outline = dy < arm_thickness as i32 / 2 + 1 + outline as i32
+                && dx >= outline as i32 - 1
+                && dx < half as i32;
+            // Outline of vertical arm
+            let on_v_outline = dx < arm_thickness as i32 / 2 + 1 + outline as i32
+                && dy >= outline as i32 - 1
+                && dy < half as i32;
+
+            if in_h_arm || in_v_arm {
+                // White arm interior
+                buffer.set_pixel(x, y, [255, 255, 255, 255]);
+            } else if on_h_outline || on_v_outline {
+                // Dark outline
+                buffer.set_pixel(x, y, [0, 0, 0, 200]);
             }
         }
     }

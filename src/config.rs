@@ -26,6 +26,14 @@ fn default_reset_zoom() -> String {
     "r".to_string()
 }
 
+fn default_mode_annotation() -> String {
+    "Control-a".to_string()
+}
+
+fn default_mode_capture() -> String {
+    "Control-c".to_string()
+}
+
 /// Default screen corner for the OSD legend.
 fn default_osd_corner() -> crate::osd::Corner {
     crate::osd::Corner::TopLeft
@@ -290,9 +298,10 @@ pub struct Keybindings {
     pub screenshot_fullscreen: String,
     pub config_window: String,
     pub anti_aliasing: String,
-    pub mode_center_cursor: String,
-    pub mode_edge_pan: String,
-    pub mode_miniature: String,
+    #[serde(default = "default_mode_annotation")]
+    pub mode_annotation: String,
+    #[serde(default = "default_mode_capture")]
+    pub mode_capture: String,
     /// Reset the zoom back to `default_zoom`. Defaults to "r" for config
     /// files written before it existed. (When the hold-to-zoom binding is
     /// "MMB", the middle mouse button arms hold-to-zoom instead of resetting;
@@ -342,9 +351,8 @@ impl Default for MagnifierConfig {
                 screenshot_fullscreen: "f".to_string(),
                 config_window: "Tab".to_string(),
                 anti_aliasing: "a".to_string(),
-                mode_center_cursor: "Control-c".to_string(),
-                mode_edge_pan: "Control-e".to_string(),
-                mode_miniature: "Control-m".to_string(),
+                mode_annotation: "Control-a".to_string(),
+                mode_capture: "Control-c".to_string(),
                 reset_zoom: "r".to_string(),
                 toggle_cursor: "c".to_string(),
                 hold_to_zoom: "MMB".to_string(),

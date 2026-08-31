@@ -1567,7 +1567,7 @@ fn blend_overlay_into(
 ) {
     for y in 0..height {
         for x in 0..width {
-            let di = (((y + oy) as usize) * (stride as usize) + (x + ox) as usize) * 4;
+            let di = ((y + oy) as usize) * (stride as usize) + ((x + ox) as usize) * 4;
             let si = (y as usize * width as usize + x as usize) * 4;
             let a = overlay[si + 3] as f32 / 255.0;
             if a <= 0.0 {
@@ -1603,17 +1603,21 @@ const BTN_MIDDLE: u32 = 0x112;
 /// resetting the zoom.
 const MMB_HTZ: &str = "MMB";
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum MagnifierMode {
-    CenterCursor,
-    EdgePan,
-    MiniatureWindow,
+/// The three mutually exclusive interaction modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppMode {
+    /// Normal magnifier: pan and zoom the frozen screen image.
+    Magnify,
+    /// Drawing annotations on the magnified view.
+    Annotation,
+    /// Defining a screenshot selection region.
+    Capture,
 }
 
 pub struct MagnifierState {
     pub config: MagnifierConfig,
     pub zoom: f64,
-    pub mode: MagnifierMode,
+    pub mode: AppMode,
     pub osd_visible: bool,
     /// Whether the magnified cursor sprite is drawn inside the viewport
     /// (toggled with the `toggle_cursor` key; independent of the hardware
@@ -1639,7 +1643,7 @@ impl MagnifierState {
         MagnifierState {
             config,
             zoom,
-            mode: MagnifierMode::CenterCursor,
+            mode: AppMode::Magnify,
             osd_visible,
             cursor_visible: true,
             renderer,
@@ -1707,7 +1711,7 @@ impl MagnifierState {
         self.cursor_visible = !self.cursor_visible;
     }
 
-    pub fn switch_mode(&mut self, mode: MagnifierMode) {
+    pub fn switch_mode(&mut self, mode: AppMode) {
         self.mode = mode;
         tracing::info!("Mode switched to {:?}", mode);
     }
@@ -1906,6 +1910,26 @@ pub struct MagnifierWindow {
     cursor_was_visible: bool,
     /// Draw Mode state: vector annotation overlay activated by LMB.
     draw_mode: crate::draw_mode::DrawModeState,
+    /// Whether MMB drag is currently panning the view in Annotation Mode.
+    /// When annotation_active, normal mouse movement does not pan — only
+    /// MMB drag pans the view, so the user can draw without the screen
+    /// shifting under them.
+    mmb_pan_active: bool,
+    /// Rendered draw-mode annotation overlay at logical resolution.
+    /// Populated by `draw_mode.annotations_overlay()` each frame;
+    /// composited by the GPU sprite shader or the CPU blend path.
+    draw_overlay: Option<RgbaBuffer>,
+    /// The view_center at which the draw_overlay was last rendered.
+    /// Used to compute the GPU UV offset for pan-without-rerender.
+    overlay_rendered_center: Option<(f64, f64)>,
+    /// The GPU UV offset applied to the annotation overlay texture.
+    /// (0.0, 0.0) when the overlay was just rendered; nonzero when
+    /// the view has panned but the overlay hasn't been re-rendered.
+    overlay_gpu_uv_offset: (f32, f32),
+    /// The annotation version (count of annotations + drawing state) at
+    /// which the overlay was last rendered. Used to detect when annotations
+    /// have changed and the overlay needs re-rendering.
+    overlay_annotation_version: u64,
 }
 
 struct ScreencastManagerData;
@@ -2161,6 +2185,7 @@ impl CompositorHandler for MagnifierWindow {
 
 impl LayerShellHandler for MagnifierWindow {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
+        tracing::debug!("Exit due to layer surface closed");
         self.exit = true;
     }
 
@@ -2387,7 +2412,7 @@ impl PointerHandler for MagnifierWindow {
                         self.pointer_position_f = position;
                         self.state.pointer_position = (position.0 as i32, position.1 as i32);
                         // Update in-progress drawing (capture px) while LMB is held.
-                        if self.draw_mode.drawing.is_some() {
+                        if self.draw_mode.annotation_active && self.draw_mode.drawing.is_some() {
                             let (sx, sy) = self.capture_scale();
                             let cap = (position.0 * sx, position.1 * sy);
                             if let Some(ref mut drawing) = self.draw_mode.drawing {
@@ -2397,6 +2422,16 @@ impl PointerHandler for MagnifierWindow {
                                 }
                             }
                         }
+                        // Panning pauses while LMB is held (drawing) so the
+                        // drawn lines stay fixed on the content. In
+                        // Annotation Mode, panning is also suppressed — only
+                        // MMB drag pans the view (hold-to-zoom is allowed
+                        // through since it is a deliberate, explicit action).
+                        let can_pan = !self.draw_mode.drawing_held
+                            && (!self.draw_mode.annotation_active
+                                || self.mmb_pan_active
+                                || self.hold_to_zoom_active);
+                        if can_pan {
                         // Shift modifier slows down panning for precision.
                         let shift_factor = if self.shift_held {
                             self.state.config.shift_slow_factor
@@ -2405,12 +2440,6 @@ impl PointerHandler for MagnifierWindow {
                         };
                         let dx = raw_dx * shift_factor;
                         let dy = raw_dy * shift_factor;
-                        // The view pans with the hand's *movement* (relative
-                        // deltas), never by re-centering on the hand's
-                        // absolute position — the magnified cursor sits at
-                        // the dead center of the viewport, so releasing
-                        // hold-to-zoom (or any other state change) can never
-                        // make the view jump to the hand.
                         let (sx, sy) = self.capture_scale();
                         let bounds = match &self.captured {
                             Some(c) => (c.buffer.width as f64, c.buffer.height as f64),
@@ -2544,30 +2573,43 @@ impl PointerHandler for MagnifierWindow {
                             };
                             self.view_center = Some((fx, fy));
                         }
+                        } // end can_pan
                         self.request_motion_redraw(qh);
                     }
                 }
                 PointerEventKind::Press { button, .. } => {
-                    // Right mouse button quits, same as Q.
+                    // Right mouse button: in Magnify Mode, quit the app.
+                    // In Annotation/Capture Mode, return to Magnify Mode.
                     if button == BTN_RIGHT {
-                        self.exit = true;
+                        match self.state.mode {
+                            AppMode::Magnify => {
+                                tracing::debug!("Exit due to RMB in Magnify Mode");
+                                self.exit = true;
+                            }
+                            AppMode::Annotation => {
+                                self.mmb_pan_active = false;
+                                self.draw_mode.deactivate_annotation();
+                                self.state.switch_mode(AppMode::Magnify);
+                                self.draw_frame(qh);
+                            }
+                            AppMode::Capture => {
+                                // Handled in handle_screenshot_pointer.
+                            }
+                        }
                     }
                     if button == BTN_MIDDLE {
-                        // The middle mouse button is the default hold-to-zoom
-                        // key: while it is held, vertical motion zooms (see
-                        // the Motion handler), so MMB press arms the feature
-                        // instead of resetting the zoom. With any other
-                        // hold-to-zoom binding configured, MMB keeps its
-                        // legacy reset-to-default role (the `reset_zoom` key
-                        // always resets either way).
-                        if self.state.config.keybindings.hold_to_zoom == MMB_HTZ {
+                        if self.draw_mode.annotation_active {
+                            // In Annotation Mode, MMB drag pans the view
+                            // (mouse movement is otherwise locked so drawing
+                            // stays stable on the content).
+                            self.mmb_pan_active = true;
+                        } else if self.state.config.keybindings.hold_to_zoom == MMB_HTZ {
+                            // The middle mouse button is the default
+                            // hold-to-zoom key: while it is held, vertical
+                            // motion zooms (see the Motion handler).
                             self.hold_to_zoom_active = true;
                             self.hold_zoom_last_y = self.pointer_position_f.1;
                             self.hold_floor_dead_travel = 0.0;
-                            // Ensure the view center is initialized so the
-                            // vertical lock engages immediately (in case no
-                            // motion/draw happened before the press) —
-                            // mirrors the keyboard arm in `press_key`.
                             if self.view_center.is_none() {
                                 let (sx, sy) = self.capture_scale();
                                 self.view_center = Some(self.clamp_to_capture((
@@ -2576,17 +2618,14 @@ impl PointerHandler for MagnifierWindow {
                                 )));
                             }
                         } else {
-                            // Middle mouse button resets the zoom to the
-                            // default; the view stays put (zoom scales around
-                            // the center). The runtime minimum applies, so a
-                            // default of 0 % lands on the fully-zoomed-out
-                            // view.
+                            // Legacy: MMB resets the zoom to the default.
                             let default_zoom = self.state.config.default_zoom.unwrap_or(1.0);
                             self.set_zoom(default_zoom, self.runtime_min_zoom());
                             self.draw_frame(qh);
                         }
                     }
-                    if button == BTN_LEFT {
+                    if button == BTN_LEFT && self.draw_mode.annotation_active {
+                        tracing::debug!("LMB press: starting draw with tool={:?}", self.draw_mode.tool);
                         // LMB press: start drawing with current tool.
                         let pos = event.position;
                         let (sx, sy) = self.capture_scale();
@@ -2594,10 +2633,15 @@ impl PointerHandler for MagnifierWindow {
                         self.draw_mode.drawing = Some(
                             crate::draw_mode::DrawingInProgress::new(
                                 self.draw_mode.tool,
+                                self.draw_mode.color,
                                 cap,
                             ),
                         );
                         self.draw_mode.drawing_held = true;
+                        // Invalidate overlay cache so existing annotations
+                        // are re-rendered at current view, then drawing
+                        // segments are appended incrementally.
+                        self.draw_mode.invalidate_overlay();
                     }
 
                 }
@@ -2607,18 +2651,20 @@ impl PointerHandler for MagnifierWindow {
                         self.draw_mode.commit_drawing();
                         self.draw_frame(qh);
                     }
-                    // Releasing the hold-to-zoom key stops smooth zooming —
-                    // the mouse-button counterpart of `release_key`. The view
-                    // stays exactly where it is (no jump, no self-animation);
-                    // the Motion handler corrects any residual offset with
-                    // real pointer motion.
-                    if button == BTN_MIDDLE && self.state.config.keybindings.hold_to_zoom == MMB_HTZ
-                    {
-                        let was_active = self.hold_to_zoom_active;
-                        self.hold_to_zoom_active = false;
-                        if was_active {
-                            self.last_motion_at = Some(std::time::Instant::now());
-                            self.draw_frame(qh);
+                    if button == BTN_MIDDLE {
+                        if self.draw_mode.annotation_active {
+                            self.mmb_pan_active = false;
+                        } else if self.state.config.keybindings.hold_to_zoom == MMB_HTZ
+                        {
+                            // Releasing the hold-to-zoom key stops smooth
+                            // zooming — the mouse-button counterpart of
+                            // `release_key`.
+                            let was_active = self.hold_to_zoom_active;
+                            self.hold_to_zoom_active = false;
+                            if was_active {
+                                self.last_motion_at = Some(std::time::Instant::now());
+                                self.draw_frame(qh);
+                            }
                         }
                     }
                 }
@@ -2838,12 +2884,20 @@ impl KeyboardHandler for MagnifierWindow {
             self.open_config(qh);
         } else if keysym_str == config_key.anti_aliasing {
             tracing::info!("Anti-aliasing toggle - not yet implemented");
-        } else if keysym_str == config_key.mode_center_cursor {
-            self.state.switch_mode(MagnifierMode::CenterCursor);
-        } else if keysym_str == config_key.mode_edge_pan {
-            self.state.switch_mode(MagnifierMode::EdgePan);
-        } else if keysym_str == config_key.mode_miniature {
-            self.state.switch_mode(MagnifierMode::MiniatureWindow);
+        } else if keysym_str == config_key.mode_annotation {
+            // Enter Annotation Mode via pie menu (or keyboard shortcut).
+            if self.state.mode != AppMode::Annotation {
+                self.state.switch_mode(AppMode::Annotation);
+                self.draw_mode.annotation_active = true;
+                self.draw_frame(qh);
+            }
+        } else if keysym_str == config_key.mode_capture {
+            // Enter Capture Mode (manual screenshot selection).
+            if self.state.mode != AppMode::Capture {
+                self.enter_screenshot_mode(false);
+                self.state.switch_mode(AppMode::Capture);
+                self.draw_frame(qh);
+            }
         } else if keysym_str == config_key.toggle_cursor {
             self.state.toggle_cursor();
             self.draw_frame(qh);
@@ -2858,7 +2912,27 @@ impl KeyboardHandler for MagnifierWindow {
             self.draw_frame(qh);
         }
 
-        if event.keysym == Keysym::Escape || event.keysym == Keysym::q {
+        if event.keysym == Keysym::Escape {
+            tracing::debug!("Escape pressed, mode={:?}", self.state.mode);
+            match self.state.mode {
+                AppMode::Magnify => {
+                    tracing::debug!("Exit due to Escape");
+                    self.exit = true;
+                }
+                AppMode::Annotation => {
+                    self.mmb_pan_active = false;
+                    self.draw_mode.deactivate_annotation();
+                    self.state.switch_mode(AppMode::Magnify);
+                    self.draw_frame(qh);
+                }
+                AppMode::Capture => {
+                    self.exit_screenshot_mode();
+                    self.state.switch_mode(AppMode::Magnify);
+                    self.draw_frame(qh);
+                }
+            }
+        } else if event.keysym == Keysym::q {
+            tracing::debug!("Exit due to Q");
             self.exit = true;
         }
     }
@@ -2924,6 +2998,10 @@ impl KeyboardHandler for MagnifierWindow {
             && keysym_to_string(event.keysym) == "Space"
         {
             let offset = self.draw_mode.end_space_hold();
+            // If a tool/color was selected, enter Annotation Mode.
+            if self.draw_mode.annotation_active {
+                self.state.switch_mode(AppMode::Annotation);
+            }
             // Shift the view center so the content under the cursor stays
             // visible after the cursor re-centers.
             if offset.0.abs() > 0.01 || offset.1.abs() > 0.01 {
@@ -3355,6 +3433,7 @@ impl MagnifierWindow {
     /// user drags one out.
     fn enter_screenshot_mode(&mut self, fullscreen: bool) {
         self.screenshot_active = true;
+        self.state.switch_mode(AppMode::Capture);
         // Each entry starts at the configured default save scale; the toggle
         // key then flips it while in the mode.
         self.effective_screenshot_scale = None;
@@ -3539,12 +3618,10 @@ impl MagnifierWindow {
         // Tooltip delay: wake the loop when the tooltip should appear.
         if self.draw_mode.space_held {
             if let Some(remaining) = self.draw_mode.tooltip_redraw_after() {
-                if !remaining.is_zero() {
-                    best = Some(match best {
-                        None => remaining,
-                        Some(b) => b.min(remaining),
-                    });
-                }
+                best = Some(match best {
+                    None => remaining,
+                    Some(b) => b.min(remaining),
+                });
             }
         }
         best
@@ -3693,6 +3770,7 @@ impl MagnifierWindow {
                     }
                 } else if button == BTN_RIGHT {
                     self.exit_screenshot_mode();
+                    self.state.switch_mode(AppMode::Magnify);
                 }
                 self.draw_frame(qh);
             }
@@ -4405,22 +4483,49 @@ impl MagnifierWindow {
                 self.screenshot_overlay = Some(buf);
                 self.screenshot_overlay_state = Some(overlay_state);
             }
-            // Render annotations overlay (always, if annotations exist or drawing).
-            let draw_mode_overlay = if !self.draw_mode.annotations.is_empty() || self.draw_mode.drawing.is_some() {
-                let scale = crate::gpu::RENDER_SCALE as f64;
-                let vp_w = self.width as i32 * scale as i32;
-                let vp_h = self.height as i32 * scale as i32;
-                crate::draw_mode::render_annotations_overlay(
-                    &self.draw_mode.annotations,
-                    self.draw_mode.drawing.as_ref(),
-                    vp_w,
-                    vp_h,
-                    (center_x, center_y),
-                    zoom,
-                )
-            } else {
-                None
-            };
+            // Render annotations overlay at logical (viewport) resolution.
+            // The GPU upscales it via LINEAR filtering; the overlay must
+            // not be larger than the screen's logical pixels.
+            //
+            // Pan-without-rerender: the overlay is rendered once at a
+            // specific view_center. On subsequent frames, if the view has
+            // panned but the overlay buffer still covers the visible area,
+            // we skip re-rendering and instead shift the texture via GPU
+            // UV offset. Re-rendering is forced when annotations change
+            // (add/remove/commit) or the pan exceeds the buffer margin.
+            let has_draw_overlay = !self.draw_mode.annotations.is_empty() || self.draw_mode.drawing.is_some();
+            let annotations_changed = self.draw_mode.overlay_version() != self.overlay_annotation_version;
+            let view_moved = self.overlay_rendered_center.map_or(true, |(cx, cy)| {
+                (cx - center_x).abs() > 1.0 || (cy - center_y).abs() > 1.0
+            });
+            let force_rerender = annotations_changed || self.draw_mode.drawing.is_some();
+            if has_draw_overlay && (force_rerender || view_moved) {
+                self.draw_mode.annotations_overlay(
+                    &mut self.draw_overlay,
+                    self.width as i32, self.height as i32,
+                    (center_x, center_y), zoom,
+                );
+                self.overlay_rendered_center = Some((center_x, center_y));
+                self.overlay_gpu_uv_offset = (0.0, 0.0);
+                self.overlay_annotation_version = self.draw_mode.overlay_version();
+            } else if has_draw_overlay {
+                // Compute UV offset from the pan delta.
+                if let Some((rcx, rcy)) = self.overlay_rendered_center {
+                    // The overlay was rendered at (rcx, rcy). The current
+                    // view is at (center_x, center_y). The UV offset shifts
+                    // the texture so annotations stay in capture space.
+                    // Capture px delta → UV fraction of the viewport.
+                    let vp_w = self.width as f64;
+                    let vp_h = self.height as f64;
+                    // At the rendered zoom, the viewport covers
+                    // vp_w/zoom × vp_h/zoom capture px.
+                    let capture_vp_w = vp_w / zoom;
+                    let capture_vp_h = vp_h / zoom;
+                    let dx = (center_x - rcx) / capture_vp_w;
+                    let dy = (center_y - rcy) / capture_vp_h;
+                    self.overlay_gpu_uv_offset = (dx as f32, dy as f32);
+                }
+            }
             // Annotation UI sprite: shown when Space is held.
             let toolbar_sprite = if self.draw_mode.space_held {
                 self.draw_mode.pie_menu_sprite().map(|tb| {
@@ -4439,11 +4544,18 @@ impl MagnifierWindow {
             } else {
                 None
             };
-            // Prefer screenshot overlay; fall back to draw-mode overlay.
-            let overlay = self.screenshot_overlay.as_ref().or(draw_mode_overlay.as_ref());
+            // Overlay selection: screenshot mode takes precedence;
+            // otherwise use the draw-mode annotation overlay.
+            // They are mutually exclusive (you cannot draw while in
+            // screenshot mode).
+            let overlay = if self.screenshot_active {
+                self.screenshot_overlay.as_ref()
+            } else {
+                self.draw_overlay.as_ref()
+            };
             // Force texture re-upload when draw-mode overlay is present
             // (it changes every frame due to annotations/toolbar/drawing).
-            let rebuild = rebuild || draw_mode_overlay.is_some();
+            let rebuild = rebuild || has_draw_overlay;
 
             // The GPU buffer is RENDER_SCALE x the logical size, so the
             // cursor sprite origin is scaled to match. The cursor never
@@ -4455,17 +4567,26 @@ impl MagnifierWindow {
             let cursor = cursor_logical.map(|(cx, cy)| {
                 // When Space is held (Annotation UI), render cursor at 1:1
                 // (unscaled) size so the user can point at pie menu items
-                // naturally; otherwise scale by zoom × RENDER_SCALE.
+                // naturally; in Annotation/Capture modes, use the crosshair;
+                // otherwise scale by zoom × RENDER_SCALE.
                 let sprite_scale = if self.draw_mode.space_held {
                     crate::gpu::RENDER_SCALE as f64 / zoom
                 } else {
                     crate::gpu::RENDER_SCALE as f64
                 };
-                let (buf, (hx, hy)) = self
-                    .magnified_cursor
-                    .as_mut()
-                    .expect("magnified cursor present")
-                    .sprite(sprite_scale);
+                let (buf, (hx, hy)) = if matches!(self.state.mode, AppMode::Annotation | AppMode::Capture)
+                    && !self.draw_mode.space_held
+                {
+                    self.magnified_cursor
+                        .as_mut()
+                        .expect("magnified cursor present")
+                        .crosshair_sprite(sprite_scale)
+                } else {
+                    self.magnified_cursor
+                        .as_mut()
+                        .expect("magnified cursor present")
+                        .sprite(sprite_scale)
+                };
                 let origin_x = (cx * crate::gpu::RENDER_SCALE as f64 - hx).round() as i32;
                 let origin_y = (cy * crate::gpu::RENDER_SCALE as f64 - hy).round() as i32;
                 ((origin_x, origin_y), buf, (hx, hy))
@@ -4537,6 +4658,7 @@ impl MagnifierWindow {
                     cursor_changed,
                     minimap.as_ref(),
                     toolbar_sprite.as_ref(),
+                    self.overlay_gpu_uv_offset,
                 );
             } else {
                 // 0 % zoom: the magnified view collapses to nothing — draw a
@@ -4556,6 +4678,7 @@ impl MagnifierWindow {
                     cursor_changed,
                     minimap.as_ref(),
                     toolbar_sprite.as_ref(),
+                    self.overlay_gpu_uv_offset,
                 );
             }
             // Track cursor state for next frame's upload skip.
@@ -4583,17 +4706,26 @@ impl MagnifierWindow {
         // coincide with the cursor at the dead center).
         let cursor_buf = cursor_logical.map(|(cx, cy)| {
             // When Space is held (Annotation UI), render cursor at 1:1
-            // (unscaled) size; otherwise scale by zoom.
+            // (unscaled) size; in Annotation/Capture modes, use the
+            // crosshair; otherwise scale by zoom.
             let sprite_scale = if self.draw_mode.space_held {
                 1.0 / zoom
             } else {
                 1.0
             };
-            let (buf, (hx, hy)) = self
-                .magnified_cursor
-                .as_mut()
-                .expect("magnified cursor present")
-                .sprite(sprite_scale);
+            let (buf, (hx, hy)) = if matches!(self.state.mode, AppMode::Annotation | AppMode::Capture)
+                && !self.draw_mode.space_held
+            {
+                self.magnified_cursor
+                    .as_mut()
+                    .expect("magnified cursor present")
+                    .crosshair_sprite(sprite_scale)
+            } else {
+                self.magnified_cursor
+                    .as_mut()
+                    .expect("magnified cursor present")
+                    .sprite(sprite_scale)
+            };
             // Dead center origin (or the live pointer in Screenshot Mode), on
             // the canvas pixel grid. The cursor never moves on its own.
             let origin_x = (cx - hx).round() as i32;
@@ -4685,10 +4817,29 @@ impl MagnifierWindow {
             self.screenshot_overlay = Some(buf);
             self.screenshot_overlay_state = Some(overlay_state);
         }
-        let screenshot_overlay_cpu: Option<(Vec<u8>, i32, i32)> = self
-            .screenshot_overlay
-            .as_ref()
-            .map(|b| (b.data.clone(), b.width, b.height));
+        let screenshot_overlay_cpu: Option<(Vec<u8>, i32, i32)> = if self.screenshot_active {
+            self.screenshot_overlay
+                .as_ref()
+                .map(|b| (b.data.clone(), b.width, b.height))
+        } else {
+            None
+        };
+        // Render draw-mode annotation overlay at logical resolution.
+        let has_draw_overlay_cpu = !self.draw_mode.annotations.is_empty() || self.draw_mode.drawing.is_some();
+        if has_draw_overlay_cpu {
+            self.draw_mode.annotations_overlay(
+                &mut self.draw_overlay,
+                self.width as i32, self.height as i32,
+                (center_x, center_y), zoom,
+            );
+        }
+        let draw_overlay_cpu: Option<(Vec<u8>, i32, i32)> = if has_draw_overlay_cpu {
+            self.draw_overlay
+                .as_ref()
+                .map(|b| (b.data.clone(), b.width, b.height))
+        } else {
+            None
+        };
         // The minimap for the CPU path: the same base-cached sprite, at
         // logical resolution, blended into the canvas at its corner position
         // inside the render closure (which cannot borrow `self`).
@@ -4727,6 +4878,9 @@ impl MagnifierWindow {
                     .copy_from_slice(&src_row[..(dest_w as usize) * 4]);
             }
             if let Some((ref overlay, ow, oh)) = screenshot_overlay_cpu {
+                blend_overlay_into(canvas, stride, overlay, ow, oh, 0, 0);
+            }
+            if let Some((ref overlay, ow, oh)) = draw_overlay_cpu {
                 blend_overlay_into(canvas, stride, overlay, ow, oh, 0, 0);
             }
             if let Some((cursor_pos, ref cursor_sprite, hotspot)) = cursor_buf {
@@ -4806,7 +4960,7 @@ impl MagnifierWindow {
 
     fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
         if let Some(gpu) = &mut self.gpu {
-            gpu.draw(None, None, None, None, None, false, true, None, None);
+            gpu.draw(None, None, None, None, None, false, true, None, None, (0.0, 0.0));
             return;
         }
         self.render_frame(qh, |canvas, _width, _height, _stride| {
@@ -5007,6 +5161,7 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         edge_hold: (None, None),            shift_held: false,
             ctrl_held: false,
             pan_accum: (0.0, 0.0),
+        mmb_pan_active: false,
         minimap_visible: minimap_on_launch,
         minimap_base: None,
         minimap_outline_coverage: None,
@@ -5014,6 +5169,10 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         cursor_upload_zoom: -1.0,
         cursor_was_visible: false,
         draw_mode: crate::draw_mode::DrawModeState::new(),
+        draw_overlay: None,
+        overlay_rendered_center: None,
+        overlay_gpu_uv_offset: (0.0, 0.0),
+        overlay_annotation_version: 0,
     };
 
     tracing::info!(
@@ -5046,10 +5205,11 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         window.draw_frame_if_motion_pending(&qh);
         // Tooltip timer: redraw when the tooltip should appear.
         if window.draw_mode.space_held {
-            if let Some(remaining) = window.draw_mode.tooltip_redraw_after() {
-                if remaining.is_zero() && !window.redraw_pending {
+            match window.draw_mode.tooltip_redraw_after() {
+                Some(remaining) if remaining.is_zero() => {
                     window.draw_frame(&qh);
                 }
+                _ => {}
             }
         }
         // And a cursor settle may have come due while the pointer rested:
@@ -6436,7 +6596,7 @@ mod tests {
         ov[i_border..i_border + 4].copy_from_slice(&[255, 153, 0, 255]);
         let i_scrim = 0; // pixel (0,0)
         ov[i_scrim..i_scrim + 4].copy_from_slice(&[0, 0, 0, 128]);
-        blend_overlay_into(&mut canvas, 4, &ov, 4, 4, 0, 0);
+        blend_overlay_into(&mut canvas, 16, &ov, 4, 4, 0, 0); // stride = 4px * 4 bytes
         let border_px = &canvas[i_border..i_border + 4];
         assert_eq!(border_px, [255, 153, 0, 255]);
         let scrim_px = &canvas[0..4];

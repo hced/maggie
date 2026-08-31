@@ -92,6 +92,28 @@ void main() {
 }
 "#;
 
+/// Fragment shader for the annotation overlay pass. Applies `u_uv_offset`
+/// to shift the texture UV, enabling pan-without-rerender: the annotation
+/// buffer is rendered once and shifted on the GPU when the view pans.
+const OVERLAY_FRAGMENT_SHADER: &str = r#"
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 v_uv;
+uniform sampler2D u_tex;
+uniform vec2 u_uv_offset;
+void main() {
+    vec2 uv = v_uv + u_uv_offset;
+    if (uv.x < 0.0 || uv.x >= 1.0 || uv.y < 0.0 || uv.y >= 1.0) {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+    } else {
+        gl_FragColor = texture2D(u_tex, uv);
+    }
+}
+"#;
+
 /// The GPU path renders its buffers at this multiple of the layer's logical
 /// size and advertises the same value via `wl_surface.set_buffer_scale`, so the
 /// compositor's fractional-scale resampling doesn't soften the magnified
@@ -118,6 +140,7 @@ pub struct GpuRenderer {
     egl_window: wayland_egl::WlEglSurface,
     program: GLuint,
     sprite_program: GLuint,
+    overlay_program: GLuint,
     vao: GLuint,
     vbo: GLuint,
     frame_tex: GLuint,
@@ -129,6 +152,7 @@ pub struct GpuRenderer {
     u_src_loc: GLint,
     u_rect_loc: GLint,
     u_oob_black_loc: GLint,
+    u_overlay_uv_offset_loc: GLint,
     width: i32,
     height: i32,
 }
@@ -261,6 +285,35 @@ impl GpuRenderer {
                 "Sprite shader locations not found (u_rect={}, u_tex={})",
                 u_rect_loc,
                 sprite_u_tex_loc
+            );
+        }
+
+        // Overlay program: same vertex shader as sprite, but fragment shader
+        // applies u_uv_offset for pan-without-rerender on annotations.
+        let overlay_program = Self::build_program_with(
+            SPRITE_VERTEX_SHADER,
+            OVERLAY_FRAGMENT_SHADER,
+        )?;
+        let u_overlay_uv_offset_loc = get_uniform_location(
+            overlay_program,
+            c"u_uv_offset".as_ptr(),
+        );
+        if u_overlay_uv_offset_loc < 0 {
+            anyhow::bail!("Overlay shader uniform u_uv_offset not found");
+        }
+        let overlay_u_rect_loc = get_uniform_location(
+            overlay_program,
+            c"u_rect".as_ptr(),
+        );
+        let overlay_u_tex_loc = get_uniform_location(
+            overlay_program,
+            c"u_tex".as_ptr(),
+        );
+        if overlay_u_rect_loc < 0 || overlay_u_tex_loc < 0 {
+            anyhow::bail!(
+                "Overlay shader locations not found (u_rect={}, u_tex={})",
+                overlay_u_rect_loc,
+                overlay_u_tex_loc
             );
         }
 
@@ -425,6 +478,7 @@ impl GpuRenderer {
             egl_window,
             program,
             sprite_program,
+            overlay_program,
             vao,
             vbo,
             frame_tex,
@@ -436,6 +490,7 @@ impl GpuRenderer {
             u_src_loc,
             u_rect_loc,
             u_oob_black_loc,
+            u_overlay_uv_offset_loc,
             width: width * RENDER_SCALE,
             height: height * RENDER_SCALE,
         };
@@ -454,6 +509,10 @@ impl GpuRenderer {
     }
 
     fn build_program(vertex_shader: &str) -> anyhow::Result<GLuint> {
+        Self::build_program_with(vertex_shader, FRAGMENT_SHADER)
+    }
+
+    fn build_program_with(vertex_shader: &str, fragment_shader: &str) -> anyhow::Result<GLuint> {
         unsafe {
             let vs = gles2::CreateShader(gles2::VERTEX_SHADER);
             let vs_src = vertex_shader.as_ptr() as *const GLchar;
@@ -474,8 +533,8 @@ impl GpuRenderer {
             }
 
             let fs = gles2::CreateShader(gles2::FRAGMENT_SHADER);
-            let fs_src = FRAGMENT_SHADER.as_ptr() as *const GLchar;
-            let fs_len = FRAGMENT_SHADER.len() as GLint;
+            let fs_src = fragment_shader.as_ptr() as *const GLchar;
+            let fs_len = fragment_shader.len() as GLint;
             gles2::ShaderSource(fs, 1, &fs_src, &fs_len);
             gles2::CompileShader(fs);
             let mut ok: GLint = 0;
@@ -590,6 +649,7 @@ impl GpuRenderer {
         upload_cursor: bool,
         minimap: Option<&OsdSprite>,
         toolbar: Option<&OsdSprite>,
+        overlay_uv_offset: (f32, f32),
     ) {
         unsafe {
             gles2::Viewport(0, 0, self.width, self.height);
@@ -645,7 +705,14 @@ impl GpuRenderer {
                 gles2::BlendFunc(gles2::SRC_ALPHA, gles2::ONE_MINUS_SRC_ALPHA);
                 gles2::ActiveTexture(gles2::TEXTURE0);
                 gles2::BindTexture(gles2::TEXTURE_2D, self.overlay_tex);
-                gles2::UseProgram(self.sprite_program);
+                // Use the overlay program with UV offset for
+                // pan-without-rerender on annotation overlays.
+                gles2::UseProgram(self.overlay_program);
+                gles2::Uniform2f(
+                    self.u_overlay_uv_offset_loc,
+                    overlay_uv_offset.0,
+                    overlay_uv_offset.1,
+                );
                 if upload_overlay {
                     gles2::TexImage2D(
                         gles2::TEXTURE_2D,
@@ -667,7 +734,14 @@ impl GpuRenderer {
                     verts.as_ptr() as *const GLvoid,
                     gles2::STREAM_DRAW,
                 );
-                gles2::Uniform4f(self.u_rect_loc, 0.0, 0.0, 1.0, 1.0);
+                // The overlay program uses the same vertex shader as sprite,
+                // so u_rect is at the same location — look it up from the
+                // overlay program.
+                let overlay_u_rect = get_uniform_location(
+                    self.overlay_program,
+                    c"u_rect".as_ptr(),
+                );
+                gles2::Uniform4f(overlay_u_rect, 0.0, 0.0, 1.0, 1.0);
                 gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
             }
 
@@ -890,6 +964,7 @@ impl Drop for GpuRenderer {
             gles2::DeleteTextures(1, &self.minimap_tex);
             gles2::DeleteProgram(self.program);
             gles2::DeleteProgram(self.sprite_program);
+            gles2::DeleteProgram(self.overlay_program);
         }
         let _ = self.egl.make_current(self.display, None, None, None);
         let _ = self.egl.destroy_context(self.display, self.context);

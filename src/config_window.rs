@@ -695,14 +695,13 @@ fn config_section(
             );
             key_row(
                 ui,
-                "Mode: center cursor",
-                &mut config.keybindings.mode_center_cursor,
+                "Enter annotation mode",
+                &mut config.keybindings.mode_annotation,
             );
-            key_row(ui, "Mode: edge pan", &mut config.keybindings.mode_edge_pan);
             key_row(
                 ui,
-                "Mode: miniature",
-                &mut config.keybindings.mode_miniature,
+                "Enter capture mode",
+                &mut config.keybindings.mode_capture,
             );
         });
 
