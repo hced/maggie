@@ -1,6 +1,6 @@
 [package]
 name = "maggie"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 
 [dependencies]
@@ -38,7 +38,7 @@ wgpu = "23.0"
 pollster = "0.4"
 bytemuck = { version = "1.14", features = ["derive"] }
 
-# Windows screen capture (DXGI Desktop Duplication) — optional
+# Platform-specific screen capture
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", optional = true, features = [
     "Win32_Graphics_Dxgi",
@@ -50,7 +50,6 @@ windows = { version = "0.58", optional = true, features = [
     "Win32_UI_HiDpi",
 ] }
 
-# macOS screen capture — optional
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.24", optional = true }
 core-video-sys = { version = "0.1", optional = true }

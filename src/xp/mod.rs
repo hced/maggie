@@ -186,17 +186,30 @@ impl ApplicationHandler for XpState {
             .with_decorations(false)
             .with_window_level(WindowLevel::AlwaysOnTop);
 
-        let window = Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                tracing::error!("Failed to create window: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
 
-        // Confine pointer.
+        // Confine pointer (non-fatal if it fails — e.g. some Wayland compositors).
         let _ = window.set_cursor_grab(CursorGrabMode::Confined)
             .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked));
         window.set_cursor_visible(false);
         window.set_fullscreen(Some(Fullscreen::Borderless(None)));
 
         // Create renderer.
-        let renderer = pollster::block_on(renderer::XpRenderer::new(window.clone()))
-            .expect("Failed to create wgpu renderer");
+        let renderer = match pollster::block_on(renderer::XpRenderer::new(window.clone())) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Failed to create wgpu renderer: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
 
         // Initialize screen capture.
         let mut cap = capture::create_capture().unwrap_or_else(|e| {
@@ -214,8 +227,6 @@ impl ApplicationHandler for XpState {
                     data: frame.rgba.clone(),
                 });
                 self.view_center = (frame.width as f64 / 2.0, frame.height as f64 / 2.0);
-                // Upload frame texture — renderer is created but we need to call upload
-                // through the stored renderer reference. We'll do this after storing.
                 tracing::info!("Captured {}x{} frame", frame.width, frame.height);
             }
             Err(e) => {
@@ -223,7 +234,7 @@ impl ApplicationHandler for XpState {
             }
         }
 
-        // Store renderer and window, then upload frame.
+        // Store renderer, window, and capture backend.
         self.renderer = Some(renderer);
         self.window = Some(window);
         self.cap = Some(cap);

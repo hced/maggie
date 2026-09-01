@@ -54,10 +54,28 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
         run: cargo build --release --bin maggie_xp --no-default-features --verbose
 
-      - name: Run tests
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --bin maggie_xp --no-default-features --features capture-win --verbose
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --release --bin maggie_xp --no-default-features --verbose
+
+      - name: Run tests (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test --release --no-default-features --verbose
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --release --no-default-features --features capture-win --verbose
+
+      - name: Run tests (macOS)
+        if: runner.os == 'macOS'
         run: cargo test --release --no-default-features --verbose
 
       - name: Upload binary artifact
