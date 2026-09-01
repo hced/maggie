@@ -446,6 +446,7 @@ impl XpRenderer {
         cursor_sprite: Option<(&[u8], u32, u32, [f32; 2])>,
         minimap_sprite: Option<(&[u8], u32, u32, [f32; 2])>,
         osd_sprite: Option<(&[u8], u32, u32, [f32; 2])>,
+        warning_sprite: Option<(&[u8], u32, u32, [f32; 2])>,
     ) {
         let output = match self.surface.get_current_texture() {
             Ok(t) => t,
@@ -551,6 +552,16 @@ impl XpRenderer {
                     data, w, h, pos,
                     &self.sprite_pipeline,
                     "osd",
+                );
+            }
+
+            // Draw warning sprite (persistent overlay when requirements are missing).
+            if let Some((data, w, h, pos)) = warning_sprite {
+                self.draw_sprite(
+                    &mut render_pass,
+                    data, w, h, pos,
+                    &self.sprite_pipeline,
+                    "warning",
                 );
             }
         }

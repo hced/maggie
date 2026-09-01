@@ -55,6 +55,8 @@ pub struct XpState {
     pub screenshot_phase: f64,
     /// Configuration window open state
     pub config_open: bool,
+    /// Warning text shown as a persistent overlay when requirements are missing.
+    pub warning_text: Option<Vec<String>>,
     window: Option<Arc<Window>>,
     renderer: Option<renderer::XpRenderer>,
     cap: Option<Box<dyn capture::ScreenCapture>>,
@@ -80,6 +82,7 @@ impl XpState {
             screenshot_rect: None,
             screenshot_phase: 0.0,
             config_open: false,
+            warning_text: None,
             window: None,
             renderer: None,
             cap: None,
@@ -161,6 +164,15 @@ impl XpState {
             None
         };
 
+        // Build warning sprite (persistent overlay when requirements are missing).
+        let warning_data = self.warning_text.as_ref().and_then(|lines| {
+            use crate::osd::{self, Corner};
+            let screen_w = win_w as i32;
+            let screen_h = win_h as i32;
+            osd::build_osd_sprite(lines, Corner::TopRight, screen_w, screen_h)
+                .map(|sprite| (sprite.buffer.data, sprite.width as u32, sprite.height as u32))
+        });
+
         renderer.render(
             Some([src_x as f32, src_y as f32, src_w as f32, src_h as f32]),
             capture.width as u32,
@@ -169,6 +181,7 @@ impl XpState {
             cursor_data.as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h, [self.pointer_pos.0 as f32 - *w as f32 / 2.0, self.pointer_pos.1 as f32 - *h as f32 / 2.0])),
             minimap_data.as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h, [win_w as f32 - *w as f32 - 10.0, win_h as f32 - *h as f32 - 10.0])),
             osd_data.as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h, [10.0, 10.0])),
+            warning_data.as_ref().map(|(d, w, h)| (d.as_slice(), *w, *h, [(win_w - *w as f64 - 28.0) as f32, 28.0])),
         );
 
     }
@@ -211,12 +224,27 @@ impl ApplicationHandler for XpState {
             }
         };
 
-        // Initialize screen capture.
-        let mut cap = capture::create_capture().unwrap_or_else(|e| {
-            tracing::warn!("Screen capture unavailable: {e}");
-            tracing::info!("Starting in demo mode");
-            Box::new(DemoCapture) as Box<dyn capture::ScreenCapture>
-        });
+        // Check platform requirements and initialize screen capture.
+        let (mut cap, initial_warning) = match check_platform_requirements() {
+            Ok(()) => match capture::create_capture() {
+                Ok(c) => (c as Box<dyn capture::ScreenCapture>, None),
+                Err(e) => {
+                    tracing::warn!("Screen capture failed: {e}");
+                    (
+                        Box::new(DemoCapture) as Box<dyn capture::ScreenCapture>,
+                        Some(build_platform_warning(&e.to_string())),
+                    )
+                }
+            },
+            Err(warnings) => {
+                tracing::warn!("Platform requirements missing: {warnings:?}");
+                (
+                    Box::new(DemoCapture) as Box<dyn capture::ScreenCapture>,
+                    Some(warnings),
+                )
+            }
+        };
+        self.warning_text = initial_warning;
 
         // Capture the initial frame.
         match cap.capture_primary() {
@@ -387,6 +415,113 @@ pub fn run() -> anyhow::Result<()> {
     event_loop.run_app(&mut state)?;
 
     Ok(())
+}
+
+/// Check platform-specific requirements for screen capture.
+/// Returns Ok(()) if all requirements are met, or Err with warning lines.
+fn check_platform_requirements() -> Result<(), Vec<String>> {
+    let mut warnings = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    {
+        // Check for PipeWire daemon
+        if !check_command_exists("pipewire") {
+            warnings.push("Missing: pipewire daemon".to_string());
+            warnings.push("Install: pipewire pipewire-pulse".to_string());
+        }
+        // Check for xdg-desktop-portal
+        if !check_command_exists("xdg-desktop-portal") {
+            warnings.push("Missing: xdg-desktop-portal".to_string());
+            warnings.push("Install: xdg-desktop-portal".to_string());
+        }
+        // Check for a portal backend
+        let has_portal_backend = check_command_exists("xdg-desktop-portal-gnome")
+            || check_command_exists("xdg-desktop-portal-kde")
+            || check_command_exists("xdg-desktop-portal-gtk")
+            || check_command_exists("xdg-desktop-portal-hyprland")
+            || check_command_exists("xdg-desktop-portal-wlr")
+            || check_command_exists("xdg-desktop-portal-cosmic")
+            || check_command_exists("xdg-desktop-portal-generic");
+        if !has_portal_backend {
+            warnings.push("Missing: xdg-desktop-portal backend".to_string());
+            warnings.push("Install: xdg-desktop-portal-gnome (or -kde/-wlr/-hyprland)".to_string());
+        }
+    }
+
+    if !warnings.is_empty() {
+        warnings.insert(0, "=== Requirements Missing ===".to_string());
+        warnings.push("".to_string());
+        warnings.push("Maggie will start in demo mode.".to_string());
+        warnings.push("Press Esc/Q to quit.".to_string());
+        return Err(warnings);
+    }
+
+    Ok(())
+}
+
+/// Check if a command exists in PATH.
+#[cfg(target_os = "linux")]
+fn check_command_exists(name: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Build platform-specific warning messages when capture fails.
+fn build_platform_warning(error: &str) -> Vec<String> {
+    let mut lines = vec!["=== Warning ===".to_string()];
+
+    #[cfg(target_os = "linux")]
+    {
+        lines.push("Screen capture failed on Linux.".to_string());
+        lines.push("".to_string());
+        lines.push("Maggie needs these for screen capture:".to_string());
+        lines.push("  - pipewire".to_string());
+        lines.push("  - xdg-desktop-portal".to_string());
+        lines.push("  - a portal backend (gnome/kde/wlr)".to_string());
+        lines.push("".to_string());
+        lines.push("Or use the native Wayland binary: maggie".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        lines.push("Screen capture failed on macOS.".to_string());
+        lines.push("".to_string());
+        lines.push("Grant Screen Recording permission:".to_string());
+        lines.push("System Settings > Privacy & Security".to_string());
+        lines.push("> Screen Recording > add Maggie".to_string());
+        lines.push("".to_string());
+        lines.push("Then restart Maggie.".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        lines.push("Screen capture failed on Windows.".to_string());
+        lines.push("".to_string());
+        lines.push("DXGI Desktop Duplication requires:".to_string());
+        lines.push("  - A compatible GPU".to_string());
+        lines.push("  - A running desktop session".to_string());
+    }
+
+    // Fallback for unknown platforms
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        lines.push(format!("Error: {error}"));
+    }
+
+    if !error.is_empty() && !lines.iter().any(|l| l.contains(error)) {
+        lines.push("".to_string());
+        lines.push(format!("Details: {error}"));
+    }
+
+    lines.push("".to_string());
+    lines.push("Starting in demo mode.".to_string());
+    lines.push("Press Esc/Q to quit.".to_string());
+    lines
 }
 
 /// Dummy capture for development/testing.
