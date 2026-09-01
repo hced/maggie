@@ -215,7 +215,7 @@ pub mod platform_capture {
     // We use raw pointers throughout to avoid type mismatches with the safe
     // core-graphics crate wrappers (which use foreign-types NonNull wrappers
     // that don't play well with our bitmap context workflow).
-    extern "C" {
+    unsafe extern "C" {
         fn CGDisplayCreateImage(display: CGDirectDisplayID) -> *mut c_void;
         fn CGImageGetWidth(image: *const c_void) -> usize;
         fn CGImageGetHeight(image: *const c_void) -> usize;
