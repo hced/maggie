@@ -23,10 +23,13 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         include:
           - os: ubuntu-latest
+            platform: linux
             rustflags: "-C target-cpu=x86-64-v3"
           - os: windows-latest
+            platform: windows
             rustflags: "-C target-cpu=x86-64-v3"
           - os: macos-latest
+            platform: macos
             rustflags: ""
     runs-on: ${{ matrix.os }}
 
@@ -48,7 +51,7 @@ jobs:
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         with:
-          name: maggie_xp-${{ matrix.os }}
+          name: maggie_xp-${{ matrix.platform }}
           path: |
             target/release/maggie_xp
             target/release/maggie_xp.exe
@@ -70,35 +73,35 @@ jobs:
       - name: Download Linux Artifact
         uses: actions/download-artifact@v8
         with:
-          name: maggie_xp-ubuntu-latest
-          path: ${{ github.workspace }}/incoming/ubuntu
+          name: maggie_xp-linux
+          path: ${{ github.workspace }}/incoming/linux
 
       - name: Download macOS Artifact
         uses: actions/download-artifact@v8
         with:
-          name: maggie_xp-macos-latest
+          name: maggie_xp-macos
           path: ${{ github.workspace }}/incoming/macos
 
       - name: Download Windows Artifact
         uses: actions/download-artifact@v8
         with:
-          name: maggie_xp-windows-latest
+          name: maggie_xp-windows
           path: ${{ github.workspace }}/incoming/windows
 
       - name: Package artifacts for release
         run: |
           cd ${{ github.workspace }}/incoming
 
-          if [ -f "ubuntu/maggie_xp" ]; then
-            tar -czf ${{ github.workspace }}/release-files/maggie_xp-linux.tar.gz -C ubuntu maggie_xp
+          if [ -f "linux/maggie_xp" ]; then
+            tar -czf ${{ github.workspace }}/release-files/maggie-linux.tar.gz -C linux maggie_xp
           fi
 
           if [ -f "macos/maggie_xp" ]; then
-            tar -czf ${{ github.workspace }}/release-files/maggie_xp-macos.tar.gz -C macos maggie_xp
+            tar -czf ${{ github.workspace }}/release-files/maggie-macos.tar.gz -C macos maggie_xp
           fi
 
           if [ -f "windows/maggie_xp.exe" ]; then
-            zip -j ${{ github.workspace }}/release-files/maggie_xp-windows.zip windows/maggie_xp.exe
+            zip -j ${{ github.workspace }}/release-files/maggie-windows.zip windows/maggie_xp.exe
           fi
 
           cd ${{ github.workspace }}/release-files
