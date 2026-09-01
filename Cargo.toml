@@ -1,6 +1,6 @@
 [package]
 name = "maggie"
-version = "0.2.9"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -53,6 +53,12 @@ windows = { version = "0.58", optional = true, features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.24", optional = true }
 
+# Linux screen capture via XDG Desktop Portal + PipeWire
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", features = ["screencast"], optional = true }
+pipewire = { version = "0.9", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+
 [features]
 default = ["wayland"]
 # Enable all Wayland-specific dependencies for the native binary
@@ -64,6 +70,7 @@ wayland = [
 ]
 capture-win = ["dep:windows"]
 capture-mac = ["dep:core-graphics"]
+capture-linux = ["dep:ashpd", "dep:pipewire", "dep:tokio"]
 
 [build-dependencies]
 gl_generator = { version = "0.14", optional = true }

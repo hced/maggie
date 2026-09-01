@@ -312,9 +312,337 @@ pub mod platform_capture {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Linux: stub
+// Linux: XDG Desktop Portal + PipeWire
 // ═══════════════════════════════════════════════════════════════════════════
-#[cfg(target_os = "linux")]
+
+// When capture-linux is enabled, use the XDG Desktop Portal ScreenCast API
+// (via ashpd) to negotiate a PipeWire stream with the compositor. This works
+// on GNOME, KDE, Sway, Hyprland, Niri, COSMIC, and other modern Wayland
+// compositors — as well as X11 sessions that have xdg-desktop-portal installed.
+//
+// Without capture-linux, fall back to a stub that directs the user to the
+// native Wayland binary.
+
+#[cfg(all(target_os = "linux", feature = "capture-linux"))]
+pub mod platform_capture {
+    use super::*;
+    use anyhow::{Context, bail};
+    use ashpd::desktop::{
+        PersistMode,
+        screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
+    };
+    use pipewire as pw;
+    use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+    use std::thread;
+
+    /// Shared state between the PipeWire thread and the main thread.
+    struct SharedState {
+        frame: Option<CapturedScreen>,
+        width: u32,
+        height: u32,
+    }
+
+    /// Linux screen capture via XDG Desktop Portal ScreenCast + PipeWire.
+    pub struct LinuxScreenCapture {
+        shared: Arc<Mutex<SharedState>>,
+        running: Arc<AtomicBool>,
+        _pw_thread: thread::JoinHandle<()>,
+    }
+
+    impl LinuxScreenCapture {
+        pub fn init() -> Result<Self> {
+            // Use a short-lived tokio runtime for the async ashpd portal call.
+            let (node_id, fd) = {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("Failed to create tokio runtime for portal call")?;
+                rt.block_on(open_portal())
+                    .context("Failed to open XDG Desktop Portal screencast session")?
+            };
+
+            tracing::info!("Linux capture: PipeWire node_id={node_id}");
+
+            let shared = Arc::new(Mutex::new(SharedState {
+                frame: None,
+                width: 0,
+                height: 0,
+            }));
+            let running = Arc::new(AtomicBool::new(true));
+
+            let shared_clone = shared.clone();
+            let running_clone = running.clone();
+
+            let pw_thread = thread::Builder::new()
+                .name("maggie-pipewire".into())
+                .spawn(move || {
+                    if let Err(e) = run_pipewire(node_id, fd, shared_clone, running_clone) {
+                        tracing::error!("PipeWire capture thread failed: {e:#}");
+                    }
+                })
+                .context("Failed to spawn PipeWire thread")?;
+
+            Ok(Self {
+                shared,
+                running,
+                _pw_thread: pw_thread,
+            })
+        }
+    }
+
+    impl ScreenCapture for LinuxScreenCapture {
+        fn capture_primary(&mut self) -> Result<CapturedScreen> {
+            let state = self.shared.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+            state.frame.as_ref().map(|f| CapturedScreen {
+                rgba: f.rgba.clone(),
+                width: f.width,
+                height: f.height,
+            }).ok_or_else(|| anyhow::anyhow!("No frame captured yet — waiting for PipeWire stream"))
+        }
+    }
+
+    impl Drop for LinuxScreenCapture {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::SeqCst);
+        }
+    }
+
+    // ── Portal session ──────────────────────────────────────────────────────
+
+    /// Open an XDG Desktop Portal ScreenCast session and return the PipeWire
+    /// node ID and remote file descriptor.
+    async fn open_portal() -> Result<(u32, std::os::fd::OwnedFd)> {
+        let proxy = Screencast::new().await
+            .context("Failed to connect to org.freedesktop.portal.ScreenCast")?;
+        let session = proxy.create_session(Default::default()).await
+            .context("Failed to create screencast session")?;
+
+        proxy.select_sources(
+            &session,
+            SelectSourcesOptions::default()
+                .set_cursor_mode(CursorMode::Hidden)
+                .set_sources(Some(SourceType::Monitor).map(Into::into))
+                .set_multiple(false)
+                .set_persist_mode(PersistMode::DoNot),
+        ).await.context("Failed to select sources")?.response()
+            .context("Source selection was dismissed or failed")?;
+
+        let response = proxy
+            .start(&session, None, Default::default()).await
+            .context("Failed to start screencast")?
+            .response()
+            .context("Screencast start was dismissed or failed")?;
+
+        let stream = response.streams()
+            .first()
+            .context("Portal returned no streams")
+            .cloned()?;
+
+        let fd = proxy.open_pipe_wire_remote(&session, Default::default()).await
+            .context("Failed to open PipeWire remote")?;
+
+        Ok((stream.pipe_wire_node_id(), fd))
+    }
+
+    // ── PipeWire streaming ──────────────────────────────────────────────────
+
+    /// Run the PipeWire main loop on this thread, receiving frames from the
+    /// compositor and writing the latest one into `shared`.
+    fn run_pipewire(
+        node_id: u32,
+        fd: std::os::fd::OwnedFd,
+        shared: Arc<Mutex<SharedState>>,
+        running: Arc<AtomicBool>,
+    ) -> Result<()> {
+        pw::init();
+
+        let mainloop = pw::main_loop::MainLoopBox::new(None)
+            .context("Failed to create PipeWire main loop")?;
+        let context = pw::context::ContextBox::new(&mainloop.loop_(), None)
+            .context("Failed to create PipeWire context")?;
+        let core = context.connect_fd(fd, None)
+            .context("Failed to connect to PipeWire remote")?;
+
+        let stream = pw::stream::StreamBox::new(
+            &core,
+            "maggie-capture",
+            pw::properties::properties!
+            {
+                *pw::keys::MEDIA_TYPE => "Video",
+                *pw::keys::MEDIA_CATEGORY => "Capture",
+                *pw::keys::MEDIA_ROLE => "Screen",
+            },
+        ).context("Failed to create PipeWire stream")?;
+
+        // State carried into PipeWire callbacks via user_data.
+        struct PwData {
+            format: pw::spa::param::video::VideoInfoRaw,
+            shared: Arc<Mutex<SharedState>>,
+            running: Arc<AtomicBool>,
+        }
+
+        let user_data = PwData {
+            format: Default::default(),
+            shared,
+            running: running.clone(),
+        };
+
+        let _listener = stream
+            .add_local_listener_with_user_data(user_data)
+            .state_changed(|_, data, _old, new| {
+                tracing::debug!("PipeWire stream state: {new:?}");
+                if matches!(new, pw::stream::StreamState::Error(_)) {
+                    data.running.store(false, Ordering::SeqCst);
+                }
+            })
+            .param_changed(move |_, data, id, param| {
+                let Some(param) = param else { return; };
+                if id != pw::spa::param::ParamType::Format.as_raw() {
+                    return;
+                }
+                let (media_type, media_subtype) =
+                    match pw::spa::param::format_utils::parse_format(param) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                if media_type != pw::spa::param::format::MediaType::Video
+                    || media_subtype != pw::spa::param::format::MediaSubtype::Raw
+                {
+                    return;
+                }
+                data.format.parse(param).expect("Failed to parse video format");
+                let w = data.format.size().width;
+                let h = data.format.size().height;
+                let fmt = data.format.format();
+                tracing::info!("PipeWire video format: {fmt:?} {w}x{h}");
+                if let Ok(mut state) = data.shared.lock() {
+                    state.width = w;
+                    state.height = h;
+                }
+            })
+            .process(move |stream, data| {
+                if !data.running.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Some(mut buffer) = stream.dequeue_buffer() else {
+                    tracing::warn!("PipeWire: no buffers available");
+                    return;
+                };
+                let datas = buffer.datas_mut();
+                if datas.is_empty() {
+                    return;
+                }
+                let chunk_size = {
+                    let data0 = &mut datas[0];
+                    data0.chunk().size() as usize
+                };
+                if chunk_size == 0 {
+                    return;
+                }
+                let ptr = datas[0].data().unwrap_or(&mut []);
+                let w = data.format.size().width;
+                let h = data.format.size().height;
+                let stride = w * 4; // We negotiate RGBA
+                let expected = (stride * h) as usize;
+                let raw = if ptr.len() >= chunk_size {
+                    &ptr[..chunk_size]
+                } else {
+                    &ptr[..]
+                };
+                let rgba = if raw.len() >= expected {
+                    raw[..expected].to_vec()
+                } else {
+                    // Partial frame — pad with zeros.
+                    let mut buf = vec![0u8; expected];
+                    buf[..raw.len()].copy_from_slice(raw);
+                    buf
+                };
+                if let Ok(mut state) = data.shared.lock() {
+                    state.frame = Some(CapturedScreen { rgba, width: w, height: h });
+                }
+            })
+            .register()
+            .context("Failed to register PipeWire stream listener")?;
+
+        // Negotiate format: prefer RGBA, also accept RGB and BGRx.
+        use pw::spa::{pod, utils::{SpaTypes, Fraction, Rectangle}};
+        let obj = pod::object!
+        {
+            SpaTypes::ObjectParamFormat,
+            pw::spa::param::ParamType::EnumFormat,
+            pod::property!(
+                pw::spa::param::format::FormatProperties::MediaType,
+                Id,
+                pw::spa::param::format::MediaType::Video
+            ),
+            pod::property!(
+                pw::spa::param::format::FormatProperties::MediaSubtype,
+                Id,
+                pw::spa::param::format::MediaSubtype::Raw
+            ),
+            pod::property!(
+                pw::spa::param::format::FormatProperties::VideoFormat,
+                Choice,
+                Enum,
+                Id,
+                pw::spa::param::video::VideoFormat::RGBA,
+                pw::spa::param::video::VideoFormat::RGBA,
+                pw::spa::param::video::VideoFormat::RGB,
+                pw::spa::param::video::VideoFormat::RGBx,
+                pw::spa::param::video::VideoFormat::BGRx
+            ),
+            pod::property!(
+                pw::spa::param::format::FormatProperties::VideoSize,
+                Choice,
+                Range,
+                Rectangle,
+                Rectangle { width: 1920, height: 1080 },
+                Rectangle { width: 1, height: 1 },
+                Rectangle { width: 7680, height: 4320 }
+            ),
+            pod::property!(
+                pw::spa::param::format::FormatProperties::VideoFramerate,
+                Choice,
+                Range,
+                Fraction,
+                Fraction { num: 30, denom: 1 },
+                Fraction { num: 0, denom: 1 },
+                Fraction { num: 120, denom: 1 }
+            ),
+        };
+
+        let values: Vec<u8> = pod::serialize::PodSerializer::serialize(
+            std::io::Cursor::new(Vec::new()),
+            &pod::Value::Object(obj),
+        ).context("Failed to serialize format negotiation pod")?
+            .0.into_inner();
+
+        let mut params = [pod::Pod::from_bytes(&values)
+            .context("Failed to parse serialized pod")?];
+
+        stream.connect(
+            pw::spa::utils::Direction::Input,
+            Some(node_id),
+            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+            &mut params,
+        ).context("Failed to connect PipeWire stream")?;
+
+        tracing::info!("PipeWire stream connected, entering main loop");
+
+        // Run until the running flag is cleared (e.g. on drop).
+        while running.load(Ordering::SeqCst) {
+            mainloop.loop_().iterate(std::time::Duration::from_millis(100));
+        }
+
+        tracing::info!("PipeWire capture thread exiting");
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Linux: stub (when capture-linux feature is NOT enabled)
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(all(target_os = "linux", not(feature = "capture-linux")))]
 pub mod platform_capture {
     use super::*;
 
@@ -341,10 +669,10 @@ pub fn create_capture() -> Result<Box<dyn ScreenCapture>> {
     { return Ok(Box::new(platform_capture::DxgiCapture::init()?)); }
     #[cfg(all(target_os = "macos", feature = "capture-mac"))]
     { return Ok(Box::new(platform_capture::MacosCapture::init()?)); }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "capture-linux"))]
+    { return Ok(Box::new(platform_capture::LinuxScreenCapture::init()?)); }
+    #[cfg(all(target_os = "linux", not(feature = "capture-linux")))]
     { return Ok(Box::new(platform_capture::LinuxCapture::init()?)); }
     // Fallback: no capture backend available
     anyhow::bail!("No capture backend available for this platform/feature configuration")
 }
-
-

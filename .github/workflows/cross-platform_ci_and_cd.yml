@@ -49,14 +49,16 @@ jobs:
             libxkbcommon-x11-dev \
             libxcb-render0-dev \
             libxcb-shape0-dev \
-            libxcb-xfixes0-dev
+            libxcb-xfixes0-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
-        run: cargo build --release --bin maggie_xp --no-default-features --verbose
+        run: cargo build --release --bin maggie_xp --no-default-features --features capture-linux --verbose
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
@@ -68,7 +70,7 @@ jobs:
 
       - name: Run tests (Linux)
         if: runner.os == 'Linux'
-        run: cargo test --release --no-default-features --verbose
+        run: cargo test --release --no-default-features --features capture-linux --verbose
 
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
