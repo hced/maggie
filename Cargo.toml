@@ -33,7 +33,7 @@ glow = { version = "0.17", optional = true }
 egui-file-dialog = { version = "0.14.1", optional = true }
 
 # Cross-platform (winit + wgpu) dependencies
-winit = { version = "0.30", features = ["rwh_06"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11"] }
 wgpu = "23.0"
 pollster = "0.4"
 bytemuck = { version = "1.14", features = ["derive"] }
