@@ -1,0 +1,114 @@
+name: Cross-Platform CI/CD
+
+# -----------------------------------------------------------------------------
+# RUNNER TRIGGER LOGIC:
+# This workflow is explicitly configured to ONLY trigger on tag pushes (e.g., v1.0.0).
+# Standard pushes to the 'main' branch or pull requests will NOT wake up the runners,
+# ensuring we don't waste CI compilation minutes on routine development tasks.
+# -----------------------------------------------------------------------------
+on:
+  push:
+    tags:
+      - "v*" # <-- This specific rule restricts execution to version tags only
+
+env:
+  CARGO_TERM_COLOR: always
+  # Force all JavaScript actions to use Node 24 immediately to silence deprecation warnings
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# Need to grant write permissions for the Release step to move compiled binaries into Release
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        # Use windows-latest to allow GitHub's internal redirection to handle the label update
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --bin maggie_xp --no-default-features --verbose
+
+      - name: Run tests
+        run: cargo test --release --verbose
+
+      # Explicitly naming artifacts distinctly per-OS
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: maggie_xp-${{ matrix.os }}
+          path: |
+            target/release/maggie_xp
+            target/release/maggie_xp.exe
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Create release directory structure
+        run: |
+          mkdir -p ${{ github.workspace }}/incoming
+          mkdir -p ${{ github.workspace }}/release-files
+
+      # Download each artifact explicitly into its own deliberate folder to avoid v4 flattening bugs
+      - name: Download Linux Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: maggie_xp-ubuntu-latest
+          path: ${{ github.workspace }}/incoming/ubuntu
+
+      - name: Download macOS Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: maggie_xp-macos-latest
+          path: ${{ github.workspace }}/incoming/macos
+
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: maggie_xp-windows-latest
+          path: ${{ github.workspace }}/incoming/windows
+
+      - name: Package artifacts for release
+        run: |
+          cd ${{ github.workspace }}/incoming
+
+          # Package Linux binary
+          if [ -f "ubuntu/maggie_xp" ]; then
+            tar -czf ${{ github.workspace }}/release-files/maggie_xp-linux.tar.gz -C ubuntu maggie_xp
+          fi
+
+          # Package macOS binary
+          if [ -f "macos/maggie_xp" ]; then
+            tar -czf ${{ github.workspace }}/release-files/maggie_xp-macos.tar.gz -C macos maggie_xp
+          fi
+
+          # Package Windows binary
+          if [ -f "windows/maggie_xp.exe" ]; then
+            zip -j ${{ github.workspace }}/release-files/maggie_xp-windows.zip windows/maggie_xp.exe
+          fi
+
+          # Generate checksums
+          cd ${{ github.workspace }}/release-files
+          sha256sum * > checksums.txt
+
+      - name: Create Release and upload assets
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ github.workspace }}/release-files/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

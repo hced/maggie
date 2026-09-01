@@ -1,4 +1,4 @@
-name: Linux CI/CD
+name: Linux CI
 
 on:
   push:
@@ -9,6 +9,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 permissions:
   contents: read
@@ -33,17 +34,3 @@ jobs:
 
       - name: Run tests
         run: cargo test --release --verbose
-
-      - name: Upload native binary artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: maggie-linux
-          path: target/release/maggie
-          if-no-files-found: error
-
-      - name: Upload cross-platform binary artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: maggie_xp-linux-ci
-          path: target/release/maggie_xp
-          if-no-files-found: error
