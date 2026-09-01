@@ -1,18 +1,11 @@
 [package]
 name = "maggie"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-wayland-client = { version = "0.31", features = ["log"] }
-wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
-rustix = { version = "1.1", features = ["event"] }
-xcursor = "0.3"
-smithay-client-toolkit = "0.21"
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-wayland-egl = "0.32"
-khronos-egl = { version = "6.0.0", features = ["dynamic", "1_5"] }
-clap = { version = "4.5", features = ["derive"] }
+# Shared dependencies (both binaries)
+clap = { version = "4.5", features = ["derive", "env"] }
 ron = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 tracing = "0.1"
@@ -22,18 +15,61 @@ chrono = { version = "0.4", features = ["clock"] }
 dirs = "5.0"
 memmap2 = "0.9"
 png = "0.18"
-egui = "0.35"
-egui_glow = "0.35"
-glow = "0.17"
-egui-file-dialog = "0.14.1"
-resvg = "0.45"
-thorvg = "0.5"
+resvg = { version = "0.45", optional = true }
+thorvg = { version = "0.5", optional = true }
+
+# Native Wayland dependencies (only for the native binary)
+wayland-client = { version = "0.31", features = ["log"], optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
+rustix = { version = "1.1", features = ["event"], optional = true }
+xcursor = { version = "0.3", optional = true }
+smithay-client-toolkit = { version = "0.21", optional = true }
+wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
+wayland-egl = { version = "0.32", optional = true }
+khronos-egl = { version = "6.0.0", features = ["dynamic", "1_5"], optional = true }
+egui = { version = "0.35", optional = true }
+egui_glow = { version = "0.35", optional = true }
+glow = { version = "0.17", optional = true }
+egui-file-dialog = { version = "0.14.1", optional = true }
+
+# Cross-platform (winit + wgpu) dependencies
+winit = { version = "0.30", features = ["rwh_06"] }
+wgpu = "23.0"
+pollster = "0.4"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Windows screen capture (DXGI Desktop Duplication) — optional
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", optional = true, features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Gdi",
+    "Win32_Foundation",
+    "Win32_UI_HiDpi",
+] }
+
+# macOS screen capture — optional
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { version = "0.24", optional = true }
+core-video-sys = { version = "0.1", optional = true }
+
+[features]
+default = ["wayland"]
+# Enable all Wayland-specific dependencies for the native binary
+wayland = [
+    "dep:wayland-client", "dep:wayland-protocols", "dep:rustix",
+    "dep:xcursor", "dep:smithay-client-toolkit", "dep:wayland-protocols-wlr",
+    "dep:wayland-egl", "dep:khronos-egl", "dep:egui", "dep:egui_glow",
+    "dep:glow", "dep:egui-file-dialog", "dep:gl_generator", "dep:resvg", "dep:thorvg",
+]
+capture-win = ["dep:windows"]
+capture-mac = ["dep:core-graphics", "dep:core-video-sys"]
 
 [build-dependencies]
-gl_generator = "0.14"
+gl_generator = { version = "0.14", optional = true }
 
 [profile.release]
-# Thin LTO + single codegen unit let the optimizer inline across modules and
-# vectorize the render hot paths (see .cargo/config.toml for the CPU baseline).
 lto = "thin"
 codegen-units = 1

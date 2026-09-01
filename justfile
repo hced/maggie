@@ -12,7 +12,15 @@ set default-list := true
 # =================================================================================================
 
 build:
-  cargo build --release
+  cargo build --release --features wayland
+
+# Build the cross-platform binary (winit + wgpu) — no Wayland dependencies
+build-xp:
+  cargo build --release --bin maggie_xp --no-default-features
+
+# Cross-compile for Windows from Linux (requires mingw-w64: apt install mingw-w64)
+build-windows:
+  cargo build --release --bin maggie_xp --target x86_64-pc-windows-gnu --no-default-features
 
 # Build with every instruction this machine's CPU supports (fastest locally,
 # but the binary only runs on identical-or-newer CPUs).

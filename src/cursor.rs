@@ -204,7 +204,7 @@ fn build_crosshair() -> RgbaBuffer {
 
 /// Load the system cursor theme's "default" pointer (trying several common
 /// names) at the requested nominal size, returning the image and its hotspot.
-fn load_system_cursor() -> Option<(RgbaBuffer, (f64, f64))> {
+pub fn load_system_cursor() -> Option<(RgbaBuffer, (f64, f64))> {
     let theme = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string());
     let size: u32 = std::env::var("XCURSOR_SIZE")
         .ok()
@@ -267,7 +267,7 @@ fn find_cursor_file(theme: &str, name: &str) -> Option<PathBuf> {
 
 /// Read and parse a cursor file, converting the nearest-size image into a
 /// straight-alpha RGBA buffer (the file stores premultiplied ARGB pixel data).
-fn load_cursor(theme: &str, name: &str, size: u32) -> Option<(RgbaBuffer, (f64, f64))> {
+pub fn load_cursor(theme: &str, name: &str, size: u32) -> Option<(RgbaBuffer, (f64, f64))> {
     let path = find_cursor_file(theme, name)?;
     let bytes = std::fs::read(path).ok()?;
     let images = xcursor::parser::parse_xcursor(&bytes)?;
@@ -400,5 +400,127 @@ mod tests {
         };
         let (buf, _) = image_to_buffer(&image);
         assert_eq!(buf.pixel(0, 0), Some([255, 0, 0, 128]));
+    }
+
+    // ── Crosshair cursor tests ─────────────────────────────────────
+
+    #[test]
+    fn crosshair_is_32x32() {
+        let buf = build_crosshair();
+        assert_eq!((buf.width, buf.height), (32, 32));
+    }
+
+    #[test]
+    fn crosshair_arm_pixels_are_white() {
+        let buf = build_crosshair();
+        // Horizontal arm just right of center: (17, 16) has dx=1, in arm.
+        let h_arm = buf.pixel(17, 16).unwrap();
+        assert_eq!(h_arm, [255, 255, 255, 255], "horizontal arm should be white");
+        // Vertical arm just below center: (16, 17) has dy=1, in arm.
+        let v_arm = buf.pixel(16, 17).unwrap();
+        assert_eq!(v_arm, [255, 255, 255, 255], "vertical arm should be white");
+        // Pixel deeper in horizontal arm: (5, 16) dx=11.
+        assert_eq!(buf.pixel(5, 16).unwrap(), [255, 255, 255, 255]);
+        // Pixel deeper in vertical arm: (16, 5) dy=11.
+        assert_eq!(buf.pixel(16, 5).unwrap(), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn crosshair_outline_is_dark() {
+        let buf = build_crosshair();
+        // Outline wraps around the arm tips. Pixel (1, 16) has dx=15,
+        // just past the arm end (dx < 15 is arm, dx >= 15 is outline).
+        let outline_h = buf.pixel(1, 16).unwrap();
+        assert_eq!(
+            outline_h,
+            [0, 0, 0, 200],
+            "horizontal arm tip outline"
+        );
+        // Vertical arm tip: (16, 1) dy=15.
+        let outline_v = buf.pixel(16, 1).unwrap();
+        assert_eq!(
+            outline_v,
+            [0, 0, 0, 200],
+            "vertical arm tip outline"
+        );
+        // Outline at arm-side: (18, 18) dx=2, dy=2 — outside arm (dx<2
+        // but dy<2 fails), inside outline band.
+        let outline_side = buf.pixel(18, 18).unwrap();
+        assert_eq!(
+            outline_side,
+            [0, 0, 0, 200],
+            "outline beside arm"
+        );
+    }
+
+    #[test]
+    fn crosshair_center_is_outline() {
+        let buf = build_crosshair();
+        // Exact center (16,16) has dx=0,dy=0: inside on_h_outline and
+        // on_v_outline but NOT in_h_arm/in_v_arm (dx/dy < outline).
+        let px = buf.pixel(16, 16).unwrap();
+        assert_eq!(px, [0, 0, 0, 200], "center pixel should be outline");
+    }
+
+    #[test]
+    fn crosshair_corners_are_transparent() {
+        let buf = build_crosshair();
+        // Corners of the 32×32 buffer should be fully transparent.
+        assert_eq!(buf.pixel(0, 0).unwrap()[3], 0, "top-left corner");
+        assert_eq!(buf.pixel(31, 0).unwrap()[3], 0, "top-right corner");
+        assert_eq!(buf.pixel(0, 31).unwrap()[3], 0, "bottom-left corner");
+        assert_eq!(buf.pixel(31, 31).unwrap()[3], 0, "bottom-right corner");
+    }
+
+    #[test]
+    fn crosshair_hotspot_is_center() {
+        let mut cursor = MagnifiedCursor::from_reticle(1.0);
+        let (_sprite, hotspot) = cursor.crosshair_sprite(1.0);
+        // Base image is 32×32, hotspot at (16, 16) × factor.
+        assert_eq!(hotspot, (16.0, 16.0));
+    }
+
+    #[test]
+    fn crosshair_sprite_scales_with_zoom() {
+        let mut cursor = MagnifiedCursor::from_reticle(1.0);
+        let (sprite, hotspot) = cursor.crosshair_sprite(2.0);
+        // 32 × 2 = 64 px sprite.
+        assert_eq!((sprite.width, sprite.height), (64, 64));
+        assert_eq!(hotspot, (32.0, 32.0));
+    }
+
+    #[test]
+    fn crosshair_arm_width_is_consistent() {
+        let buf = build_crosshair();
+        // Scan horizontal arm at y=16: white pixels at x where
+        // dx=|x-16| is in [1..=14] (both sides of center). That's
+        // x in [2..=15] ∪ [17..=30] = 28 white pixels.
+        let white_count = (0..32i32)
+            .filter(|&x| buf.pixel(x, 16).unwrap()[0] == 255)
+            .count();
+        assert_eq!(white_count, 28, "horizontal arm white pixel count");
+
+        let white_count_v = (0..32i32)
+            .filter(|&y| buf.pixel(16, y).unwrap()[0] == 255)
+            .count();
+        assert_eq!(white_count_v, 28, "vertical arm white pixel count");
+    }
+
+    #[test]
+    fn crosshair_only_has_three_pixel_types() {
+        let buf = build_crosshair();
+        // Every pixel should be either transparent, white, or dark outline.
+        for y in 0..32 {
+            for x in 0..32 {
+                let px = buf.pixel(x, y).unwrap();
+                let is_transparent = px == [0, 0, 0, 0];
+                let is_white = px == [255, 255, 255, 255];
+                let is_outline = px == [0, 0, 0, 200];
+                assert!(
+                    is_transparent || is_white || is_outline,
+                    "unexpected pixel at ({x},{y}): {px:?}"
+                );
+            }
+        }
     }
 }

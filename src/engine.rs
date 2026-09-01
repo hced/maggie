@@ -1722,106 +1722,54 @@ pub struct CapturedFrame {
 }
 
 pub struct MagnifierWindow {
-    registry_state: RegistryState,
-    output_state: OutputState,
-    seat_state: SeatState,
-    shm: Shm,
-    pool: SlotPool,
-    layer: LayerSurface,
-    compositor_state: CompositorState,
-    screencast_manager: Option<ZwlrScreencopyManagerV1>,
-    screencast_pool: Option<SlotPool>,
-    screencast_buffer: Option<smithay_client_toolkit::shm::slot::Buffer>,
-    screencast_width: Option<u32>,
-    screencast_height: Option<u32>,
-    screencast_stride: Option<u32>,
-    y_invert: bool,
-    capture_retries: u8,
-    capture_manager: CaptureManager,
-    captured: Option<CapturedFrame>,
-    gpu: Option<GpuRenderer>,
-    gpu_init_failed: bool,
-    state: MagnifierState,
-    exit: bool,
-    first_configure: bool,
-    /// The view center (capture px) was initialized on the launch pointer
+    pub registry_state: RegistryState,    pub output_state: OutputState,    pub seat_state: SeatState,    pub shm: Shm,    pub pool: SlotPool,    pub layer: LayerSurface,    pub compositor_state: CompositorState,    pub screencast_manager: Option<ZwlrScreencopyManagerV1>,    pub screencast_pool: Option<SlotPool>,    pub screencast_buffer: Option<smithay_client_toolkit::shm::slot::Buffer>,    pub screencast_width: Option<u32>,    pub screencast_height: Option<u32>,    pub screencast_stride: Option<u32>,    pub y_invert: bool,    pub capture_retries: u8,    pub capture_manager: CaptureManager,    pub captured: Option<CapturedFrame>,    pub gpu: Option<GpuRenderer>,    pub gles2_backend: Option<crate::platform::gles2::Gles2Backend>,    pub gpu_init_failed: bool,    pub state: MagnifierState,    pub exit: bool,    pub first_configure: bool,    /// The view center (capture px) was initialized on the launch pointer
     /// position once; later pointer enters never re-center (which would jump).
-    launch_centered: bool,
-    /// The launch pointer position (logical px) recorded on the first enter,
+    pub launch_centered: bool,    /// The launch pointer position (logical px) recorded on the first enter,
     /// applied with the real capture scale once the capture exists (the
     /// enter can arrive before the screencopy completes).
-    launch_position: Option<(f64, f64)>,
-    /// The launch pointer position in capture px — where the launching app's
+    pub launch_position: Option<(f64, f64)>,    /// The launch pointer position in capture px — where the launching app's
     /// own cursor graphic (XWayland / software cursors, which `overlay_cursor
     /// = 0` cannot exclude) is baked into the frozen frame. The minimap base
     /// scrubs this region so no stray miniature cursor appears next to its
     /// marker dot.
-    cursor_bake_capture_pos: Option<(f64, f64)>,
-    view_center: Option<(f64, f64)>,
-    /// Wall-clock time of the last pointer-motion event, driving the offset
+    pub cursor_bake_capture_pos: Option<(f64, f64)>,    pub view_center: Option<(f64, f64)>,    /// Wall-clock time of the last pointer-motion event, driving the offset
     /// correction's time constant (only real motion corrects — never
     /// self-animated).
-    last_motion_at: Option<std::time::Instant>,
-    /// A motion-driven redraw was throttled and is waiting for the next
+    pub last_motion_at: Option<std::time::Instant>,    /// A motion-driven redraw was throttled and is waiting for the next
     /// [`MOTION_REDRAW_INTERVAL`] deadline (see [`MagnifierWindow::request_motion_redraw`]).
-    redraw_pending: bool,
-    /// A settle redraw is pending: armed on pointer motion, fired once the
+    pub redraw_pending: bool,    /// A settle redraw is pending: armed on pointer motion, fired once the
     /// pointer has been still for [`CURSOR_SETTLE_DELAY`], so the frozen
     /// screen's sampling origin snaps onto the cursor's lattice (see
     /// [`MagnifierWindow::draw_frame_if_settle_due`]). The cursor itself
     /// never moves.
-    settle_pending: bool,
-    /// When the last motion-driven redraw happened; used to cap the redraw
+    pub settle_pending: bool,    /// When the last motion-driven redraw happened; used to cap the redraw
     /// rate so high-frequency pointer events cannot flood the compositor.
-    last_draw_at: Option<std::time::Instant>,
-    animating: bool,
-    frame_callback: Option<wl_callback::WlCallback>,
-    width: u32,
-    height: u32,
-    current_output: Option<wl_output::WlOutput>,
-    pointer_seen: bool,
-    pointer_position_f: (f64, f64),
-    keyboard: Option<wl_keyboard::WlKeyboard>,
-    pointer: Option<wl_pointer::WlPointer>,
-    magnified_cursor: Option<crate::cursor::MagnifiedCursor>,
-    blank_cursor_surface: Option<wl_surface::WlSurface>,
-    cursor_pool: Option<SlotPool>,
-    /// The `zwp_pointer_constraints_v1` global (when the compositor provides
+    pub last_draw_at: Option<std::time::Instant>,    pub animating: bool,    pub frame_callback: Option<wl_callback::WlCallback>,    pub width: u32,    pub height: u32,    pub current_output: Option<wl_output::WlOutput>,    pub pointer_seen: bool,    pub pointer_position_f: (f64, f64),    pub keyboard: Option<wl_keyboard::WlKeyboard>,    pub pointer: Option<wl_pointer::WlPointer>,    pub magnified_cursor: Option<crate::cursor::MagnifiedCursor>,    pub blank_cursor_surface: Option<wl_surface::WlSurface>,    pub cursor_pool: Option<SlotPool>,    /// The `zwp_pointer_constraints_v1` global (when the compositor provides
     /// it). Used to confine the pointer to the layer surface so it can never
     /// leave into other surfaces (shell hot corners, panels) — the compositor
     /// then always keeps the blank cursor in effect and the OS cursor never
     /// shows, and the delivered position at the screen edges is clamped
     /// instead of oscillating sub-pixel-wise.
-    pointer_constraints: PointerConstraintsState,
-    /// The active pointer confinement on the layer surface (persistent
+    pub pointer_constraints: PointerConstraintsState,    /// The active pointer confinement on the layer surface (persistent
     /// lifetime, whole-surface region), kept alive for the app's lifetime.
-    confinement: Option<ZwpConfinedPointerV1>,
-    /// A cursor surface showing the real system cursor (from the loaded theme)
+    pub confinement: Option<ZwpConfinedPointerV1>,    /// A cursor surface showing the real system cursor (from the loaded theme)
     /// at its native size, used while the Configuration window is open so the
     /// UI is operated with a visible pointer. The hotspot is stored alongside.
-    config_cursor_surface: Option<wl_surface::WlSurface>,
-    config_cursor_pool: Option<SlotPool>,
-    config_cursor_hotspot: Option<(i32, i32)>,
-    /// Whether Screenshot Mode is active (entered with the `screenshot_manual`
+    pub config_cursor_surface: Option<wl_surface::WlSurface>,    pub config_cursor_pool: Option<SlotPool>,    pub config_cursor_hotspot: Option<(i32, i32)>,    /// Whether Screenshot Mode is active (entered with the `screenshot_manual`
     /// key, default `S`; `F` enters it with the whole screen pre-selected).
     /// While active the user drags a selection rectangle over the frozen
     /// frame (LMB), nudges its nearest border with WASD, selects the whole
     /// screen with `F`, saves with Return and cancels with Esc/Q/RMB.
-    screenshot_active: bool,
-    /// Whether the left mouse button is currently held to draw the selection.
-    screenshot_dragging: bool,
-    /// The drag anchor in capture px (where the LMB was pressed); the
+    pub screenshot_active: bool,    /// Whether the left mouse button is currently held to draw the selection.
+    pub screenshot_dragging: bool,    /// The drag anchor in capture px (where the LMB was pressed); the
     /// selection rectangle spans from here to the live pointer position.
-    screenshot_drag_start: Option<(f64, f64)>,
-    /// The settled selection rectangle in capture px, normalized
+    pub screenshot_drag_start: Option<(f64, f64)>,    /// The settled selection rectangle in capture px, normalized
     /// `(x0, y0, x1, y1)` with `x0 <= x1` and `y0 <= y1`, clamped to the
     /// frozen capture. `None` while in Screenshot Mode with nothing selected.
-    screenshot_rect: Option<(f64, f64, f64, f64)>,
-    /// The screenshot save scale toggled while in Screenshot Mode (`None` =
+    pub screenshot_rect: Option<(f64, f64, f64, f64)>,    /// The screenshot save scale toggled while in Screenshot Mode (`None` =
     /// the configured `screenshot_scale` default). The toggle key flips it
     /// between real size and magnified; reset on every mode entry.
-    effective_screenshot_scale: Option<crate::config::ScreenshotScale>,
-    /// App-side key repeat for a held WASD nudge key in Screenshot Mode:
+    pub effective_screenshot_scale: Option<crate::config::ScreenshotScale>,    /// App-side key repeat for a held WASD nudge key in Screenshot Mode:
     /// `(key, next_deadline)`. While set, the event loop's `dispatch_with_timeout`
     /// wakes on the deadline and `draw_frame` fires repeat nudges on the
     /// cadence (no reliance on compositor repeat events or frame callbacks).
@@ -1829,108 +1777,82 @@ pub struct MagnifierWindow {
     /// recent held nudge key (pressing a second key replaces the first;
     /// releasing any nudge key clears the hold) — one direction at a time,
     /// which is all nudging needs.
-    nudge_hold: Option<(char, std::time::Instant)>,
-    /// The magnified-cursor position offset (logical px) captured when
+    pub nudge_hold: Option<(char, std::time::Instant)>,    /// The magnified-cursor position offset (logical px) captured when
     /// Screenshot Mode is entered: the difference between the viewport center
     /// (where the cursor sprite sits) and the live pointer. The sprite then
     /// follows the pointer *plus* this offset, so pressing the screenshot key
     /// never jumps the cursor — it stays exactly where it was, and only
     /// relative pointer movement moves it.
-    screenshot_cursor_offset: Option<(f64, f64)>,
-    /// Transient OSD message (e.g. "Saved ~/Pictures/...") with the time it
+    pub screenshot_cursor_offset: Option<(f64, f64)>,    /// Transient OSD message (e.g. "Saved ~/Pictures/...") with the time it
     /// was set; shown in the legend for a few seconds.
-    screenshot_notice: Option<(String, std::time::Instant)>,
-    /// Cached screenshot-mode overlay buffer (dim + selection border). Only
+    pub screenshot_notice: Option<(String, std::time::Instant)>,    /// Cached screenshot-mode overlay buffer (dim + selection border). Only
     /// rebuilt when the screenshot-mode state changes (mode on/off or the
     /// selection rectangle) — plain pointer motion must NOT refill or
     /// re-upload it, or the mouse feels laggy in Screenshot Mode.
-    screenshot_overlay: Option<RgbaBuffer>,
-    /// The screenshot-mode state `(active, selection rect)` the cached overlay
+    pub screenshot_overlay: Option<RgbaBuffer>,    /// The screenshot-mode state `(active, selection rect)` the cached overlay
     /// buffer was filled for; the overlay is rebuilt only when this changes.
-    screenshot_overlay_state: Option<ScreenshotOverlayState>,
-    /// The egui Configuration window; present while it is open. While it is
+    pub screenshot_overlay_state: Option<ScreenshotOverlayState>,    /// The egui Configuration window; present while it is open. While it is
     /// open the whole surface shows the UI and pointer/keyboard input is
     /// forwarded to it instead of driving the magnifier.
-    config_window: Option<ConfigWindow>,
-    /// Latest wl_pointer enter serial, used to reset the cursor to the default
+    pub config_window: Option<ConfigWindow>,    /// Latest wl_pointer enter serial, used to reset the cursor to the default
     /// (Configuration window open) or re-hide it with the blank surface
     /// (closed) when the pointer is over the surface.
-    last_pointer_serial: Option<u32>,
-    /// Hold-to-zoom: while the configured modifier is held, vertical pointer
+    pub last_pointer_serial: Option<u32>,    /// Hold-to-zoom: while the configured modifier is held, vertical pointer
     /// motion changes the zoom continuously instead of in steps.
-    hold_to_zoom_active: bool,
-    /// Pointer Y (logical) of the previous motion event while hold-to-zoom is
+    pub hold_to_zoom_active: bool,    /// Pointer Y (logical) of the previous motion event while hold-to-zoom is
     /// active; the per-event delta drives the zoom change.
-    hold_zoom_last_y: f64,
-    /// Accumulated upward travel (logical px) while the zoom sits exactly on
+    pub hold_zoom_last_y: f64,    /// Accumulated upward travel (logical px) while the zoom sits exactly on
     /// the runtime minimum (the fully-zoomed-out view): tiny alternating
     /// pointer jitter must not flap the zoom between the floor and one step
     /// above it, so zoom-in from the floor is ignored until this passes
     /// [`HTZ_FLOOR_DEADZONE`] (see [`htz_floor_zoom`]).
-    hold_floor_dead_travel: f64,
-    /// Non-magnetic edge-hold latch per axis (`(x, y)`): which side (high /
+    pub hold_floor_dead_travel: f64,    /// Non-magnetic edge-hold latch per axis (`(x, y)`): which side (high /
     /// low) of each axis is currently held onto its capture edge, or `None`.
     /// See [`edge_hold_axis`] — the latch gives the edge-hold hysteresis so
     /// a parked pointer's micro-wobble can't make the quantized view hop
     /// between the edge and `capture − 2`.
-    edge_hold: (Option<bool>, Option<bool>),
-    /// Whether the Shift key is currently held. Used to slow down pointer
+    pub edge_hold: (Option<bool>, Option<bool>),    /// Whether the Shift key is currently held. Used to slow down pointer
     /// motion (panning) by the configured factor.
-    shift_held: bool,
-    /// Whether Ctrl is currently held (for undo/redo shortcuts).
-    ctrl_held: bool,
-    /// Sub-pixel accumulator for smooth shift-slowed panning: tracks the
+    pub shift_held: bool,    /// Whether Ctrl is currently held (for undo/redo shortcuts).
+    pub ctrl_held: bool,    /// Sub-pixel accumulator for smooth shift-slowed panning: tracks the
     /// fractional capture-pixel movement from scaled deltas, advancing
     /// the view center only when the accumulator crosses 0.5 px. This
     /// eliminates the quantization artifacts ("square" motion) that a
     /// simple per-event multiplier creates at high zoom.
-    pan_accum: (f64, f64),
-    /// Whether the minimap overlay (a dimmed overview of the frozen screen
+    pub pan_accum: (f64, f64),    /// Whether the minimap overlay (a dimmed overview of the frozen screen
     /// with the visible-region marker) is shown in the viewport corner
     /// (toggled with the `minimap` key, default `M`).
-    minimap_visible: bool,
-    /// Cached minimap base buffer (dimmed downscale of the capture + chrome),
+    pub minimap_visible: bool,    /// Cached minimap base buffer (dimmed downscale of the capture + chrome),
     /// without the per-frame view marker. Rebuilt only when the capture or
     /// the minimap size changes; each frame the marker is drawn into a clone
     /// of this.
-    minimap_base: Option<RgbaBuffer>,
-    /// Cached minimap outline coverage (per-pixel stroke alpha from the
+    pub minimap_base: Option<RgbaBuffer>,    /// Cached minimap outline coverage (per-pixel stroke alpha from the
     /// SDF supersampling). Keyed on `(buf_w, buf_h, outline_width)`. Only
     /// recomputed when the minimap dimensions or outline thickness change.
-    minimap_outline_coverage: Option<(i32, i32, f64, Vec<u8>)>,
-    /// Cached minimap base with the outline mask already applied. Keyed
+    pub minimap_outline_coverage: Option<(i32, i32, f64, Vec<u8>)>,    /// Cached minimap base with the outline mask already applied. Keyed
     /// on `(buf_w, buf_h, outline_width)`. Avoids re-running the SDF-
     /// based mask on every frame.
-    minimap_masked_base: Option<(i32, i32, f64, RgbaBuffer)>,
-    /// Last zoom level at which the cursor texture was uploaded to the GPU.
+    pub minimap_masked_base: Option<(i32, i32, f64, RgbaBuffer)>,    /// Last zoom level at which the cursor texture was uploaded to the GPU.
     /// When the zoom hasn't changed, theTexImage2D upload is skipped.
-    cursor_upload_zoom: f64,
-    /// Whether the cursor was visible on the previous frame. When
+    pub cursor_upload_zoom: f64,    /// Whether the cursor was visible on the previous frame. When
     /// visibility toggles, the texture is re-uploaded.
-    cursor_was_visible: bool,
-    /// Draw Mode state: vector annotation overlay activated by LMB.
-    draw_mode: crate::draw_mode::DrawModeState,
-    /// Whether MMB drag is currently panning the view in Annotation Mode.
+    pub cursor_was_visible: bool,    /// Draw Mode state: vector annotation overlay activated by LMB.
+    pub draw_mode: crate::draw_mode::DrawModeState,    /// Whether MMB drag is currently panning the view in Annotation Mode.
     /// When annotation_active, normal mouse movement does not pan — only
     /// MMB drag pans the view, so the user can draw without the screen
     /// shifting under them.
-    mmb_pan_active: bool,
-    /// Rendered draw-mode annotation overlay at logical resolution.
+    pub mmb_pan_active: bool,    /// Rendered draw-mode annotation overlay at logical resolution.
     /// Populated by `draw_mode.annotations_overlay()` each frame;
     /// composited by the GPU sprite shader or the CPU blend path.
-    draw_overlay: Option<RgbaBuffer>,
-    /// The view_center at which the draw_overlay was last rendered.
+    pub draw_overlay: Option<RgbaBuffer>,    /// The view_center at which the draw_overlay was last rendered.
     /// Used to compute the GPU UV offset for pan-without-rerender.
-    overlay_rendered_center: Option<(f64, f64)>,
-    /// The GPU UV offset applied to the annotation overlay texture.
+    pub overlay_rendered_center: Option<(f64, f64)>,    /// The GPU UV offset applied to the annotation overlay texture.
     /// (0.0, 0.0) when the overlay was just rendered; nonzero when
     /// the view has panned but the overlay hasn't been re-rendered.
-    overlay_gpu_uv_offset: (f32, f32),
-    /// The annotation version (count of annotations + drawing state) at
+    pub overlay_gpu_uv_offset: (f32, f32),    /// The annotation version (count of annotations + drawing state) at
     /// which the overlay was last rendered. Used to detect when annotations
     /// have changed and the overlay needs re-rendering.
-    overlay_annotation_version: u64,
-}
+    pub overlay_annotation_version: u64,}
 
 struct ScreencastManagerData;
 
@@ -2210,8 +2132,8 @@ impl LayerShellHandler for MagnifierWindow {
 
         self.ensure_gpu(conn);
 
-        if let Some(gpu) = &mut self.gpu {
-            gpu.resize(self.width as i32, self.height as i32);
+        if let (Some(gpu), Some(backend)) = (&mut self.gpu, &mut self.gles2_backend) {
+            gpu.resize(backend, self.width as i32, self.height as i32);
         }
 
         if let Some(cw) = &mut self.config_window {
@@ -4096,12 +4018,29 @@ impl MagnifierWindow {
         if self.gpu.is_some() || self.gpu_init_failed {
             return;
         }
-        match GpuRenderer::init(
-            conn.backend().display_ptr() as *mut std::os::raw::c_void,
-            self.layer.wl_surface(),
-            self.width as i32,
-            self.height as i32,
-        ) {
+        // Create the EGL/Wayland backend first.
+        let backend = unsafe {
+            crate::platform::gles2::Gles2Backend::new(
+                conn.backend().display_ptr() as *mut std::os::raw::c_void,
+                self.layer.wl_surface(),
+                self.width as i32,
+                self.height as i32,
+                crate::gpu::RENDER_SCALE,
+            )
+        };
+        let mut backend = match backend {
+            Ok(b) => b,
+            Err(e) => {
+                self.gpu_init_failed = true;
+                tracing::warn!(
+                    "GPU rendering unavailable, falling back to CPU path: {:#}",
+                    e
+                );
+                return;
+            }
+        };
+        // Initialize the renderer using the backend.
+        match GpuRenderer::init(&backend, self.width as i32, self.height as i32) {
             Ok(mut gpu) => {
                 self.layer
                     .wl_surface()
@@ -4109,6 +4048,7 @@ impl MagnifierWindow {
                 if let Some(captured) = &self.captured {
                     gpu.upload_frame(&captured.buffer);
                 }
+                self.gles2_backend = Some(backend);
                 self.gpu = Some(gpu);
             }
             Err(e) => {
@@ -4181,8 +4121,8 @@ impl MagnifierWindow {
             let result = cw.update(&mut self.state.config);
             if result == UiResult::Continue {
                 cw.paint();
-                if let Some(gpu) = &self.gpu {
-                    gpu.swap_buffers();
+                if let (Some(gpu), Some(backend)) = (&self.gpu, &self.gles2_backend) {
+                    gpu.swap_buffers(backend);
                 }
             }
             self.config_window = Some(cw);
@@ -4388,6 +4328,7 @@ impl MagnifierWindow {
             }
         }
 
+        let gles2_backend_ref = self.gles2_backend.as_ref();
         if let Some(gpu) = &mut self.gpu {
             let osd = if self.state.osd_visible || notice_fresh {
                 crate::osd::build_osd_sprite(
@@ -4659,6 +4600,7 @@ impl MagnifierWindow {
                     minimap.as_ref(),
                     toolbar_sprite.as_ref(),
                     self.overlay_gpu_uv_offset,
+                    false, (0.0, 0.0), 0.0,
                 );
             } else {
                 // 0 % zoom: the magnified view collapses to nothing — draw a
@@ -4679,6 +4621,7 @@ impl MagnifierWindow {
                     minimap.as_ref(),
                     toolbar_sprite.as_ref(),
                     self.overlay_gpu_uv_offset,
+                    false, (0.0, 0.0), 0.0,
                 );
             }
             // Track cursor state for next frame's upload skip.
@@ -4691,11 +4634,20 @@ impl MagnifierWindow {
                 self.cursor_upload_zoom = zoom;
             }
             self.cursor_was_visible = self.state.cursor_visible;
-            if self.animating {
-                self.request_frame_callback(qh);
-            }
-            return;
         }
+        // Present the rendered frame to the compositor and request
+        // the next frame callback. These must happen outside the
+        // `if let Some(gpu)` block to avoid holding &mut self.gpu
+        // while calling &mut self methods.
+        if let Some(backend) = gles2_backend_ref {
+            if let Some(gpu) = &self.gpu {
+                gpu.swap_buffers(backend);
+            }
+        }
+        if self.animating {
+            self.request_frame_callback(qh);
+        }
+        return;
 
         // CPU fallback: same texel-grid lock as the GPU branch, but the
         // canvas is at logical resolution, so one capture texel spans `zoom`
@@ -4959,8 +4911,12 @@ impl MagnifierWindow {
     }
 
     fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
+        let gles2_backend_ref = self.gles2_backend.as_ref();
         if let Some(gpu) = &mut self.gpu {
-            gpu.draw(None, None, None, None, None, false, true, None, None, (0.0, 0.0));
+            gpu.draw(None, None, None, None, None, false, true, None, None, (0.0, 0.0), false, (0.0, 0.0), 0.0);
+            if let Some(backend) = gles2_backend_ref {
+                gpu.swap_buffers(backend);
+            }
             return;
         }
         self.render_frame(qh, |canvas, _width, _height, _stride| {
@@ -5114,6 +5070,7 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         capture_manager,
         captured: None,
         gpu: None,
+        gles2_backend: None,
         gpu_init_failed: false,
         state,
         exit: false,

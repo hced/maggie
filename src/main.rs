@@ -1,62 +1,47 @@
+//! Maggie — Native Wayland screen magnifier.
+//!
+//! This binary is only available when compiled with the `wayland` feature
+//! (enabled by default). For cross-platform builds, use `maggie_xp`.
+
+#![cfg_attr(not(feature = "wayland"), allow(dead_code, unused_imports, unused_variables))]
+
+#[cfg(feature = "wayland")]
 use anyhow::Result;
+#[cfg(feature = "wayland")]
 use clap::Parser;
+#[cfg(feature = "wayland")]
 use tracing_subscriber::prelude::*;
 
-mod capture;
-mod config;
-mod config_window;
-mod cursor;
-mod draw_mode;
-mod engine;
-mod gpu;
-mod input;
-mod osd;
-mod render;
+// When wayland feature is enabled, use modules from the lib crate.
+#[cfg(feature = "wayland")]
+use maggie::engine;
 
+#[cfg(feature = "wayland")]
 #[derive(Parser, Debug)]
 #[command(name = "maggie", version, about = "Native Wayland screen magnifier")]
 struct Args {
-    #[arg(short, long, value_name = "LEVEL")]
-    zoom: Option<f64>,
-
-    #[arg(short, long)]
-    debug: bool,
+    /// Log filter (e.g. "debug", "maggie=trace")
+    #[arg(short, long, env = "RUST_LOG", default_value = "info")]
+    log_filter: String,
 }
 
+#[cfg(feature = "wayland")]
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Panic hook: log to stderr so panics are visible.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        eprintln!("PANIC: {info}");
-        default_hook(info);
-    }));
-
-    // The log filter honours `RUST_LOG` (e.g. `RUST_LOG=maggie=debug maggie`),
-    // falling back to `maggie=info` when it is unset/empty/invalid — note
-    // that `try_from_default_env()` returns an *empty* (all-silent) filter for
-    // an unset variable, so the environment must be checked explicitly.
-    // `--debug` forces debug output regardless of the environment.
-    let filter = if args.debug {
-        tracing_subscriber::EnvFilter::new("maggie=debug")
-    } else if std::env::var("RUST_LOG")
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
-    {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("maggie=info"))
-    } else {
-        tracing_subscriber::EnvFilter::new("maggie=info")
-    };
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(filter)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| args.log_filter.into()),
+        )
         .init();
 
     tracing::info!("Starting maggie");
+    engine::run(None)
+}
 
-    engine::run(args.zoom)?;
-
-    Ok(())
+// When wayland feature is not enabled, this binary is a no-op.
+#[cfg(not(feature = "wayland"))]
+fn main() {
+    eprintln!("This binary requires the 'wayland' feature. Use 'maggie_xp' for cross-platform.");
 }

@@ -1,19 +1,16 @@
 #![allow(dead_code)]
 
-use std::os::raw::c_void;
 use std::ptr;
-
-use khronos_egl as egl;
 
 use crate::osd::OsdSprite;
 use crate::render::RgbaBuffer;
-use wayland_client::Proxy;
+use crate::platform::gles2::Gles2Backend;
 
 /// A magnified-cursor sprite ready to draw: its screen position, the sprite
 /// buffer, and the hotspot offset inside the sprite (in sprite pixels).
 pub type CursorSprite<'a> = &'a ((i32, i32), RgbaBuffer, (f64, f64));
 
-mod gles2 {
+pub(crate) mod gles2 {
     #![allow(
         non_snake_case,
         non_camel_case_types,
@@ -114,6 +111,48 @@ void main() {
 }
 "#;
 
+/// Fragment shader for the inverted-color annotation cursor. Outputs
+/// luminance (white on crosshair arms, black elsewhere). The blend mode
+/// `ONE_MINUS_DST_COLOR / ONE_MINUS_SRC_COLOR` handles the actual
+/// inversion: white pixels invert the destination, black pixels pass
+/// through unchanged. This mirrors HouseLordPaint's diff-blend crosshair.
+const INVERT_CURSOR_FRAGMENT_SHADER: &str = r#"
+#extension GL_OES_standard_derivatives : enable
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 v_uv;
+uniform float u_size;   // crosshair bounding-box size in pixels (N)
+void main() {
+    // Center origin: 0.5 = center of quad, range is -0.5..0.5.
+    vec2 c = v_uv - 0.5;
+    float half_sz = u_size * 0.5;
+    // Anti-aliasing width: ~1 sub-pixel.
+    vec2 dx = dFdx(c);
+    vec2 dy = dFdy(c);
+    float aa = length(dx) + length(dy);
+    // Crosshair arm half-thickness and gap (empty center).
+    float hw = u_size * 0.04;   // arm half-thickness (8% of size)
+    float gap = u_size * 0.08;  // center gap radius
+    // Horizontal arm: |y| near 0, |x| in [gap, 0.5].
+    float y_in  = 1.0 - smoothstep(hw - aa, hw + aa, abs(c.y));
+    float x_arm = smoothstep(gap - aa, gap + aa, abs(c.x))
+                * (1.0 - smoothstep(0.5 - aa, 0.5 + aa, abs(c.x)));
+    float horizontal = y_in * x_arm;
+    // Vertical arm: |x| near 0, |y| in [gap, 0.5].
+    float x_in  = 1.0 - smoothstep(hw - aa, hw + aa, abs(c.x));
+    float y_arm = smoothstep(gap - aa, gap + aa, abs(c.y))
+                * (1.0 - smoothstep(0.5 - aa, 0.5 + aa, abs(c.y)));
+    float vertical = x_in * y_arm;
+    float cov = clamp(horizontal + vertical, 0.0, 1.0);
+    // Output luminance: white on arms, black elsewhere.
+    // Blend func ONE_MINUS_DST_COLOR inverts the destination under arms.
+    gl_FragColor = vec4(vec3(cov), 1.0);
+}
+"#;
+
 /// The GPU path renders its buffers at this multiple of the layer's logical
 /// size and advertises the same value via `wl_surface.set_buffer_scale`, so the
 /// compositor's fractional-scale resampling doesn't soften the magnified
@@ -133,14 +172,11 @@ pub struct GpuRenderer {
     /// `glow` context over the same EGL/GLES2 function pointers, for the
     /// egui-based Configuration window.
     glow: std::sync::Arc<glow::Context>,
-    egl: egl::DynamicInstance<egl::EGL1_4>,
-    display: egl::Display,
-    surface: egl::Surface,
-    context: egl::Context,
-    egl_window: wayland_egl::WlEglSurface,
     program: GLuint,
     sprite_program: GLuint,
     overlay_program: GLuint,
+    invert_program: GLuint,
+    u_crosshair_size_loc: GLint,
     vao: GLuint,
     vbo: GLuint,
     frame_tex: GLuint,
@@ -158,106 +194,23 @@ pub struct GpuRenderer {
 }
 
 impl GpuRenderer {
+    /// Initialize the GPU renderer using an already-created backend.
+    ///
+    /// The backend handles EGL/Wayland setup; this method compiles shaders,
+    /// creates GL state (VAO, VBO, textures), and returns the renderer.
     pub fn init(
-        wl_display: *mut c_void,
-        wl_surface: &wayland_client::protocol::wl_surface::WlSurface,
+        backend: &Gles2Backend,
         width: i32,
         height: i32,
     ) -> anyhow::Result<Self> {
-        let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required() }
-            .map_err(|e| anyhow::anyhow!("Failed to load libEGL: {e}"))?;
+        // Load GL function pointers through the EGL resolver.
+        backend.load_gl();
 
-        let display = unsafe { egl.get_display(wl_display) }
-            .ok_or_else(|| anyhow::anyhow!("Failed to create EGL display"))?;
-        egl.initialize(display)
-            .map_err(|e| anyhow::anyhow!("Failed to initialize EGL: {e:?}"))?;
-        egl.bind_api(egl::OPENGL_ES_API)
-            .map_err(|e| anyhow::anyhow!("Failed to bind GLES API: {e:?}"))?;
-
-        let config = egl
-            .choose_first_config(
-                display,
-                &[
-                    egl::SURFACE_TYPE,
-                    egl::WINDOW_BIT,
-                    egl::RED_SIZE,
-                    8,
-                    egl::GREEN_SIZE,
-                    8,
-                    egl::BLUE_SIZE,
-                    8,
-                    egl::ALPHA_SIZE,
-                    8,
-                    egl::RENDERABLE_TYPE,
-                    egl::OPENGL_ES2_BIT,
-                    egl::NONE,
-                ],
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to choose EGL config: {e:?}"))?
-            .ok_or_else(|| anyhow::anyhow!("No suitable EGL config"))?;
-
-        let context = egl
-            .create_context(
-                display,
-                config,
-                None,
-                &[egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE],
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to create EGL context: {e:?}"))?;
-
-        let egl_window = wayland_egl::WlEglSurface::new(
-            wl_surface.id(),
-            width * RENDER_SCALE,
-            height * RENDER_SCALE,
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to create wl_egl_window: {e}"))?;
-        let surface = unsafe {
-            egl.create_window_surface(display, config, egl_window.ptr() as *mut c_void, None)
-                .map_err(|e| anyhow::anyhow!("Failed to create EGL window surface: {e:?}"))?
-        };
-
-        egl.make_current(display, Some(surface), Some(surface), Some(context))
-            .map_err(|e| anyhow::anyhow!("Failed to make EGL context current: {e:?}"))?;
-
-        // Swap interval 0: never block in eglSwapBuffers waiting for buffer
-        // release, so the event loop stays responsive (keys keep working)
-        // while the panning animation redraws every frame.
-        egl.swap_interval(display, 0)
-            .map_err(|e| anyhow::anyhow!("Failed to set EGL swap interval: {e:?}"))?;
-
-        gles2::load_with(|name| {
-            egl.get_proc_address(name)
-                .map(|f| f as *const c_void)
-                .unwrap_or(ptr::null())
-        });
-
-        // Report which GPU is actually rendering (after load_with, so the
-        // GL function pointers are available). On Wayland, the EGL display
-        // follows the compositor's render GPU (dGPU in hybrid setups whose
-        // compositor renders on it), so this makes dGPU/iGPU routing
-        // verifiable at a glance instead of assumed.
-        let gl_string = |name: u32| unsafe {
-            let ptr = gles2::GetString(name);
-            if ptr.is_null() {
-                return "(unknown)".to_string();
-            }
-            std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char)
-                .to_string_lossy()
-                .into_owned()
-        };
-        let vendor = gl_string(gles2::VENDOR);
-        let renderer = gl_string(gles2::RENDERER);
+        // Report which GPU is actually rendering.
+        let (vendor, renderer) = backend.gl_info();
         tracing::info!("EGL GPU: {vendor} — {renderer}");
 
-        // A `glow` context bound to the same EGL/GLES2 function pointers,
-        // used by the egui-based Configuration window (egui-glow).
-        let glow = unsafe {
-            glow::Context::from_loader_function(|name: &str| {
-                egl.get_proc_address(name)
-                    .map(|f| f as *const c_void)
-                    .unwrap_or(ptr::null())
-            })
-        };
+        let glow = backend.glow_context();
 
         let program = Self::build_program(VERTEX_SHADER)?;
         let u_src_loc = get_uniform_location(program, c"u_src".as_ptr());
@@ -315,6 +268,21 @@ impl GpuRenderer {
                 overlay_u_rect_loc,
                 overlay_u_tex_loc
             );
+        }
+
+        // Inverted-color cursor program: draws a crosshair shape as
+        // luminance (white on arms, black elsewhere). The blend mode
+        // ONE_MINUS_DST_COLOR inverts the destination under the arms.
+        let invert_program = Self::build_program_with(
+            SPRITE_VERTEX_SHADER,
+            INVERT_CURSOR_FRAGMENT_SHADER,
+        )?;
+        let u_crosshair_size_loc = get_uniform_location(
+            invert_program,
+            c"u_size".as_ptr(),
+        );
+        if u_crosshair_size_loc < 0 {
+            anyhow::bail!("Crosshair cursor shader uniform u_size not found");
         }
 
         let mut vao = 0;
@@ -470,15 +438,12 @@ impl GpuRenderer {
         }
 
         let renderer = GpuRenderer {
-            glow: std::sync::Arc::new(glow),
-            egl,
-            display,
-            surface,
-            context,
-            egl_window,
+            glow,
             program,
             sprite_program,
             overlay_program,
+            invert_program,
+            u_crosshair_size_loc,
             vao,
             vbo,
             frame_tex,
@@ -499,11 +464,7 @@ impl GpuRenderer {
             "GPU renderer initialized ({}x{} logical, EGL {})",
             width,
             height,
-            renderer
-                .egl
-                .query_string(Some(renderer.display), egl::VERSION)
-                .map(|c| c.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "?".into())
+            backend.egl_version(),
         );
         Ok(renderer)
     }
@@ -579,14 +540,13 @@ impl GpuRenderer {
         self.glow.clone()
     }
 
-    /// Present the current framebuffer to the compositor. Used by the egui
-    /// Configuration window, which paints the UI directly into the same EGL
-    /// surface instead of going through [`Self::draw`].
-    pub fn swap_buffers(&self) {
-        self.egl.swap_buffers(self.display, self.surface).ok();
+    /// Present the current framebuffer to the compositor. Delegates to the
+    /// backend (which owns the EGL surface).
+    pub fn swap_buffers(&self, backend: &Gles2Backend) {
+        backend.swap_buffers();
     }
 
-    pub fn resize(&mut self, width: i32, height: i32) {
+    pub fn resize(&mut self, backend: &mut Gles2Backend, width: i32, height: i32) {
         let width = width * RENDER_SCALE;
         let height = height * RENDER_SCALE;
         if width == self.width && height == self.height {
@@ -594,7 +554,7 @@ impl GpuRenderer {
         }
         self.width = width;
         self.height = height;
-        self.egl_window.resize(width, height, 0, 0);
+        backend.resize(width, height);
         unsafe {
             gles2::Viewport(0, 0, width, height);
         }
@@ -650,6 +610,9 @@ impl GpuRenderer {
         minimap: Option<&OsdSprite>,
         toolbar: Option<&OsdSprite>,
         overlay_uv_offset: (f32, f32),
+        invert_cursor: bool,
+        invert_cursor_center: (f32, f32), // center in RENDER_SCALE surface px
+        crosshair_size: f32,               // crosshair bounding-box size in surface px
     ) {
         unsafe {
             gles2::Viewport(0, 0, self.width, self.height);
@@ -944,12 +907,47 @@ impl GpuRenderer {
                 gles2::Disable(gles2::BLEND);
             }
 
+            // Inverted-color cursor pass: copy the current framebuffer
+            // into a texture, then draw a fullscreen quad with the
+            // inversion shader that inverts RGB within a circle.
+            if invert_cursor {
+                // Crosshair-shaped inversion: draw a small quad centered on
+                // the cursor with the crosshair luminance shader. The blend
+                // mode inverts destination pixels under the arms.
+                gles2::Enable(gles2::BLEND);
+                gles2::BlendEquation(gles2::FUNC_ADD);
+                gles2::BlendFuncSeparate(
+                    gles2::ONE_MINUS_DST_COLOR,
+                    gles2::ONE_MINUS_SRC_COLOR,
+                    gles2::ONE,
+                    gles2::ZERO,
+                );
+                gles2::UseProgram(self.invert_program);
+                gles2::Uniform1f(self.u_crosshair_size_loc, 1.0);
+                // Center the crosshair quad on invert_cursor_center.
+                let half = crosshair_size * 0.5;
+                let cx = invert_cursor_center.0;
+                let cy = invert_cursor_center.1;
+                let x0 = (cx - half) / self.width as f32;
+                let y0 = (cy - half) / self.height as f32;
+                let w = crosshair_size / self.width as f32;
+                let h = crosshair_size / self.height as f32;
+                let verts: [GLfloat; 12] =
+                    [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+                gles2::BufferData(
+                    gles2::ARRAY_BUFFER,
+                    size_of_val(&verts) as GLsizeiptr,
+                    verts.as_ptr() as *const GLvoid,
+                    gles2::STREAM_DRAW,
+                );
+                gles2::Uniform4f(self.u_rect_loc, x0, y0, w, h);
+                gles2::DrawArrays(gles2::TRIANGLES, 0, 6);
+                gles2::Disable(gles2::BLEND);
+                gles2::UseProgram(self.program);
+            }
+
             check_gl_error("draw");
         }
-        self.egl
-            .swap_buffers(self.display, self.surface)
-            .map_err(|e| anyhow::anyhow!("eglSwapBuffers failed: {e:?}"))
-            .unwrap_or_else(|e| tracing::error!("{e:#}"));
     }
 }
 
@@ -965,11 +963,9 @@ impl Drop for GpuRenderer {
             gles2::DeleteProgram(self.program);
             gles2::DeleteProgram(self.sprite_program);
             gles2::DeleteProgram(self.overlay_program);
+            gles2::DeleteProgram(self.invert_program);
         }
-        let _ = self.egl.make_current(self.display, None, None, None);
-        let _ = self.egl.destroy_context(self.display, self.context);
-        let _ = self.egl.destroy_surface(self.display, self.surface);
-        let _ = self.egl.terminate(self.display);
+        // EGL cleanup is handled by Gles2Backend::drop().
     }
 }
 

@@ -734,9 +734,9 @@ fn scroll_zoom_name(mode: crate::config::ScrollZoomMode) -> &'static str {
 // ----------------------------------------------------------------------
 
 pub fn keysym_to_egui_key(
-    keysym: smithay_client_toolkit::seat::keyboard::Keysym,
+    keysym: crate::platform::wayland::Keysym,
 ) -> Option<egui::Key> {
-    use smithay_client_toolkit::seat::keyboard::Keysym as K;
+    use crate::platform::wayland::Keysym as K;
 
     // Keys whose xkb name does not match egui's `from_name` vocabulary.
     let special = match keysym {
@@ -788,7 +788,7 @@ mod tests {
 
     #[test]
     fn keysym_mapping_covers_common_keys() {
-        use smithay_client_toolkit::seat::keyboard::Keysym as K;
+        use crate::platform::wayland::Keysym as K;
         assert_eq!(keysym_to_egui_key(K::Escape), Some(egui::Key::Escape));
         assert_eq!(keysym_to_egui_key(K::Return), Some(egui::Key::Enter));
         assert_eq!(keysym_to_egui_key(K::Tab), Some(egui::Key::Tab));
