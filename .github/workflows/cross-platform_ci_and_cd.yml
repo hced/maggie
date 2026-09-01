@@ -64,7 +64,7 @@ jobs:
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
-        run: cargo build --release --bin maggie_xp --no-default-features --verbose
+        run: cargo build --release --bin maggie_xp --no-default-features --features capture-mac --verbose
 
       - name: Run tests (Linux)
         if: runner.os == 'Linux'
@@ -76,7 +76,7 @@ jobs:
 
       - name: Run tests (macOS)
         if: runner.os == 'macOS'
-        run: cargo test --release --no-default-features --verbose
+        run: cargo test --release --no-default-features --features capture-mac --verbose
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7

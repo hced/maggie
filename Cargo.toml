@@ -1,6 +1,6 @@
 [package]
 name = "maggie"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 
 [dependencies]
@@ -52,7 +52,6 @@ windows = { version = "0.58", optional = true, features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.24", optional = true }
-core-video-sys = { version = "0.1", optional = true }
 
 [features]
 default = ["wayland"]
@@ -64,7 +63,7 @@ wayland = [
     "dep:glow", "dep:egui-file-dialog", "dep:gl_generator", "dep:resvg", "dep:thorvg",
 ]
 capture-win = ["dep:windows"]
-capture-mac = ["dep:core-graphics", "dep:core-video-sys"]
+capture-mac = ["dep:core-graphics"]
 
 [build-dependencies]
 gl_generator = { version = "0.14", optional = true }

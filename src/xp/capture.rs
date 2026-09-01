@@ -203,10 +203,32 @@ pub mod platform_capture {
 #[cfg(all(target_os = "macos", feature = "capture-mac"))]
 pub mod platform_capture {
     use super::*;
-    use anyhow::{Context, bail};
+    use anyhow::bail;
+    use core_graphics::display::*;
+    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+    use core_graphics::image::CGImageRef;
+    use core_graphics::base::kCGImageAlphaPremultipliedLast;
+    use std::ffi::c_void;
+
+    // Raw FFI declarations for functions not exposed by the safe core-graphics crate.
+    extern "C" {
+        fn CGBitmapContextCreate(
+            data: *mut c_void,
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bytes_per_row: usize,
+            space: *const c_void,
+            bitmap_info: u32,
+        ) -> *mut c_void;
+        fn CGContextDrawImage(ctx: *const c_void, rect: CGRect, image: *const c_void);
+        fn CGContextRelease(ctx: *const c_void);
+        fn CGColorSpaceRelease(space: *const c_void);
+        fn CGImageRelease(image: *const c_void);
+    }
 
     pub struct MacosCapture {
-        display_id: u32,
+        display_id: CGDirectDisplayID,
         width: u32,
         height: u32,
     }
@@ -214,9 +236,9 @@ pub mod platform_capture {
     impl MacosCapture {
         pub fn init() -> Result<Self> {
             // SAFETY: CGMainDisplayID() is always safe.
-            let display_id = unsafe { core_graphics_sys::display::CGMainDisplayID() };
-            let width = unsafe { core_graphics_sys::display::CGDisplayPixelsWide(display_id) } as u32;
-            let height = unsafe { core_graphics_sys::display::CGDisplayPixelsHigh(display_id) } as u32;
+            let display_id = unsafe { CGMainDisplayID() };
+            let width = unsafe { CGDisplayPixelsWide(display_id) } as u32;
+            let height = unsafe { CGDisplayPixelsHigh(display_id) } as u32;
 
             tracing::info!("macOS capture initialized: display {display_id} ({width}x{height})");
 
@@ -226,48 +248,47 @@ pub mod platform_capture {
 
     impl ScreenCapture for MacosCapture {
         fn capture_primary(&mut self) -> Result<CapturedScreen> {
-            // SAFETY: CGDisplayCreateImage returns an owned CGImageRef.
-            let image = unsafe {
-                core_graphics_sys::image::CGDisplayCreateImage(self.display_id)
-            };
-            if image.is_null() {
-                bail!("CGDisplayCreateImage failed");
+            // SAFETY: CGDisplayCreateImage is always safe to call. We check for null
+            // before constructing a reference to avoid UB with the NonNull-based CGImageRef.
+            let raw_image = unsafe { CGDisplayCreateImage(self.display_id) };
+            let raw_ptr: *mut CGImage = raw_image as *mut _;
+            if raw_ptr.is_null() {
+                bail!("CGDisplayCreateImage failed — grant Screen Recording permission in \
+                    System Settings → Privacy & Security → Screen Recording, then restart Maggie");
             }
 
-            let img_width = unsafe { core_graphics_sys::image::CGImageGetWidth(image) } as u32;
-            let img_height = unsafe { core_graphics_sys::image::CGImageGetHeight(image) } as u32;
+            let img = unsafe { &*raw_ptr };
+            let img_width = img.width() as u32;
+            let img_height = img.height() as u32;
             let bytes_per_row = img_width * 4;
             let mut rgba = vec![0u8; (bytes_per_row * img_height) as usize];
 
             unsafe {
-                let cs = core_graphics_sys::color_space::CGColorSpaceCreateDeviceRGB();
-                let ctx = core_graphics_sys::context::CGBitmapContextCreate(
-                    rgba.as_mut_ptr() as *mut _,
+                let cs = CGColorSpaceCreateDeviceRGB();
+                let ctx = CGBitmapContextCreate(
+                    rgba.as_mut_ptr() as *mut c_void,
                     img_width as usize,
                     img_height as usize,
                     8,
                     bytes_per_row as usize,
-                    cs,
-                    core_graphics_sys::base::kCGImageAlphaPremultipliedLast,
+                    cs.as_ptr() as *const c_void,
+                    kCGImageAlphaPremultipliedLast,
                 );
                 if ctx.is_null() {
-                    core_graphics_sys::base::CGImageRelease(image);
-                    core_graphics_sys::base::CGColorSpaceRelease(cs);
+                    CGImageRelease(image.as_ptr() as *const c_void);
+                    CGColorSpaceRelease(cs.as_ptr() as *const c_void);
                     bail!("Failed to create bitmap context");
                 }
 
-                let rect = core_graphics_sys::geometry::CGRect {
-                    origin: core_graphics_sys::geometry::CGPoint { x: 0.0, y: 0.0 },
-                    size: core_graphics_sys::geometry::CGSize {
-                        width: img_width as f64,
-                        height: img_height as f64,
-                    },
-                };
-                core_graphics_sys::context::CGContextDrawImage(ctx, rect, image);
+                let rect = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(
+                    img_width as f64,
+                    img_height as f64,
+                ));
+                CGContextDrawImage(ctx, rect, image.as_ptr() as *const c_void);
 
-                core_graphics_sys::base::CGContextRelease(ctx);
-                core_graphics_sys::base::CGColorSpaceRelease(cs);
-                core_graphics_sys::base::CGImageRelease(image);
+                CGContextRelease(ctx);
+                CGColorSpaceRelease(cs.as_ptr() as *const c_void);
+                CGImageRelease(image.as_ptr() as *const c_void);
             }
 
             // CGImages are bottom-up; flip to top-down.
