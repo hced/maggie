@@ -204,14 +204,24 @@ pub mod platform_capture {
 pub mod platform_capture {
     use super::*;
     use anyhow::bail;
-    use core_graphics::display::*;
+    use core_graphics::display::{CGDirectDisplayID, CGMainDisplayID, CGDisplayPixelsWide, CGDisplayPixelsHigh};
     use core_graphics::geometry::{CGPoint, CGRect, CGSize};
-    use core_graphics::image::CGImageRef;
-    use core_graphics::base::kCGImageAlphaPremultipliedLast;
     use std::ffi::c_void;
 
-    // Raw FFI declarations for functions not exposed by the safe core-graphics crate.
+    // Bitmap info constant: premultiplied alpha, last component.
+    const K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+
+    // Raw FFI declarations for Core Graphics functions.
+    // We use raw pointers throughout to avoid type mismatches with the safe
+    // core-graphics crate wrappers (which use foreign-types NonNull wrappers
+    // that don't play well with our bitmap context workflow).
     extern "C" {
+        fn CGDisplayCreateImage(display: CGDirectDisplayID) -> *mut c_void;
+        fn CGImageGetWidth(image: *const c_void) -> usize;
+        fn CGImageGetHeight(image: *const c_void) -> usize;
+        fn CGImageRelease(image: *const c_void);
+        fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+        fn CGColorSpaceRelease(space: *const c_void);
         fn CGBitmapContextCreate(
             data: *mut c_void,
             width: usize,
@@ -223,8 +233,6 @@ pub mod platform_capture {
         ) -> *mut c_void;
         fn CGContextDrawImage(ctx: *const c_void, rect: CGRect, image: *const c_void);
         fn CGContextRelease(ctx: *const c_void);
-        fn CGColorSpaceRelease(space: *const c_void);
-        fn CGImageRelease(image: *const c_void);
     }
 
     pub struct MacosCapture {
@@ -248,35 +256,37 @@ pub mod platform_capture {
 
     impl ScreenCapture for MacosCapture {
         fn capture_primary(&mut self) -> Result<CapturedScreen> {
-            // SAFETY: CGDisplayCreateImage is always safe to call. We check for null
-            // before constructing a reference to avoid UB with the NonNull-based CGImageRef.
-            let raw_image = unsafe { CGDisplayCreateImage(self.display_id) };
-            let raw_ptr: *mut CGImage = raw_image as *mut _;
-            if raw_ptr.is_null() {
+            // SAFETY: CGDisplayCreateImage is always safe to call.
+            let image = unsafe { CGDisplayCreateImage(self.display_id) };
+            if image.is_null() {
                 bail!("CGDisplayCreateImage failed — grant Screen Recording permission in \
                     System Settings → Privacy & Security → Screen Recording, then restart Maggie");
             }
 
-            let img = unsafe { &*raw_ptr };
-            let img_width = img.width() as u32;
-            let img_height = img.height() as u32;
+            let img_width = unsafe { CGImageGetWidth(image) } as u32;
+            let img_height = unsafe { CGImageGetHeight(image) } as u32;
             let bytes_per_row = img_width * 4;
             let mut rgba = vec![0u8; (bytes_per_row * img_height) as usize];
 
             unsafe {
                 let cs = CGColorSpaceCreateDeviceRGB();
+                if cs.is_null() {
+                    CGImageRelease(image);
+                    bail!("Failed to create RGB color space");
+                }
+
                 let ctx = CGBitmapContextCreate(
                     rgba.as_mut_ptr() as *mut c_void,
                     img_width as usize,
                     img_height as usize,
                     8,
                     bytes_per_row as usize,
-                    cs.as_ptr() as *const c_void,
-                    kCGImageAlphaPremultipliedLast,
+                    cs as *const c_void,
+                    K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
                 );
                 if ctx.is_null() {
-                    CGImageRelease(image.as_ptr() as *const c_void);
-                    CGColorSpaceRelease(cs.as_ptr() as *const c_void);
+                    CGImageRelease(image);
+                    CGColorSpaceRelease(cs);
                     bail!("Failed to create bitmap context");
                 }
 
@@ -284,11 +294,11 @@ pub mod platform_capture {
                     img_width as f64,
                     img_height as f64,
                 ));
-                CGContextDrawImage(ctx, rect, image.as_ptr() as *const c_void);
+                CGContextDrawImage(ctx, rect, image);
 
                 CGContextRelease(ctx);
-                CGColorSpaceRelease(cs.as_ptr() as *const c_void);
-                CGImageRelease(image.as_ptr() as *const c_void);
+                CGColorSpaceRelease(cs);
+                CGImageRelease(image);
             }
 
             // CGImages are bottom-up; flip to top-down.
