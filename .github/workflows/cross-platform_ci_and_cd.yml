@@ -39,6 +39,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -46,7 +58,7 @@ jobs:
         run: cargo build --release --bin maggie_xp --no-default-features --verbose
 
       - name: Run tests
-        run: cargo test --release --verbose
+        run: cargo test --release --no-default-features --verbose
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
