@@ -246,6 +246,17 @@ impl ApplicationHandler for XpState {
         };
         self.warning_text = initial_warning;
 
+        // Temporary: force warning display with MAGGIE_SHOW_WARNING=1
+        if std::env::var("MAGGIE_SHOW_WARNING").unwrap_or_default() == "1" {
+            self.warning_text = Some(vec![
+                "=== Test Warning ===".to_string(),
+                "This is a test of the warning popup.".to_string(),
+                "".to_string(),
+                "Platform requirements check works.".to_string(),
+                "Press Esc/Q to quit.".to_string(),
+            ]);
+        }
+
         // Capture the initial frame.
         match cap.capture_primary() {
             Ok(frame) => {

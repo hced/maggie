@@ -1627,6 +1627,8 @@ pub struct MagnifierState {
     pub pointer_position: (i32, i32),
     /// Deadline after which the launch hint ("K: help") disappears.
     pub launch_hint_deadline: Option<std::time::Instant>,
+    /// Warning text shown as a persistent overlay when requirements are missing.
+    pub warning_lines: Vec<String>,
 }
 
 impl MagnifierState {
@@ -1651,6 +1653,7 @@ impl MagnifierState {
             launch_hint_deadline: Some(
                 std::time::Instant::now() + std::time::Duration::from_secs(4),
             ),
+            warning_lines: Vec::new(),
         }
     }
 
@@ -4236,6 +4239,7 @@ impl MagnifierWindow {
         let src_y = center_y - view_h / 2.0;
 
         let lines = self.osd_lines();
+        let warning_lines = self.state.warning_lines.clone();
 
         // The magnified cursor is drawn at the exact center of the viewport
         // (the center of the magnified quad; the quad fills the screen at
@@ -4367,6 +4371,17 @@ impl MagnifierWindow {
             } else {
                 // Clear the deadline once expired so we stop checking.
                 self.state.launch_hint_deadline = None;
+                None
+            };
+            // Warning sprite (persistent overlay when requirements are missing).
+            let warning_sprite = if !warning_lines.is_empty() {
+                crate::osd::build_osd_sprite(
+                    &warning_lines,
+                    crate::osd::Corner::TopRight,
+                    self.width as i32 * crate::gpu::RENDER_SCALE,
+                    self.height as i32 * crate::gpu::RENDER_SCALE,
+                )
+            } else {
                 None
             };
             // Draw Mode toolbar: rendered into the overlay buffer below.
@@ -4601,6 +4616,7 @@ impl MagnifierWindow {
                     toolbar_sprite.as_ref(),
                     self.overlay_gpu_uv_offset,
                     false, (0.0, 0.0), 0.0,
+                    warning_sprite.as_ref(),
                 );
             } else {
                 // 0 % zoom: the magnified view collapses to nothing — draw a
@@ -4622,6 +4638,7 @@ impl MagnifierWindow {
                     toolbar_sprite.as_ref(),
                     self.overlay_gpu_uv_offset,
                     false, (0.0, 0.0), 0.0,
+                    warning_sprite.as_ref(),
                 );
             }
             // Track cursor state for next frame's upload skip.
@@ -4862,6 +4879,16 @@ impl MagnifierWindow {
                     hint_color,
                 );
             }
+            // Draw warning overlay (persistent, always visible when set).
+            if !warning_lines.is_empty() {
+                crate::osd::draw_osd(
+                    canvas,
+                    width,
+                    height,
+                    &warning_lines,
+                    crate::osd::Corner::TopRight,
+                );
+            }
         });
     }
 
@@ -4913,7 +4940,7 @@ impl MagnifierWindow {
     fn draw_black_overlay(&mut self, qh: &QueueHandle<Self>) {
         let gles2_backend_ref = self.gles2_backend.as_ref();
         if let Some(gpu) = &mut self.gpu {
-            gpu.draw(None, None, None, None, None, false, true, None, None, (0.0, 0.0), false, (0.0, 0.0), 0.0);
+            gpu.draw(None, None, None, None, None, false, true, None, None, (0.0, 0.0), false, (0.0, 0.0), 0.0, None);
             if let Some(backend) = gles2_backend_ref {
                 gpu.swap_buffers(backend);
             }
@@ -5047,7 +5074,17 @@ pub fn run(initial_zoom: Option<f64>) -> anyhow::Result<()> {
         config.screenshot_filename_pattern.clone(),
     );
     let minimap_on_launch = config.minimap_visible;
-    let state = MagnifierState::new(config, initial_zoom);
+    let mut state = MagnifierState::new(config, initial_zoom);
+    // Temporary: force warning display with MAGGIE_SHOW_WARNING=1
+    if std::env::var("MAGGIE_SHOW_WARNING").unwrap_or_default() == "1" {
+        state.warning_lines = vec![
+            "=== Test Warning ===".to_string(),
+            "This is a test of the warning popup.".to_string(),
+            "".to_string(),
+            "Platform requirements check works.".to_string(),
+            "Press Esc/Q to quit.".to_string(),
+        ];
+    }
     let start_zoom = state.zoom;
 
     let mut window = MagnifierWindow {
