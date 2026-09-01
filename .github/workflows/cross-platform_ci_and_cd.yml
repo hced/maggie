@@ -1,22 +1,18 @@
 name: Cross-Platform CI/CD
 
-# -----------------------------------------------------------------------------
-# RUNNER TRIGGER LOGIC:
-# This workflow is explicitly configured to ONLY trigger on tag pushes (e.g., v1.0.0).
-# Standard pushes to the 'main' branch or pull requests will NOT wake up the runners,
-# ensuring we don't waste CI compilation minutes on routine development tasks.
-# -----------------------------------------------------------------------------
 on:
   push:
+    branches: [main]
     tags:
-      - "v*" # <-- This specific rule restricts execution to version tags only
+      - "v*"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  # Force all JavaScript actions to use Node 24 immediately to silence deprecation warnings
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Need to grant write permissions for the Release step to move compiled binaries into Release
 permissions:
   contents: write
 
@@ -26,19 +22,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         include:
-          # x86-64-v3 (AVX2/FMA) is valid on x86-64 Linux and Windows
           - os: ubuntu-latest
             rustflags: "-C target-cpu=x86-64-v3"
           - os: windows-latest
             rustflags: "-C target-cpu=x86-64-v3"
-          # macos-latest is aarch64 (Apple Silicon) — x86-64-v3 is invalid on ARM
           - os: macos-latest
             rustflags: ""
     runs-on: ${{ matrix.os }}
 
     env:
-      # Override .cargo/config.toml rustflags per-platform so the x86-64-v3
-      # flag doesn't break the macOS ARM build
       RUSTFLAGS: ${{ matrix.rustflags }}
 
     steps:
@@ -53,7 +45,6 @@ jobs:
       - name: Run tests
         run: cargo test --release --verbose
 
-      # Explicitly naming artifacts distinctly per-OS
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         with:
@@ -76,7 +67,6 @@ jobs:
           mkdir -p ${{ github.workspace }}/incoming
           mkdir -p ${{ github.workspace }}/release-files
 
-      # Download each artifact explicitly into its own deliberate folder to avoid flattening bugs
       - name: Download Linux Artifact
         uses: actions/download-artifact@v8
         with:
@@ -99,22 +89,18 @@ jobs:
         run: |
           cd ${{ github.workspace }}/incoming
 
-          # Package Linux binary
           if [ -f "ubuntu/maggie_xp" ]; then
             tar -czf ${{ github.workspace }}/release-files/maggie_xp-linux.tar.gz -C ubuntu maggie_xp
           fi
 
-          # Package macOS binary
           if [ -f "macos/maggie_xp" ]; then
             tar -czf ${{ github.workspace }}/release-files/maggie_xp-macos.tar.gz -C macos maggie_xp
           fi
 
-          # Package Windows binary
           if [ -f "windows/maggie_xp.exe" ]; then
             zip -j ${{ github.workspace }}/release-files/maggie_xp-windows.zip windows/maggie_xp.exe
           fi
 
-          # Generate checksums
           cd ${{ github.workspace }}/release-files
           sha256sum * > checksums.txt
 
