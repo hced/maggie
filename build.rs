@@ -6,6 +6,7 @@ fn main() {
         return;
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if !std::arch::is_x86_feature_detected!("avx2") {
         println!(
             "cargo:warning=this CPU does not support AVX2 (x86-64-v3), Maggie's committed \
