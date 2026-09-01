@@ -36,6 +36,7 @@ pub mod platform_capture {
     use windows::Win32::Graphics::Direct3D11::*;
     use windows::Win32::Graphics::Dxgi::Common::*;
     use windows::Win32::Graphics::Dxgi::*;
+    use windows::core::Interface;
 
     /// Windows screen capture via DXGI Desktop Duplication.
     pub struct DxgiCapture {
@@ -74,9 +75,7 @@ pub mod platform_capture {
                 // Get DXGI adapter and output.
                 let dxgi_device: IDXGIDevice = device.cast()?;
                 let adapter: IDXGIAdapter = dxgi_device.GetParent()?;
-                let mut output: Option<IDXGIOutput> = None;
-                adapter.EnumOutputs(0, &mut output)?;
-                let output = output.context("No DXGI output")?;
+                let output: IDXGIOutput = adapter.EnumOutputs(0)?;
 
                 // Get output description for dimensions.
                 let desc = output.GetDesc()?;
@@ -96,9 +95,9 @@ pub mod platform_capture {
                     Format: DXGI_FORMAT_B8G8R8A8_UNORM,
                     SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                     Usage: D3D11_USAGE_STAGING,
-                    BindFlags: D3D11_BIND_FLAG(0),
-                    CPUAccessFlags: D3D11_CPU_ACCESS_READ,
-                    MiscFlags: D3D11_RESOURCE_MISC_FLAG(0),
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
                 };
                 let mut staging: Option<ID3D11Texture2D> = None;
                 device.CreateTexture2D(&tex_desc, None, Some(&mut staging))?;
@@ -125,9 +124,9 @@ pub mod platform_capture {
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 Usage: D3D11_USAGE_STAGING,
-                BindFlags: D3D11_BIND_FLAG(0),
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ,
-                MiscFlags: D3D11_RESOURCE_MISC_FLAG(0),
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
             };
             let mut staging: Option<ID3D11Texture2D> = None;
             unsafe {
@@ -148,7 +147,7 @@ pub mod platform_capture {
                 self.duplication.AcquireNextFrame(
                     100, // timeout ms
                     &mut frame_info,
-                    Some(&mut resource),
+                    &mut resource,
                 )?;
                 let resource = resource.context("No frame resource")?;
 
