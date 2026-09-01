@@ -24,9 +24,22 @@ jobs:
   build:
     strategy:
       matrix:
-        # Use windows-latest to allow GitHub's internal redirection to handle the label update
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            # x86-64-v3 (AVX2/FMA) is fine on x86-64 Linux
+            rustflags: "-C target-cpu=x86-64-v3"
+          - os: windows-latest
+            # x86-64-v3 (AVX2/FMA) is fine on x86-64 Windows
+            rustflags: "-C target-cpu=x86-64-v3"
+          - os: macos-latest
+            # macos-latest is aarch64 (Apple Silicon) — x86-64-v3 is invalid on ARM
+            rustflags: ""
     runs-on: ${{ matrix.os }}
+
+    env:
+      # Override .cargo/config.toml rustflags per-platform so the x86-64-v3
+      # flag doesn't break the macOS ARM build
+      RUSTFLAGS: ${{ matrix.rustflags }}
 
     steps:
       - uses: actions/checkout@v7
@@ -63,7 +76,7 @@ jobs:
           mkdir -p ${{ github.workspace }}/incoming
           mkdir -p ${{ github.workspace }}/release-files
 
-      # Download each artifact explicitly into its own deliberate folder to avoid v4 flattening bugs
+      # Download each artifact explicitly into its own deliberate folder to avoid flattening bugs
       - name: Download Linux Artifact
         uses: actions/download-artifact@v8
         with:
